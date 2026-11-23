@@ -1790,7 +1790,13 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     constexpr UINT committed_heap_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
                                           D3D12_HEAP_FLAG_HARDWARE_PROTECTED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT |
                                           D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
-    if (UINT(heap_flags) & ~committed_heap_flags) return "heap flags of a committed resource";
+    // ALLOW_WRITE_WATCH is taken where the CPU can write the memory: UPLOAD, READBACK and a CUSTOM heap with a CPU page
+    // property, on buffers and textures; DEFAULT and NOT_AVAILABLE refuse it (host and WARP; d3d12_committed_write_watch_test).
+    const bool cpu_visible = heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK ||
+                             (heap.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                              heap.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+    const UINT allowed_heap_flags = committed_heap_flags | (cpu_visible ? D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH : 0u);
+    if (UINT(heap_flags) & ~allowed_heap_flags) return "heap flags of a committed resource";
 
     const bool buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     // 0x400 is not in this SDK's d3d12.h (10.0.26100), but the host accepts it on buffers and textures; 0x200 and
