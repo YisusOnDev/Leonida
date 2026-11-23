@@ -2411,10 +2411,13 @@ public:
             }
         }
         if (token) *token = t;
-        // Blocking enumeration: every connected device is reported before this returns, on the caller's thread.
-        for (const Event& e : now) {
-            fn(t, context, e.device, e.timestamp, e.current, e.previous);
-            e.device->Release();
+        // Blocking enumeration stays on the caller's thread, but has the same cancellation and lifetime guarantees
+        // as queued callbacks: StopCallback skips later devices and UnregisterCallback waits for active delivery.
+        if (!now.empty()) {
+            std::lock_guard dl(s.deliver_mu);
+            const DWORD previous_thread = s.delivering_thread.exchange(GetCurrentThreadId());
+            for (const Event& e : now) deliver_event(e);
+            s.delivering_thread = previous_thread;  // preserve an outer callback during reentrant enumeration
         }
         return S_OK;
     }

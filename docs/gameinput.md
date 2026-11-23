@@ -310,6 +310,11 @@ event per call (a quota of 0 runs exactly one), no further event once the quota 
 queued when the call started (later ones wait for the next call, so even an unlimited quota returns). The wait
 handle is signalled again while events remain.
 
+`GameInputBlockingEnumeration` delivers device callbacks on the registering thread before registration returns,
+using the same delivery lock and cancellation checks. Stopping the callback from within itself skips the remaining
+devices. `UnregisterCallback` from another thread waits for active delivery before returning success, so its callback
+state can then be reclaimed, following the [callback lifetime contract](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/common/input/advanced/input-callbacks).
+
 The API surface:
 
 | interface | implemented | not implemented |
@@ -448,7 +453,8 @@ rests on a transcription rather than on a side-by-side compile.
   the fact, both directions, two pads interleaved and filtered by device, ageing out, held readings, unplug and
   replug), the guide button, motor and trigger
   rumble as SDL receives them, the DualSense effect bytes in each `LEONIDA_DS_TRIGGERS` mode, the lightbar, a
-  dispatcher and its quota, async and blocking enumeration, unregistering, unplugging and replugging, and three identical pads
+  dispatcher and its quota, async and blocking enumeration, self-stop during enumeration, unregistering from another
+  thread while an enumeration callback is active, unplugging and replugging, and three identical pads
   (an id each, `FindDeviceFromId` and device-filtered readings per pad, replugging one, two and all three, and the
   first twin's id equal to the single-pad id). Motion runs on a virtual pad with sensors (`nsensors` in the
   virtual-joystick description, fed with `SDL_SendJoystickVirtualSensorData`): the kind and `motionInfo` on a sensor

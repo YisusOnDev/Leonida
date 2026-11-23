@@ -152,6 +152,94 @@ void CALLBACK on_guide(GameInputCallbackToken, void*, IGameInputDevice*, uint64_
     g_guide_events.push_back(pressed);
 }
 
+struct StopEnumeration {
+    IGameInput* input;
+    int calls = 0;
+};
+void CALLBACK stop_enumeration(GameInputCallbackToken token, void* context, IGameInputDevice*, uint64_t, uint32_t,
+                               uint32_t) {
+    auto& state = *static_cast<StopEnumeration*>(context);
+    ++state.calls;
+    state.input->StopCallback(token);
+}
+
+struct EnumerationGate {
+    HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE registration_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE unregister_started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE unregister_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<GameInputCallbackToken> token{0};
+    std::atomic<bool> finished{false};
+    DWORD wait_result = WAIT_FAILED;
+    ~EnumerationGate() {
+        for (HANDLE h : {entered, release, registration_done, unregister_started, unregister_done})
+            if (h) CloseHandle(h);
+    }
+};
+void CALLBACK gated_enumeration(GameInputCallbackToken token, void* context, IGameInputDevice*, uint64_t, uint32_t,
+                                uint32_t) {
+    auto& gate = *static_cast<EnumerationGate*>(context);
+    gate.token = token;
+    SetEvent(gate.entered);
+    gate.wait_result = WaitForSingleObject(gate.release, 5000);
+    gate.finished = true;
+}
+
+// Called while two virtual pads are connected. Blocking enumeration runs real callbacks on the registering thread;
+// stopping one must cancel the rest, and successful unregistration from another thread must wait for it to finish.
+void test_blocking_cancellation(IGameInput* input, IGameInputDevice* device) {
+    StopEnumeration stop{input};
+    GameInputCallbackToken stopped_token = 0;
+    const HRESULT stopped = input->RegisterDeviceCallback(nullptr, GameInputKindGamepad, GameInputDeviceConnected,
+        GameInputBlockingEnumeration, &stop, stop_enumeration, &stopped_token);
+    check(stopped == S_OK && stop.calls == 1, "blocking enumeration: StopCallback cancels the second device callback");
+    check(input->UnregisterCallback(stopped_token, 0), "blocking enumeration: a stopped callback can be unregistered");
+
+    EnumerationGate gate;
+    const bool handles = gate.entered && gate.release && gate.registration_done && gate.unregister_started &&
+                         gate.unregister_done;
+    check(handles, "blocking enumeration: synchronization events created");
+    if (!handles) return;
+    HRESULT registered = E_FAIL;
+    GameInputCallbackToken registered_token = 0;
+    std::thread registration([&] {
+        registered = input->RegisterDeviceCallback(device, GameInputKindGamepad, GameInputDeviceConnected,
+            GameInputBlockingEnumeration, &gate, gated_enumeration, &registered_token);
+        SetEvent(gate.registration_done);
+    });
+    const bool entered = WaitForSingleObject(gate.entered, 5000) == WAIT_OBJECT_0;
+    check(entered, "blocking enumeration: the callback entered before unregistering");
+    if (!entered) {
+        SetEvent(gate.release);
+        if (WaitForSingleObject(gate.registration_done, 5000) != WAIT_OBJECT_0) ExitProcess(1);
+        registration.join();
+        input->UnregisterCallback(registered_token, 0);
+        return;
+    }
+    bool removed = false, finished_on_return = false;
+    std::thread unregistering([&] {
+        SetEvent(gate.unregister_started);
+        removed = input->UnregisterCallback(gate.token, 1'000'000);
+        finished_on_return = gate.finished;
+        SetEvent(gate.unregister_done);
+    });
+    check(WaitForSingleObject(gate.unregister_started, 5000) == WAIT_OBJECT_0,
+          "blocking enumeration: the unregistering thread started");
+    // Give an early return a chance to happen, then release the callback in either case. The assertion below checks
+    // completion at successful unregistration, not elapsed time: a slow test machine cannot fail this check for being slow.
+    WaitForSingleObject(gate.unregister_done, 150);
+    SetEvent(gate.release);
+    const bool joined = WaitForSingleObject(gate.registration_done, 5000) == WAIT_OBJECT_0 &&
+                        WaitForSingleObject(gate.unregister_done, 5000) == WAIT_OBJECT_0;
+    check(joined, "blocking enumeration: both calls complete after releasing the callback");
+    if (!joined) ExitProcess(1);  // a lock regression must fail rather than hang while joining the test threads
+    registration.join();
+    unregistering.join();
+    check(registered == S_OK && gate.wait_result == WAIT_OBJECT_0, "blocking enumeration: the callback completed normally");
+    check(removed && finished_on_return, "blocking enumeration: successful unregister waits until callback state is reclaimable");
+}
+
 void set_env(const char* name, const char* value) { SetEnvironmentVariableA(name, value); }
 
 uint32_t buttons_of(IGameInputReading* r) {
@@ -1987,6 +2075,7 @@ int main() {
     input->RegisterDeviceCallback(nullptr, GameInputKindGamepad, GameInputDeviceConnected, GameInputBlockingEnumeration,
                                   nullptr, on_device, &blocking_token);
     check(g_device_events.size() == before.size() + 2, "blocking enumeration reports both pads before returning");
+    test_blocking_cancellation(input, dev);
 
     // ---- reading history: GetNextReading and GetPreviousReading ----
     // A tap of A on the Xbox pad, pressed and released before the title reads again.
