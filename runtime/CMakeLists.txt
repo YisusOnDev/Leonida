@@ -492,6 +492,10 @@ if(BUILD_TESTING)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
+  # QueueHolds (runtime/src/queue_holds.h): a fence released inside a release (D3D-496 case 1). Pure stdlib.
+  add_executable(queue_holds_pump_release_test test/queue_holds_pump_release_test.cpp)
+  add_test(NAME queue_holds_pump_release COMMAND queue_holds_pump_release_test)
+  set_tests_properties(queue_holds_pump_release PROPERTIES TIMEOUT 30)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)

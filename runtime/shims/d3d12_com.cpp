@@ -1613,7 +1613,7 @@ public:
         return objects;
     }
 
-    // A D3D12 queue holds the fences it waits on and signals until the work has been submitted.
+    // A D3D12 queue holds the fences it signals until the Signal has been submitted (a Wait does not pin: see Wait).
     static leonida::VulkanQueue::PinFn fence_pin(ID3D12Fence* fence) {
         return [fence]() -> std::shared_ptr<void> {
             fence->AddRef();
@@ -1774,7 +1774,10 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        queue_.wait(f->semaphore(), value, fence_pin(fence));
+        // Not pinned: a Wait does not keep the fence alive. The host runtime lets a queue waiting on a fence the
+        // application releases go on (D3D-496, d3d12_queue_handover_test's fence_released runs on both), and the
+        // released fence's semaphore is retired only once the submissions made so far have completed (D3D-486).
+        queue_.wait(f->semaphore(), value);
         return d3d12_trace::result(method, S_OK);
     }
 

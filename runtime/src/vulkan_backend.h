@@ -1784,9 +1784,11 @@ public:
         if (semaphore_) context.holds().add_fence(semaphore_, initial);
     }
     // The fence is released, but submissions made so far may still signal or wait for its semaphore (D3D12 lets an
-    // application release a fence it has just asked a queue to Signal, and a D3D12 queue only pins the fences of its
-    // held operations and pending Waits). remove_fence drops what the queues still hold on it, and the semaphore goes
-    // through the deletion queue once every submission made before has completed (D3D-486), not at once
+
+    // application release a fence it has just asked a queue to Signal or Wait for). remove_fence leaves no queue
+    // about to use it (its wait is taken off held batches and off Waits not yet attached to a submission, held
+    // Signals of it are forgotten, VulkanQueue::discard_waiting_on), so the semaphore goes through the deletion
+    // queue once every submission made before has completed (D3D-486), not at once
     // (VUID-vkDestroySemaphore-semaphore-05149).
     ~VulkanFence() {
         if (!semaphore_) return;
@@ -2818,7 +2820,15 @@ private:
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
                 context_.holds().held_changed(-1);
-                if (!context_.is_device_lost()) run(op);
+                if (!context_.is_device_lost()) {
+                    run(op);
+                } else {
+                    // Not run on a lost device: its pins (a fence it signals) still go after the lock, as a run
+                    // operation's do. A fence's last reference released under it would deadlock in remove_fence,
+                    // which asks this queue to forget the fence.
+                    retire_pins(op.pins, 0);
+                    retire_pins(op.wait_pins, 0);
+                }
                 released = true;
             }
             drain_pins(retired);
@@ -2826,24 +2836,34 @@ private:
         return released;
     }
 
-    // Holder: the fence is released, so what waits on it can never run.
+
+    // Holder: the fence is released. Its semaphore is retired once the submissions made so far have completed
+    // (VulkanFence), so none after may use it: a Wait on it counts as reached, as a released fence does for the CPU,
+    // whether it is not yet attached to a submission or carried by a held operation, and a held Signal of it signals
+    // nothing. The host runtime lets a queue waiting on a released fence go on (D3D-496), so a held operation is not
+    // dropped: only that wait is taken off it, and remove_fence's pump_ready releases it in order once its other
+    // waits are met.
     void discard_waiting_on(VkSemaphore semaphore) override {
-        std::vector<Deferred> dropped;
-        {
-            std::lock_guard state(state_mutex_);
-            for (auto it = held_.begin(); it != held_.end();) {
-                if (std::find(it->waits.begin(), it->waits.end(), semaphore) == it->waits.end() &&
-                    !(it->kind == Deferred::Kind::signal && it->fence == semaphore)) {
-                    ++it;
+        std::lock_guard state(state_mutex_);
+        for (std::size_t i = 0; i < waits_.size();) {
+            if (waits_[i] != semaphore) {
+                ++i;
+                continue;
+            }
+            waits_.erase(waits_.begin() + std::ptrdiff_t(i));
+            wait_values_.erase(wait_values_.begin() + std::ptrdiff_t(i));
+        }
+        for (Deferred& op : held_)
+            if (op.kind == Deferred::Kind::signal && op.fence == semaphore) op.fence = VK_NULL_HANDLE;
+        for (Deferred& op : held_)
+            for (std::size_t i = 0; i < op.waits.size();) {
+                if (op.waits[i] != semaphore) {
+                    ++i;
                     continue;
                 }
-                std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work that names it; "
-                                     "that work is dropped\n");
-                dropped.push_back(std::move(*it));
-                it = held_.erase(it);
-                context_.holds().held_changed(-1);
+                op.waits.erase(op.waits.begin() + std::ptrdiff_t(i));
+                op.wait_values.erase(op.wait_values.begin() + std::ptrdiff_t(i));
             }
-        }
     }
 
     // Holder: the sequence number of the oldest held operation.

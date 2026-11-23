@@ -586,7 +586,11 @@ bool never_signaled(Rig& rig, int seed) {
     return true;
 }
 
-// The fence a batch waits for is released: the batch is dropped and reported, nothing hangs.
+// The fence a batch waits for is released before anything signals it (D3D-496). The host runtime lets the queue go
+// on: the batch runs and the Signal after it is reached. The layer did the same only for a Wait not yet attached to a
+// submission; a held batch was dropped. Now the released fence's wait is taken off the held batch, which runs in
+// order. Run on the layer and on the host runtime: the batch copies the upload data to stage[1] and signals 101; a
+// second submission, after 101, reads stage[1] back, so verify() shows the held batch ran.
 bool fence_released(Rig& rig, int seed) {
     arm("fence released while a batch waits");
     Case c(rig, seed);
@@ -596,20 +600,24 @@ bool fence_released(Rig& rig, int seed) {
     if (FAILED(rig.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&victim)))) return true;
     ComPtr<ID3D12Fence> doomed;
     if (FAILED(rig.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&doomed)))) return false;
+    ID3D12Fence* done = c.fence(6);
     ID3D12GraphicsCommandList* held = c.make_list(direct_q, nullptr, &c.stage[1], 3);
-    if (!held) return c.fail("setup", __LINE__);
+    if (!done || !held) return c.fail("setup", __LINE__);
     ID3D12CommandList* batch[] = {held};
     if (FAILED(victim->Wait(doomed.Get(), 9))) return c.fail("Wait", __LINE__);
     victim->ExecuteCommandLists(1, batch);
-    // The queue holds the fence it waits on, as D3D12 does: the application's release does not free it under the held
-    // batch. The batch stays held (nothing ran) and is reported when the queue goes.
-    doomed.Reset();
+    if (FAILED(victim->Signal(done, 101))) return c.fail("Signal", __LINE__);
     Sleep(50);
-    const std::string log = capture_stderr([&] { victim.Reset(); });
-    if (log.find("queue destroyed with") == std::string::npos) {
+    if (done->GetCompletedValue() != 0) return c.fail("the batch ran before its fence was released", __LINE__);
+    const std::string log = capture_stderr([&] { doomed.Reset(); });
+    if (log.find("dropped") != std::string::npos) {
         std::fprintf(stderr, "stderr was: \"%s\"\n", log.c_str());
-        return c.fail("no report for the held batch", __LINE__);
+        return c.fail("the batch waiting on the released fence was dropped", __LINE__);
     }
+    if (!c.wait_fence(6, 101)) return false;
+    if (!c.submit({direct_q, 0, &c.stage[1], nullptr, 3, {{6, 101}}, 2}) || !c.wait_fence(2, 1) || !c.verify())
+        return false;
+    std::puts("fence released while a batch waits: the batch ran and its Signal was reached");
     ++cases_run;
     return true;
 }
@@ -835,11 +843,11 @@ bool run_all(ID3D12Device* device, bool layer) {
         for (auto& type_queues : rig.queues)
             for (int i = 1; i < pool_size; ++i) type_queues[i].Reset();
         ok &= never_signaled(rig, ++seed);
-        ok &= fence_released(rig, ++seed);
         ok &= held_signal_survives_release(rig, ++seed);
         ok &= monotonic_shared_fence(rig, ++seed);
         ok &= teardown_wakes_cpu_waiters(rig, ++seed);
     }
+    ok &= fence_released(rig, ++seed);  // on the host too: the reference for what a released fence's Wait does
     if (skipped) std::printf("(%d type assignments need more queues than the device gave)\n", skipped);
     return ok;
 }

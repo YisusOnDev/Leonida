@@ -2837,9 +2837,18 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   submitted first) is unchanged: no copy, no hold, the same `vkQueueSubmit`. Holding on the CPU also avoids a Wait and
   its Signal landing in the wrong order on one `VkQueue`, which would not make forward progress on the GPU
   (Vulkan-Docs issue 1262): the test also runs with every D3D12 queue on one `VkQueue` and with two.
-  What a held operation keeps alive, as D3D12's queue does: the fences it waits on and signals, until its submission
-  has completed on the GPU (a released fence stays until then, which also removes the destroy-while-pending
-  validation error the unheld path could hit); the pipeline states and root signatures of its lists (copied from the
+  What a held operation keeps alive: the fences it signals, until its submission has completed on the GPU (a
+  released fence stays until then); the fences it waits on are not kept. A fence released while operations wait
+  for it lets them go on, as the host runtime does (D3D-496): the released fence's wait is taken off each held
+  operation, which then runs in queue order once its other waits are met, and a `Wait` for it not yet attached to
+  a batch counts as reached (case "fence released while a batch waits", layer and host). This also holds when the
+  last reference goes inside a release, as the pin of a Signal one queue has just submitted while another queue
+  waits on the fence: every queue forgets the fence before it is erased, so none is submitted still waiting on it
+  (`queue_holds_pump_release_test`; the waits of D3D-496 case 1 were otherwise never met on the GPU and stalled
+  that queue for good under load). Its semaphore is not
+  destroyed at once (D3D-486): it goes through the deferred-deletion tickets once every submission made before the
+  release has completed, so nothing pending uses a destroyed semaphore (case "fences released while queues use
+  them", layer and host); the pipeline states and root signatures of its lists (copied from the
   recording before the application may `Reset` it, so releasing a PSO right after `ExecuteCommandLists` is fine).
   Resources are not kept: a resource released while a batch that names it is held fails that batch at release.
   A fence released with no queue keeping it (an unheld `Signal` the GPU has not reached yet, nothing waiting for it
