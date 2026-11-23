@@ -2594,6 +2594,18 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_m4_compute COMMAND d3d12_m4_compute_test)
       set_tests_properties(d3d12_m4_compute PROPERTIES SKIP_RETURN_CODE 77)
 
+      # Storage-image initialization and cross-queue init fences: copy-queue upload before first dispatch,
+      # shader-less barrier+copy readback before dispatch, cross-queue independent initializers, and partial-mip
+      # upload before dispatch. Reuses the translated M4 compute shaders.
+      add_executable(d3d12_storage_init_test test/d3d12_storage_init_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M4_FILES})
+      target_link_libraries(d3d12_storage_init_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_storage_init_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_M4_DIR="${LEONIDA_M4_DIR}")
+      target_compile_options(d3d12_storage_init_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_storage_init COMMAND d3d12_storage_init_test)
+      set_tests_properties(d3d12_storage_init PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
       # Typed buffer UAVs and UAV counters: cs_buf_typed.asm writes typed views through V#s with a FORMAT, and
       # cs_buf_counter.asm appends to and consumes from a structured view whose counter is the second V# of its slot;
       # the test also compares typed-buffer and counter clears with the host runtime on the layer's adapter.

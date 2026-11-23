@@ -1204,7 +1204,8 @@ public:
             }
         }
         {
-            std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
+            std::lock_guard lock(storage_mutex_);  // a resource destroyed before any submission is not initialized
+            storage_pending_.erase(id);
             std::erase_if(zero_pending_, [id](const PendingZero& zero) { return zero.id == id; });
         }
         if (img) {
@@ -1742,11 +1743,15 @@ private:
         VkBuffer buffer;
     };
     std::vector<PendingZero> zero_pending_;  // zero_on_next_submit
-    // The last submission that initialized storage images (its queue's progress semaphore and ticket) and a counter
-    // that says which one: every other queue's next submission waits for it, so no queue uses such an image before
-    // the zero-fill that put it in GENERAL has run.
-    VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
-    std::uint64_t storage_init_value_ = 0;
+    // Per-queue fences of submissions that initialized storage images or zero-filled buffers, ordered by a monotonic
+    // version counter: every other queue's next submission waits for each fence newer than its last seen version, so
+    // independent initializers on different queues never overwrite each other's wait ticket.
+    struct InitFence {
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        std::uint64_t value = 0;
+        std::uint64_t version = 0;
+    };
+    std::vector<InitFence> storage_init_fences_;
     std::uint64_t storage_init_version_ = 0;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     // depth_resolve_framebuffer's caches, under views_mutex_ like views_.
@@ -1930,7 +1935,8 @@ public:
             // This queue is idle, so whatever initialisation it published (storage images, zero-filled buffers) has
             // finished: the next submission on another queue must not wait on a semaphore that is about to go.
             std::lock_guard lock(context_.storage_mutex_);
-            if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
+            std::erase_if(context_.storage_init_fences_,
+                          [sem = progress_](const VulkanContext::InitFence& fence) { return fence.semaphore == sem; });
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -2538,12 +2544,14 @@ private:
         std::vector<VulkanContext::PendingZero> zero_buffers;
         {
             std::lock_guard lock(context_.storage_mutex_);
-            if (context_.storage_init_semaphore_ && context_.storage_init_semaphore_ != progress_ &&
-                context_.storage_init_version_ != storage_init_seen_) {
-                waits_.push_back(context_.storage_init_semaphore_);
-                wait_values_.push_back(context_.storage_init_value_);
-                storage_init_seen_ = context_.storage_init_version_;
+            for (const auto& fence : context_.storage_init_fences_) {
+                if (fence.semaphore && fence.semaphore != progress_ && fence.version > storage_init_seen_) {
+                    waits_.push_back(fence.semaphore);
+                    wait_values_.push_back(fence.value);
+                }
             }
+            if (context_.storage_init_version_ > storage_init_seen_)
+                storage_init_seen_ = context_.storage_init_version_;
             // The set this submission binds may be a new generation whose table another queue's submission uploads:
             // wait for that one, as for the storage images (the table's buffers are used by one queue family only:
             // every D3D12 queue of the device is made in info.queue_family).
@@ -2567,12 +2575,14 @@ private:
             context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &filled, 0, nullptr, 0, nullptr);
         }
+        bool any_storage_initialized = false;
         for (const ResourceId id : storage_images) {
             const ResourceBinding* image = context_.resolve(id);
             if (!image || !image->image) continue;
             const VkImageSubresourceRange range{image->aspects, 0, image->mip_levels, 0, image->array_layers};
             auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
-            detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
+            any_storage_initialized |=
+                detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
         }
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
@@ -2628,12 +2638,20 @@ private:
             context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
             context_.zero_pending_.insert(context_.zero_pending_.end(), zero_buffers.begin(), zero_buffers.end());
         }
-        if (submitted && (!storage_images.empty() || !zero_buffers.empty())) {
+        if (submitted && (any_storage_initialized || !zero_buffers.empty())) {
             std::lock_guard lock(context_.storage_mutex_);
-            context_.storage_init_semaphore_ = progress_;
-            context_.storage_init_value_ = submitted_;
-            ++context_.storage_init_version_;
-            storage_init_seen_ = context_.storage_init_version_;
+            const std::uint64_t version = ++context_.storage_init_version_;
+            bool updated = false;
+            for (auto& fence : context_.storage_init_fences_) {
+                if (fence.semaphore == progress_) {
+                    fence.value = submitted_;
+                    fence.version = version;
+                    updated = true;
+                    break;
+                }
+            }
+            if (!updated) context_.storage_init_fences_.push_back({progress_, submitted_, version});
+            storage_init_seen_ = version;
         }
         if (submitted && bindless_uploaded) {
             std::lock_guard lock(context_.storage_mutex_);

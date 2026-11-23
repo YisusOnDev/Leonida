@@ -96,6 +96,7 @@ struct ResourceBinding {
     bool rgb96 = false;
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
     bool sampled = false;              // has SAMPLED usage (no DENY_SHADER_RESOURCE): the present compose pass reads it
+    bool storage_image = false;        // has STORAGE usage (ALLOW_UNORDERED_ACCESS)
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
     bool sparse_buffer = false;
 };
@@ -1500,12 +1501,15 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
 // Images registered with the tracker in UNDEFINED have never been used. D3D12 committed resources start zeroed,
 // so each such piece is zero-filled (clear for uncompressed images, zero-buffer copy for block-compressed formats
 // when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
-// expects; with not_zeroed, it is only moved. The tracker records it.
-inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
+// expects; with not_zeroed, it is only moved. The tracker records it. Returns true if any piece transitioned from
+// UNDEFINED.
+inline bool initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                        ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    bool initialized = false;
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
+        initialized = true;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
         const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
         const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
@@ -1549,6 +1553,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         piece.layout = layout;
         if (tracker) tracker->set(id, piece.range, layout);
     }
+    return initialized;
 }
 
 inline bool within(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
@@ -2032,8 +2037,12 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
                                  const ResourceBinding& resource, ResourceId id, const VkImageSubresourceRange& range,
                                  VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker) {
     const VkImageLayout target = image_layout(resource, wanted);
-    auto pieces = current(tracker, id, range, target);
-    initialize(vk, command_buffer, resource, id, pieces, target, tracker);
+    // Storage-capable images (ALLOW_UNORDERED_ACCESS) keep GENERAL on first copy initialization so a subsequent
+    // shader UAV access (via implicit COMMON -> UNORDERED_ACCESS promotion or without an explicit transition) sees
+    // the layout its descriptor expects. Both transfer copies and storage descriptors accept GENERAL on all queues.
+    const VkImageLayout init_layout = resource.storage_image ? VK_IMAGE_LAYOUT_GENERAL : target;
+    auto pieces = current(tracker, id, range, init_layout);
+    initialize(vk, command_buffer, resource, id, pieces, init_layout, tracker);
     // D3D12 orders back-to-back copies and resolves on a resource that stays in COPY_DEST or COPY_SOURCE without a
     // barrier from the application; Vulkan does not. A piece already in the transfer layout gets no layout
     // transition, so an earlier transfer write to it is ordered here instead (write-after-write and read-after-write,
@@ -2042,7 +2051,12 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
         memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access,
                        VK_PIPELINE_STAGE_TRANSFER_BIT);
     };
-    if (pieces.size() == 1 && (pieces[0].layout == target || pieces[0].layout == VK_IMAGE_LAYOUT_GENERAL)) {
+    const auto all_in = [&](VkImageLayout layout) {
+        return !pieces.empty() &&
+               std::all_of(pieces.begin(), pieces.end(),
+                           [layout](const auto& piece) { return piece.layout == layout; });
+    };
+    if (all_in(target) || all_in(VK_IMAGE_LAYOUT_GENERAL)) {
         after_transfer_writes();
         return pieces[0].layout;
     }
