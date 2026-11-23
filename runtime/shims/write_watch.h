@@ -37,7 +37,7 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
         const uint64_t value = at ? *reinterpret_cast<volatile uint64_t*>(at) : 0;
         std::fprintf(stderr, "[rt] watch: hit %d thread %lu value %016llx after %s stack %s\n", n, GetCurrentThreadId(),
                      static_cast<unsigned long long>(value), rt::startup_trace::where(c.Rip).c_str(),
-                     rt::startup_trace::stack_from(c).c_str());
+                     rt::startup_trace::detail::stack_from(c).c_str());
         std::fflush(stderr);
     }
     return EXCEPTION_CONTINUE_EXECUTION;
