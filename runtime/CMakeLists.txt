@@ -1071,6 +1071,12 @@ if(BUILD_TESTING)
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
     set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
+    # The device proxy logs CheckFeatureSupport answers (docs/boot.md, questions 11 and 22): the first call per
+    # feature prints its size, HRESULT and bytes. device_proxy_test asks for D3D12_OPTIONS (feature 0).
+    add_test(NAME device_proxy_feature_log COMMAND device_proxy_test)
+    set_tests_properties(device_proxy_feature_log PROPERTIES SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "CheckFeatureSupport feature 0 size [0-9]+ -> 0x00000000: [0-9a-f][0-9a-f] "
+        FAIL_REGULAR_EXPRESSION "FAIL")
     # With --trace-d3d12 the 24 D3D12XboxCreateDevice parameter words still print (docs/boot.md, question 1),
     # and the line with run-specific pointers does not.
     add_test(NAME device_proxy_trace COMMAND device_proxy_test --trace-d3d12)

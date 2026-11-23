@@ -209,6 +209,8 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 // Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the measured 9/10
 // handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy handles for
 // the allocator proxy.
+
+// Slot 13 (CheckFeatureSupport) is answered by the real device unchanged; the proxy logs the answer.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object

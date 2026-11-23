@@ -143,7 +143,7 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 | 8 | XDXR desc layouts | measured in [xdxr.md](xdxr.md); the live signal is a non-empty stream desc at slot 62 |
 | 9 | Tiled textures / DCC | slot 76, `CopyTextureRegion`, resource descs; a `0x101` layout or tiled address |
 | 10 | Binning, DCC, VRS, wave MMA, stream output | shader-side answered by `tools/feature_scan.py`; the trace adds PSO/stream subobjects |
-| 11 | `CheckFeatureSupport` answers | the call's `ok`/`failed` and the `[rt]` feature-id line; the answer itself is not logged yet |
+| 11 | `CheckFeatureSupport` answers | the call's `ok`/`failed`, and the device proxy's `[rt] d3d12_xs: CheckFeatureSupport feature <id> size <n> -> <hr>: <bytes>` line with the answer (first call per feature; every call with `XS_TRACE=1`) |
 | 12 | Async compute / copy queues | queue creation and cross-queue fences |
 | 13 | 144-byte push constants | device creation `[rt]` line; `push_constants_need_fallback` when the device reports fewer |
 | 14 | Two code-base stages in one PSO | PSO creation log; the index metadata (`uses_code_base`) |
@@ -154,7 +154,7 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 | 19 | `0x03000000` root-signature bits | the root-signature blobs; the mask is a workaround, not the meaning |
 | 20 | Which BVH builder programs the game uses | slot-62 PSOs on the first RT frame; map each to its `ILDN` container |
 | 21 | PIX `Metadata` blob | metadata values; 0 and 1 are decoded silently, so an `unsupported` line means an unexpected value; if it is 2, decode the console blob from the executable's PIX calls, not the PC WinPixEventRuntime layout |
-| 22 | `CheckFeatureSupport(OPTIONS5)` RaytracingTier | the `[rt]` feature id; the tier answer itself is not logged yet, and `DispatchRays` stays unimplemented |
+| 22 | `CheckFeatureSupport(OPTIONS5)` RaytracingTier | the proxy's `CheckFeatureSupport feature 27` line: `RaytracingTier` is the structure's third word (bytes 8-11); `DispatchRays` stays unimplemented |
 
 ## 5. What a good first run looks like
 

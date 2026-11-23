@@ -155,11 +155,24 @@ int main(int argc, char** argv) {
 
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device.Get());
     check(real != nullptr, "proxy exposes its PC device");
+    if (real) {
+        // Device slot 13: CheckFeatureSupport goes through the proxy (which logs the answer) and gives the PC
+        // device's answer byte for byte.
+        D3D12_FEATURE_DATA_D3D12_OPTIONS through_proxy{}, direct{};
+        const std::uint64_t hits = rt::d3d12_xs::device_slot_hits(13);
+        const HRESULT proxy_hr =
+            device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &through_proxy, sizeof(through_proxy));
+        const HRESULT direct_hr = real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &direct, sizeof(direct));
+        check(proxy_hr == direct_hr && std::memcmp(&through_proxy, &direct, sizeof(direct)) == 0,
+              "slot 13 CheckFeatureSupport(OPTIONS) answers as the PC device");
+        check(rt::d3d12_xs::device_slot_hits(13) == hits + 1, "slot 13 hit counter moves");
+    }
     unsigned slots = rt::d3d12_xs::device_proxy_slot_count(device.Get());
     std::printf("proxy forwards %u PC vtable slots (ID3D12Device..Device14 max is 83)\n", slots);
     check(slots >= 44, "proxy forwards at least the base ID3D12Device vtable");
     check(rt::d3d12_xs::device_slot_overridden(9), "device slot 9 is CreateCommandAllocator (allocator proxies)");
     check(!rt::d3d12_xs::device_slot_overridden(10), "device slot 10 is forwarded (PC CreateGraphicsPipelineState)");
+    check(rt::d3d12_xs::device_slot_overridden(13), "device slot 13 is CheckFeatureSupport (answer logged)");
     check(rt::d3d12_xs::device_slot_overridden(14), "device slot 14 is the descriptor-heap override");
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
     check(rt::d3d12_xs::device_slot_overridden(76), "device slot 76 is the resource override");
