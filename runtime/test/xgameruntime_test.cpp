@@ -847,10 +847,89 @@ void check_run_time_load() {
         reinterpret_cast<CloseMount>(slot(pk, 26))(pk, handle);
         check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
               "slot 26 (XPackageCloseMountHandle) closes the handle");
+        // Slots 37/38, XPackageMountWithUiAsync/Result: slot 23's mount, completed on the async block; a package
+        // that is not installed is refused by the Async call.
+        using MountUiAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, XAsyncBlock*);
+        using MountUiResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint64_t*);
+        XAsyncBlock mount_block{};
+        handle = 0;
+        check(reinterpret_cast<MountUiAsync>(slot(pk, 37))(pk, "SLOTDLC_12345678901234567890123", &mount_block) == S_OK &&
+                  XAsyncGetStatus(&mount_block, true) == S_OK &&
+                  reinterpret_cast<MountUiResult>(slot(pk, 38))(pk, &mount_block, &handle) == S_OK && handle != 0 &&
+                  reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == S_OK &&
+                  need == std::strlen("C:\\LeonidaSlotDLC") + 1,
+              "slots 37/38 mount a content package through the async block, a handle slot 24 knows");
+        reinterpret_cast<CloseMount>(slot(pk, 26))(pk, handle);
+        XAsyncBlock missing_block{};
+        check(reinterpret_cast<MountUiAsync>(slot(pk, 37))(pk, "NOTINSTALLED", &missing_block) ==
+                  HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+              "slot 37 refuses a package that is not installed");
         SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
         using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
-        check(reinterpret_cast<Stub>(slot(pk, 5))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
-              "the slots without an offline answer (5, 40) are E_NOTIMPL");
+        check(reinterpret_cast<Stub>(slot(pk, 13))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
+              "the slots without an offline answer (13, 40) are E_NOTIMPL");
+        // Slots 5, 6, 9, 12, 14 and 16-19 answer as a fully installed package.
+        using CreateMonitor = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*, uint32_t, XTaskQueueHandle,
+                                                          void**);
+        using CloseMonitor = void(STDMETHODCALLTYPE*)(void*, void*);
+        using RegProgress = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*, void (CALLBACK*)(void*, void*),
+                                                        XTaskQueueRegistrationToken*);
+        using FindChunk = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*, uint32_t*);
+        using Chunks = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*);
+        using InstallAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*, uint32_t, bool, XAsyncBlock*);
+        using InstallResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void**);
+        using Estimate = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*, uint64_t*, bool*);
+        uint8_t selector[24] = {};  // one XPackageChunkSelector; never read
+        const char* const kOwnPackage = "LeonidaPackageIdentifier00000000";  // the process's default identifier
+        void* monitor = nullptr;
+        check(reinterpret_cast<CreateMonitor>(slot(pk, 5))(pk, kOwnPackage, 1, selector, 1000, nullptr, &monitor) == S_OK &&
+                  monitor != nullptr &&
+                  reinterpret_cast<CreateMonitor>(slot(pk, 5))(pk, kOwnPackage, 1, selector, 1000, nullptr, nullptr) == E_POINTER,
+              "slot 5 (XPackageCreateInstallationMonitor) hands out a monitor");
+        static std::atomic<int> s_progress_calls{0};
+        XTaskQueueRegistrationToken progress_token{};
+        check(reinterpret_cast<RegProgress>(slot(pk, 9))(pk, monitor, nullptr,
+                                                         [](void*, void*) { s_progress_calls.fetch_add(1); },
+                                                         &progress_token) == S_OK &&
+                  progress_token.token != 0 &&
+                  reinterpret_cast<RegProgress>(slot(pk, 9))(pk, monitor, nullptr, nullptr, &progress_token) == E_INVALIDARG,
+              "slot 9 (XPackageRegisterInstallationProgressChanged) hands out a token");
+        reinterpret_cast<CloseMonitor>(slot(pk, 6))(pk, monitor);
+        uint32_t availability = 7;
+        check(reinterpret_cast<FindChunk>(slot(pk, 12))(pk, kOwnPackage, 1, selector, &availability) == S_OK && availability == 0,
+              "slot 12 (XPackageFindChunkAvailability): every chunk is Ready");
+        check(reinterpret_cast<Chunks>(slot(pk, 14))(pk, kOwnPackage, 1, selector) == S_OK,
+              "slot 14 (XPackageChangeChunkInstallOrder) succeeds with nothing queued");
+        uint64_t download = 9;
+        bool confirm = true;
+        check(reinterpret_cast<Estimate>(slot(pk, 18))(pk, kOwnPackage, 1, selector, &download, &confirm) == S_OK &&
+                  download == 0 && !confirm,
+              "slot 18 (XPackageEstimateDownloadSize): nothing to download, no confirmation");
+        check(reinterpret_cast<Chunks>(slot(pk, 19))(pk, kOwnPackage, 1, selector) == E_ACCESSDENIED,
+              "slot 19 (XPackageUninstallChunks) is refused: the game files are never removed");
+        XAsyncBlock install_block{};
+        void* install_monitor = nullptr;
+        check(reinterpret_cast<InstallAsync>(slot(pk, 16))(pk, kOwnPackage, 1, selector, 1000, true, &install_block) == S_OK &&
+                  XAsyncGetStatus(&install_block, true) == S_OK &&
+                  reinterpret_cast<InstallResult>(slot(pk, 17))(pk, &install_block, &install_monitor) == S_OK &&
+                  install_monitor == monitor,
+              "slots 16/17 (XPackageInstallChunksAsync/Result) complete at once with the installed package's monitor");
+        check(s_progress_calls.load() == 0, "no progress callback is ever called");
+        // A package that is not installed is ERROR_NOT_FOUND on the chunk slots, as on slot 23's mount.
+        const HRESULT not_found = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        availability = 7;
+        void* none = &availability;
+        XAsyncBlock none_block{};
+        check(reinterpret_cast<FindChunk>(slot(pk, 12))(pk, "NOTINSTALLED", 1, selector, &availability) == not_found &&
+                  availability == 7 &&
+                  reinterpret_cast<CreateMonitor>(slot(pk, 5))(pk, "NOTINSTALLED", 1, selector, 1000, nullptr, &none) ==
+                      not_found &&
+                  none == nullptr && reinterpret_cast<Chunks>(slot(pk, 14))(pk, "NOTINSTALLED", 1, selector) == not_found &&
+                  reinterpret_cast<Estimate>(slot(pk, 18))(pk, "NOTINSTALLED", 1, selector, &download, &confirm) ==
+                      not_found &&
+                  reinterpret_cast<InstallAsync>(slot(pk, 16))(pk, "NOTINSTALLED", 1, selector, 1000, true, &none_block) ==
+                      not_found,
+              "slots 5, 12, 14, 16 and 18 refuse a package that is not installed");
         struct Progress {
             uint64_t total, installed, launch;
             bool launchable, completed;
@@ -866,7 +945,7 @@ void check_run_time_load() {
         check(!reinterpret_cast<Update>(slot(pk, 8))(pk, nullptr) &&
                   reinterpret_cast<UnregProgress>(slot(pk, 10))(pk, nullptr, XTaskQueueRegistrationToken{1}, true) &&
                   reinterpret_cast<UnregInstalled>(slot(pk, 22))(pk, XTaskQueueRegistrationToken{1}, false) &&
-                  !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, "pkg"),
+                  !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, kOwnPackage),
               "the bool slots 8, 10, 22 and 34 return their documented offline answers");
         const GUID chain[] = {
             package_cls,
