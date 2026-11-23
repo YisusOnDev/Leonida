@@ -107,6 +107,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
+    shims/window_placement.cpp
+    shims/window_placement_shims.cpp
     shims/xmem.cpp
     shims/xg_xs.cpp
     shims/acphal.cpp
@@ -331,6 +333,19 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(dstorage_test PRIVATE /OPT:NOREF)
+
+  # LEONIDA_WINDOW_MONITOR / LEONIDA_WINDOW_NO_ACTIVATE: the title's CreateWindowEx/ShowWindow imports through the
+  # registry. Creates and destroys a few windows on this desktop; none is activated.
+  add_executable(window_placement_test
+    test/window_placement_test.cpp
+    shims/window_placement.cpp
+    shims/window_placement_shims.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(window_placement_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(window_placement_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(window_placement_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(window_placement_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
@@ -1256,6 +1271,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET window_placement_test)
+    add_test(NAME window_placement COMMAND window_placement_test)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
