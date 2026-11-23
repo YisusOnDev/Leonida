@@ -13,6 +13,8 @@
 //     <overlay>\\.gta6rt-deleted, and reads and listings treat the name as gone. The marker is never removed and a
 //     deleted name is never copied up: a re-created file is its overlay copy, which reads and listings already
 //     prefer, while an open of a deleted name that fails leaves the name deleted;
+//   - FILE_FLAG_DELETE_ON_CLOSE is a delete whatever access the open asks for: the open uses the overlay copy and a
+//     package name gets its marker once the open has succeeded;
 //   - reads prefer the overlay copy and then the package;
 //   - FindFirstFile merges the two folders, the overlay winning on a name, and hides deleted names and the marker
 //     folder;
@@ -572,18 +574,19 @@ Target write_target(const std::wstring& path, bool copy_up) {
     return t;
 }
 
-// MAXIMUM_ALLOWED names no right and grants every one the file allows, write included, so it is a write-open: opened
-// as a read it handed out a handle to the package file itself, and a WriteFile through it changed the package.
-bool writes(DWORD access, DWORD disposition) {
-    constexpr DWORD kWriteAccess = GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED | FILE_WRITE_DATA | FILE_APPEND_DATA |
-                                   FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
-    if ((access & kWriteAccess) != 0) return true;
+// FILE_FLAG_DELETE_ON_CLOSE makes any open a delete: the host adds DELETE to the access it was asked for, so a
+// read-only open with the flag removes the file when its last handle is closed.
+// MAXIMUM_ALLOWED can grant write access, so it also requires the overlay.
+bool writes(DWORD access, DWORD disposition, DWORD flags) {
+    constexpr DWORD kWriteAccess = GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+                                   FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
+    if ((access & kWriteAccess) != 0 || (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) return true;
     return disposition == CREATE_NEW || disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS ||
            disposition == TRUNCATE_EXISTING;
 }
 
-Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
-    if (!writes(access, disposition)) return read_target(path);
+Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DWORD flags = 0) {
+    if (!writes(access, disposition, flags)) return read_target(path);
     // CREATE_NEW fails on any name the title can see; the host would only look in the overlay, so a file only the
     // package has would be shadowed by a new empty one.
     if (disposition == CREATE_NEW) {
@@ -595,7 +598,40 @@ Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
         disposition == OPEN_EXISTING || disposition == OPEN_ALWAYS || disposition == TRUNCATE_EXISTING;
+    // CREATE_NEW goes to the overlay, where a file only the package has is not there to refuse it. With
+    // FILE_FLAG_DELETE_ON_CLOSE the new overlay file would then be what the close deletes and the marker would hide
+    // the package file, so the open is refused here as the host refuses it for a file that exists. A name a deletion
+    // marker has freed is not in the title's view and can be created.
+    std::vector<std::wstring> parts;
+    if (disposition == CREATE_NEW && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0 &&
+        parse_console(path, parts) == Parsed::Console) {
+        const View v = view(roots(), parts);
+        if (v.kind == Kind::File && v.in_package && !v.in_overlay) return fail(ERROR_FILE_EXISTS);
+    }
     return write_target(path, keeps_contents);
+}
+
+// A delete-on-close open that succeeded is on the overlay copy, which the host removes at the last close. A name the
+// package has gets the marker DeleteFile leaves, so the package file does not come back into view then; until the
+// close, reads still find the overlay copy. A marker that cannot be written is not reported: the open succeeded and
+// the delete it carries cannot be taken back, so the package file is what the title sees again after the close.
+void mark_deleted_on_close(const std::wstring& path) {
+    std::vector<std::wstring> parts;
+    if (parse_console(path, parts) != Parsed::Console || parts.empty()) return;
+    const Roots r = roots();
+    if (r.game.empty() || r.overlay.empty() || deleted(r.overlay, parts)) return;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(join(r.game, parts), ec)) return;
+    DWORD error = 0;
+    write_marker(marker(r.overlay, parts), error);
+}
+
+// The marker for a delete-on-close open the host has just granted. The title may read the open's last error
+// (ERROR_ALREADY_EXISTS or 0), which the file queries behind the marker would replace, so it is put back. The caller
+// reads it as the first thing after the host's open: building `path` allocates, and that may change it too.
+void opened_delete_on_close(const std::wstring& path, DWORD last_error) {
+    mark_deleted_on_close(path);
+    SetLastError(last_error);
 }
 
 // ---- FindFirstFile: the overlay and the package merged into one listing
@@ -803,17 +839,19 @@ HANDLE open_file(const char* api, const void* caller, LPCWSTR name, DWORD access
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    const Target t = open_target(name, access, disposition);
+    const Target t = open_target(name, access, disposition, flags);
     if (t.error) {
         note_open_failure(api, name, t.error, caller);
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
     const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    const DWORD last_error = GetLastError();
     if (h == INVALID_HANDLE_VALUE) {
-        const DWORD error = GetLastError();
-        note_open_failure(api, name, error, caller);
-        SetLastError(error);
+        note_open_failure(api, name, last_error, caller);
+        SetLastError(last_error);
+    } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
+        opened_delete_on_close(name, last_error);
     }
     return h;
 }
@@ -839,17 +877,20 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    const Target t = open_target(name, access, disposition);
+    const DWORD flags = params ? params->dwFileFlags : 0;
+    const Target t = open_target(name, access, disposition, flags);
     if (t.error) {
         note_open_failure("CreateFile2", name, t.error, _ReturnAddress());
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
     const HANDLE h = ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    const DWORD last_error = GetLastError();
     if (h == INVALID_HANDLE_VALUE) {
-        const DWORD error = GetLastError();
-        note_open_failure("CreateFile2", name, error, _ReturnAddress());
-        SetLastError(error);
+        note_open_failure("CreateFile2", name, last_error, _ReturnAddress());
+        SetLastError(last_error);
+    } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
+        opened_delete_on_close(name, last_error);
     }
     return h;
 }

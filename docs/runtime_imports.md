@@ -242,6 +242,8 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   or two threads opening the same file never leave a truncated copy under its name; a delete of a
   package file leaves an empty marker under `<overlay>\.gta6rt-deleted`, which reads and listings treat as gone. The
   package is never written.
+  An open with `FILE_FLAG_DELETE_ON_CLOSE` is treated as a delete regardless of the access it asks for (the host adds
+  `DELETE`): it uses the overlay copy, and a package name gets its marker once the open has succeeded.
 - `DeleteFileA/W` checks the visible file's `FILE_ATTRIBUTE_READONLY`: a read-only package file with no overlay is
   refused with `ERROR_ACCESS_DENIED` before writing a deletion marker. An overlay copy supplies its own attributes,
   so a writable overlay can still be deleted when the package file underneath is read-only. The native A/W controls
