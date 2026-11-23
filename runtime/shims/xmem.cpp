@@ -317,14 +317,25 @@ const Window* find_window(uintptr_t address, uint64_t bytes) {
 
 // [address, address + size) as one placeholder of its own: split it out of the placeholder that holds it. Fails when
 // the range is not inside one placeholder.
+//
+// VirtualQuery reports the run from the queried page on, so the last page of a larger placeholder looks exactly like a
+// placeholder of its own (base == address, size == one page). Measured on Windows 11 26100: in a two-page placeholder,
+// a query of the second page says base == address and size 64 KiB, MapViewOfFile3 into it fails with
+// ERROR_INVALID_ADDRESS, and VirtualFree(MEM_PRESERVE_PLACEHOLDER) splits it; a split placeholder gets its own
+// allocation base, and splitting one that is already exact fails with ERROR_INVALID_ADDRESS. The retail title maps a
+// page table one page at a time in no particular order and asserted on that refusal (+0x2474680). So a range is only
+// taken as isolated without a split when the allocation base agrees too; otherwise the split is tried, and a split the
+// host refuses on a range the query calls exact still counts (fd1e49e1c: a tail that keeps its first allocation base).
 bool isolate_placeholder(void* address, SIZE_T size) {
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_RESERVE) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return false;
     }
-    if (xmem_placeholder_exact(info, address, size)) return true;
-    return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
+    const bool exact = xmem_placeholder_exact(info, address, size);
+    if (exact && info.AllocationBase == address) return true;
+    if (VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return true;
+    return exact;
 }
 
 PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
