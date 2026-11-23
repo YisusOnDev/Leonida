@@ -216,10 +216,10 @@ bool can_lay_out(const Computer& c) {
 //   +0x1C u32 pitch in bytes, +0x20 u32 alignment, +0x24 u32[3] padded width/height (elements) and depth or array
 //   size, +0x30 u32[2] width/height in elements, +0x38 u32[2] width/height in texels, +0x40 u32 depth or array size,
 //   +0x44 u32 samples, +0x48 u32 swizzle mode (0 linear), +0x60 u32 slice depth, +0x64 u32 in mip tail.
-// The whole structure is written (zeros first): the title used to read the plane's size and offsets from whatever
-// its stack held, sized a 256 x 1 RGBA32F texture's memory from that and overran it into the next object
-// (game_scarlett_master.exe+0x550e60f, the AV at +0x13360a3). The layout is the linear one slot 9 reads, one data
-// plane, no mip tail.
+// The whole structure is written (zeros first): before, everything but the three fields above was whatever the
+// caller's stack held, and +0x5121a84 copied that into its plane cache. (Not the cause of the AV at +0x13360a3:
+// boot frontier3-2 still had it with this change.) The layout is the linear one slots 8 and 9 use, one data plane,
+// no mip tail.
 constexpr size_t kLayoutBytes = 0x1B40, kPlaneAt = 0x18, kPlaneBytes = 0x6C8, kMipAt = 0x38, kMipBytes = 0x70;
 constexpr uint64_t kLinearAlignment = 0x100, kResourceAlignment = 0x1000;
 
