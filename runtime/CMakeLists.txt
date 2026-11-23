@@ -494,6 +494,15 @@ if(BUILD_TESTING)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
+  # Native BCPack decoder (RT-186): built-in checks, then a byte-for-byte comparison with tools/bcpack.py on
+  # synthetic chunks (tests/test_bcpack_native.py). Pure stdlib, no GPU or game files.
+  add_executable(bcpack_test test/bcpack_test.cpp src/bcpack.cpp)
+  add_test(NAME bcpack COMMAND bcpack_test)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME bcpack_native_vs_python COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_bcpack_cpp_native.py" --bin "$<TARGET_FILE:bcpack_test>")
+  endif()
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
