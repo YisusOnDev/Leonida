@@ -234,7 +234,9 @@ def native_decode_all(binary, records):
         with open(src, "wb") as f:
             for codec, out_size, raw, allow in records:
                 f.write(struct.pack("<IIBI", codec, max(out_size, 0), 1 if allow else 0, len(raw)) + raw)
-        subprocess.run([binary, "--batch", src, dst], check=True, timeout=600)
+        # Relative names from inside the folder: the helper's arguments then stay ASCII whatever the temp path is
+        # (a Windows user name outside the ANSI code page would otherwise reach a narrow argv mangled).
+        subprocess.run([os.path.abspath(binary), "--batch", "in.bin", "out.bin"], cwd=tmp, check=True, timeout=600)
         with open(dst, "rb") as f:
             blob = f.read()
     results, at = [], 0

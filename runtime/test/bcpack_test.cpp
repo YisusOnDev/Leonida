@@ -13,6 +13,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -70,10 +72,12 @@ void write_blob(std::string& out, const void* data, std::size_t size) {
     out.append(static_cast<const char*>(data), size);
 }
 
-int batch(const char* in_path, const char* out_path) {
+// Paths go through std::filesystem::path so that, with wmain on Windows, a temporary folder outside the ANSI code
+// page (a user name in another script) still opens.
+int batch(const std::filesystem::path& in_path, const std::filesystem::path& out_path) {
     std::ifstream in_file(in_path, std::ios::binary);
     if (!in_file) {
-        std::fprintf(stderr, "cannot read %s\n", in_path);
+        std::fprintf(stderr, "cannot read the batch input\n");
         return 2;
     }
     const std::vector<std::uint8_t> in((std::istreambuf_iterator<char>(in_file)), std::istreambuf_iterator<char>());
@@ -103,13 +107,22 @@ int batch(const char* in_path, const char* out_path) {
     }
     std::ofstream out_file(out_path, std::ios::binary);
     out_file.write(out.data(), static_cast<std::streamsize>(out.size()));
-    return out_file ? 0 : 2;
+    if (!out_file) {
+        std::fprintf(stderr, "cannot write the batch output\n");
+        return 2;
+    }
+    return 0;
 }
 
 }  // namespace
 
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) {
+    if (argc == 4 && std::wcscmp(argv[1], L"--batch") == 0) return batch(argv[2], argv[3]);
+#else
 int main(int argc, char** argv) {
     if (argc == 4 && std::strcmp(argv[1], "--batch") == 0) return batch(argv[2], argv[3]);
+#endif
     if (argc != 1) {
         std::fprintf(stderr, "usage: bcpack_test [--batch <in> <out>]\n");
         return 2;
