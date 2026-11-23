@@ -2317,8 +2317,9 @@ public:
     // with VK_EXT_external_memory_host and the buffer bound to it at offset 0, so the CPU's writes there are the GPU's
     // reads with no copy. Its console VA is `address` itself, the VA the title chose, so vertex, index and immediate
     // writes the title names by that VA find this buffer (VulkanContext::buffer_at). A shader that adds heap_base to
-    // that VA does not reach it: the title's own V#s into these pages need the single address space of
-    // docs/d3d12_vulkan.md section 3.3, which this does not decide. The pages stay the caller's: nothing is zeroed.
+    // that VA would not reach it, so the root views and V#s the layer writes for it name its device address minus
+    // heap_base instead (alias_title_va, docs/d3d12_vulkan.md section 3.3 "Title-placed buffers"); V#s the title
+    // writes into memory itself keep its VA. The pages stay the caller's: nothing is zeroed.
     HRESULT create_host_buffer(void* address) {
         auto& vk = device_.context->vk;
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;

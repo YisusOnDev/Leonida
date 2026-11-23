@@ -1570,6 +1570,28 @@ Arena VAs (at most 4095 MiB, so 32-bit) pass. A VA biased from outside the arena
 VAs above are at or above 2^40 as unsigned values. That is one more reason for the rule above that every buffer
 a console client can address is an arena range, whichever heap it comes from.
 
+**Title-placed buffers (device slot 133).** Here the title, not the layer, chooses the VA: `CreatePlacedResourceX`
+puts a buffer at the CPU address of the title's own pages. On Windows that is a user-mode address around 1.5 TiB,
+far past the arena (at most 4095 MiB, and descriptor tables must stay below 4 GiB), so `heap_base + title_va`
+names nothing the layer made. The layer therefore translates the title's VA where it
+writes an address itself: root CBV/SRV/UAV arguments (`SetGraphicsRoot*View`, `SetComputeRoot*View`) and the base
+of the V# it writes for a CBV or a buffer SRV/UAV (counter included). An address inside a title-placed buffer
+becomes the console VA of that buffer's GPU copy (`runtime/src/title_va_alias.h`); every other address is left
+alone, and the range is forgotten when the buffer is released.
+- When the pages can't be imported (write-combined or uncommitted pages, a missing extension, an import budget),
+  the copy is the per-submission shadow, and the shadow is an **arena range** when it fits. Its console VA is the
+  arena offset: below 4 GiB, so it holds in a root argument, in a V#'s 48 bits and in a 32-bit table pointer alike.
+  When the arena has no room, the shadow keeps its own memory and is biased like an upload buffer (logged once;
+  raise `LEONIDA_ARENA_MB`).
+- When the pages are imported (`VK_EXT_external_memory_host`), the copy is the import and its console VA is its
+  device address minus `heap_base` (mod 2^64): exact for 64-bit root arguments, and for a V# only when the driver
+  put the import above the arena (otherwise logged once, as measured for upload buffers above).
+- The title's own VA is still what `GetGPUVirtualAddress` answers and what vertex, index, copy and immediate-write
+  calls resolve through the buffer VA index, so nothing the title reads back changes.
+- **Not covered:** a pointer or V# the title writes into memory itself (inside its constant data, say). The layer
+  never sees it, so it keeps the title's VA. Covering it needs the title's pages inside the GPU address space
+  (one of the options in #7218's design note) or the translator rewriting addresses.
+
 Why not give each buffer its own BDA and set `heap_base = 0`? Because 25,865 of the 26,503 shaders (97.6%)
 truncate descriptor-table pointers to 32 bits, and host BDAs are not guaranteed to be below 4 GB. The arena keeps console VAs low and stable.
 
