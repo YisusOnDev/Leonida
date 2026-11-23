@@ -2,8 +2,8 @@
 //
 // A GDK title names its files on the console's drives, "GAME:\\data\\x.sps" being one in the installed game folder, so
 // the imports it makes of CreateFile*, FindFirstFile*/FindNextFile*/FindClose, GetFileAttributes*/GetFileAttributesEx*,
-// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes* are answered
-// here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
+// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes*, and the
+// Universal CRT's fopen/_open families, are answered here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
 //     the overlay (RT-218); any other path is a host path and goes to the host;
@@ -26,6 +26,12 @@
 #include <intrin.h>
 
 #include <atomic>
+
+#include <fcntl.h>
+#include <share.h>
+
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -34,6 +40,8 @@
 #include <memory>
 #include <mutex>
 #include <set>
+
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -449,6 +457,13 @@ bool writes(DWORD access, DWORD disposition) {
 
 Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
     if (!writes(access, disposition)) return read_target(path);
+    // CREATE_NEW fails on any name the title can see; the host would only look in the overlay, so a file only the
+    // package has would be shadowed by a new empty one.
+    if (disposition == CREATE_NEW) {
+        std::vector<std::wstring> parts;
+        if (parse_console(path, parts) == Parsed::Console && !parts.empty() && view(roots(), parts).kind != Kind::None)
+            return fail(ERROR_FILE_EXISTS);
+    }
     // OPEN_ALWAYS and TRUNCATE_EXISTING read what is already there, and a write-open must not lose a package file's
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
@@ -1342,6 +1357,245 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+// ---- CRT opens (RT-354)
+//
+// A package DLL linked against the dynamic CRT opens files through ucrtbase, whose own CreateFileW is the host's, so a
+// GAME: path reached it as a relative name. These shims map a console path with open_target, the rules CreateFile
+// uses, and hand the host path to ucrtbase's wide function, so the FILE* or descriptor belongs to the CRT the caller
+// reads it with (gta6rt links the static CRT). A host path, and an open the CRT rejects itself (a null name, a bad
+// mode), go to ucrtbase unchanged.
+namespace {
+
+struct OpenIntent {
+    DWORD access = 0;
+    DWORD disposition = 0;
+};
+
+template <typename Fn>
+Fn ucrt(const char* name) {
+    static const HMODULE module = ::LoadLibraryW(L"ucrtbase.dll");
+    return reinterpret_cast<Fn>(::GetProcAddress(module, name));
+}
+
+// The errors open_target can give, mapped as the CRT maps them.
+void set_crt_error(DWORD error) {
+    int e = EINVAL;
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) e = ENOENT;
+    if (error == ERROR_ACCESS_DENIED) e = EACCES;
+    if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) e = EEXIST;
+    if (error == ERROR_DISK_FULL) e = ENOSPC;
+    ucrt<errno_t(__cdecl*)(unsigned long)>("_set_doserrno")(error);
+    ucrt<errno_t(__cdecl*)(int)>("_set_errno")(e);
+    ::SetLastError(error);
+}
+
+// fopen's mode as the CRT reads it: leading spaces skipped, r opens an existing file, w creates or truncates (wx fails
+// on an existing one), a creates or appends, '+' adds the other direction; ",ccs=" and the rest only change how the
+// stream is read. Any other first letter is the CRT's to reject.
+std::optional<OpenIntent> from_mode(const wchar_t* mode) {
+    if (!mode) return std::nullopt;
+    while (*mode == L' ') ++mode;
+    bool plus = false, exclusive = false;
+    for (const wchar_t* p = mode; *p && *p != L','; ++p) {
+        if (*p == L'+') plus = true;
+        if (*p == L'x') exclusive = true;
+    }
+    const DWORD other = plus ? GENERIC_READ | GENERIC_WRITE : 0u;
+    switch (*mode) {
+        case L'r': return OpenIntent{GENERIC_READ | other, OPEN_EXISTING};
+        case L'w': return OpenIntent{GENERIC_WRITE | other, static_cast<DWORD>(exclusive ? CREATE_NEW : CREATE_ALWAYS)};
+        case L'a': return OpenIntent{GENERIC_WRITE | other, OPEN_ALWAYS};
+        default: return std::nullopt;
+    }
+}
+
+// The _O_ flags as the CRT turns them into a CreateFile disposition.
+OpenIntent from_oflag(int oflag) {
+    OpenIntent o;
+    o.access = (oflag & (_O_WRONLY | _O_RDWR)) ? GENERIC_WRITE : GENERIC_READ;
+    switch (oflag & (_O_CREAT | _O_EXCL | _O_TRUNC)) {
+        case _O_CREAT: o.disposition = OPEN_ALWAYS; break;
+        case _O_CREAT | _O_EXCL:
+        case _O_CREAT | _O_EXCL | _O_TRUNC: o.disposition = CREATE_NEW; break;
+        case _O_CREAT | _O_TRUNC: o.disposition = CREATE_ALWAYS; break;
+        case _O_TRUNC:
+        case _O_TRUNC | _O_EXCL: o.disposition = TRUNCATE_EXISTING; break;
+        default: o.disposition = OPEN_EXISTING; break;
+    }
+    return o;
+}
+
+// False, with errno set, when a console path is refused. `mapped` is left empty when the caller should pass its own
+// arguments through: a host path, or an open the CRT rejects itself.
+bool map_open(const wchar_t* name, const std::optional<OpenIntent>& intent, std::wstring& mapped) {
+    if (!name || !intent) return true;
+    const Target t = open_target(name, intent->access, intent->disposition);
+    if (t.error) {
+        set_crt_error(t.error);
+        return false;
+    }
+    if (t.path.native() != name) mapped = t.path.native();
+    return true;
+}
+
+bool map_open_a(const char* name, const std::optional<OpenIntent>& intent, std::wstring& mapped) {
+    return !name || map_open(widen_ansi(name).c_str(), intent, mapped);
+}
+
+std::optional<OpenIntent> from_mode_a(const char* mode) {
+    return mode ? from_mode(widen_ansi(mode).c_str()) : std::nullopt;
+}
+
+using WfsopenFn = FILE*(__cdecl*)(const wchar_t*, const wchar_t*, int);
+using WfopenSFn = errno_t(__cdecl*)(FILE**, const wchar_t*, const wchar_t*);
+using WfreopenFn = FILE*(__cdecl*)(const wchar_t*, const wchar_t*, FILE*);
+using WfreopenSFn = errno_t(__cdecl*)(FILE**, const wchar_t*, const wchar_t*, FILE*);
+using WsopenDispatchFn = errno_t(__cdecl*)(const wchar_t*, int, int, int, int*, int);
+
+// The errno set_crt_error left, as the _s functions return it.
+errno_t crt_errno() { return *ucrt<int*(__cdecl*)()>("_errno")(); }
+
+
+}  // namespace
+
+FILE* __cdecl crt_wfopen(const wchar_t* name, const wchar_t* mode) {
+    std::wstring mapped;
+    if (!map_open(name, from_mode(mode), mapped)) return nullptr;
+    return ucrt<FILE*(__cdecl*)(const wchar_t*, const wchar_t*)>("_wfopen")(mapped.empty() ? name : mapped.c_str(),
+                                                                          mode);
+}
+
+FILE* __cdecl crt_fopen(const char* name, const char* mode) {
+    std::wstring mapped;
+    if (!map_open_a(name, from_mode_a(mode), mapped)) return nullptr;
+    if (mapped.empty()) return ucrt<FILE*(__cdecl*)(const char*, const char*)>("fopen")(name, mode);
+    return ucrt<FILE*(__cdecl*)(const wchar_t*, const wchar_t*)>("_wfopen")(mapped.c_str(), widen_ansi(mode).c_str());
+}
+
+FILE* __cdecl crt_wfsopen(const wchar_t* name, const wchar_t* mode, int share) {
+    std::wstring mapped;
+    if (!map_open(name, from_mode(mode), mapped)) return nullptr;
+    return ucrt<WfsopenFn>("_wfsopen")(mapped.empty() ? name : mapped.c_str(), mode, share);
+}
+
+FILE* __cdecl crt_fsopen(const char* name, const char* mode, int share) {
+    std::wstring mapped;
+    if (!map_open_a(name, from_mode_a(mode), mapped)) return nullptr;
+    if (mapped.empty()) return ucrt<FILE*(__cdecl*)(const char*, const char*, int)>("_fsopen")(name, mode, share);
+    return ucrt<WfsopenFn>("_wfsopen")(mapped.c_str(), widen_ansi(mode).c_str(), share);
+}
+
+errno_t __cdecl crt_wfopen_s(FILE** stream, const wchar_t* name, const wchar_t* mode) {
+    std::wstring mapped;
+    if (!map_open(name, from_mode(mode), mapped)) {
+        if (stream) *stream = nullptr;
+        return crt_errno();
+    }
+    return ucrt<WfopenSFn>("_wfopen_s")(stream, mapped.empty() ? name : mapped.c_str(), mode);
+}
+
+errno_t __cdecl crt_fopen_s(FILE** stream, const char* name, const char* mode) {
+    std::wstring mapped;
+    if (!map_open_a(name, from_mode_a(mode), mapped)) {
+        if (stream) *stream = nullptr;
+        return crt_errno();
+    }
+    if (mapped.empty()) {
+        return ucrt<errno_t(__cdecl*)(FILE**, const char*, const char*)>("fopen_s")(stream, name, mode);
+    }
+    return ucrt<WfopenSFn>("_wfopen_s")(stream, mapped.c_str(), widen_ansi(mode).c_str());
+}
+
+FILE* __cdecl crt_wfreopen(const wchar_t* name, const wchar_t* mode, FILE* stream) {
+    std::wstring mapped;
+    if (!map_open(name, from_mode(mode), mapped)) return nullptr;
+    return ucrt<WfreopenFn>("_wfreopen")(mapped.empty() ? name : mapped.c_str(), mode, stream);
+}
+
+FILE* __cdecl crt_freopen(const char* name, const char* mode, FILE* stream) {
+    std::wstring mapped;
+    if (!map_open_a(name, from_mode_a(mode), mapped)) return nullptr;
+    if (mapped.empty()) {
+        return ucrt<FILE*(__cdecl*)(const char*, const char*, FILE*)>("freopen")(name, mode, stream);
+    }
+    return ucrt<WfreopenFn>("_wfreopen")(mapped.c_str(), widen_ansi(mode).c_str(), stream);
+}
+
+errno_t __cdecl crt_wfreopen_s(FILE** out, const wchar_t* name, const wchar_t* mode, FILE* stream) {
+    std::wstring mapped;
+    if (!map_open(name, from_mode(mode), mapped)) {
+        if (out) *out = nullptr;
+        return crt_errno();
+    }
+    return ucrt<WfreopenSFn>("_wfreopen_s")(out, mapped.empty() ? name : mapped.c_str(), mode, stream);
+}
+
+errno_t __cdecl crt_freopen_s(FILE** out, const char* name, const char* mode, FILE* stream) {
+    std::wstring mapped;
+    if (!map_open_a(name, from_mode_a(mode), mapped)) {
+        if (out) *out = nullptr;
+        return crt_errno();
+    }
+    if (mapped.empty()) {
+        return ucrt<errno_t(__cdecl*)(FILE**, const char*, const char*, FILE*)>("freopen_s")(out, name, mode, stream);
+    }
+    return ucrt<WfreopenSFn>("_wfreopen_s")(out, mapped.c_str(), widen_ansi(mode).c_str(), stream);
+}
+
+// The descriptor opens all end in _wsopen_dispatch, as they do inside the CRT; `secure` is _sopen_s's pmode check.
+// _open, _wopen, _sopen and _wsopen are variadic in C: their pmode is the next int argument, which the x64 convention
+// passes in the same register a fixed parameter would use.
+errno_t __cdecl crt_wsopen_dispatch(const wchar_t* name, int oflag, int share, int pmode, int* fd, int secure) {
+    std::wstring mapped;
+    if (!map_open(name, from_oflag(oflag), mapped)) {
+        if (fd) *fd = -1;
+        return crt_errno();
+    }
+    return ucrt<WsopenDispatchFn>("_wsopen_dispatch")(mapped.empty() ? name : mapped.c_str(), oflag, share, pmode, fd,
+                                                      secure);
+}
+
+errno_t __cdecl crt_sopen_dispatch(const char* name, int oflag, int share, int pmode, int* fd, int secure) {
+    std::wstring mapped;
+    if (!map_open_a(name, from_oflag(oflag), mapped)) {
+        if (fd) *fd = -1;
+        return crt_errno();
+    }
+    if (mapped.empty()) {
+        return ucrt<errno_t(__cdecl*)(const char*, int, int, int, int*, int)>("_sopen_dispatch")(name, oflag, share,
+                                                                                               pmode, fd, secure);
+    }
+    return ucrt<WsopenDispatchFn>("_wsopen_dispatch")(mapped.c_str(), oflag, share, pmode, fd, secure);
+}
+
+int __cdecl crt_wopen(const wchar_t* name, int oflag, int pmode) {
+    int fd = -1;
+    return crt_wsopen_dispatch(name, oflag, _SH_DENYNO, pmode, &fd, 0) == 0 ? fd : -1;
+}
+
+int __cdecl crt_open(const char* name, int oflag, int pmode) {
+    int fd = -1;
+    return crt_sopen_dispatch(name, oflag, _SH_DENYNO, pmode, &fd, 0) == 0 ? fd : -1;
+}
+
+int __cdecl crt_wsopen(const wchar_t* name, int oflag, int share, int pmode) {
+    int fd = -1;
+    return crt_wsopen_dispatch(name, oflag, share, pmode, &fd, 0) == 0 ? fd : -1;
+}
+
+int __cdecl crt_sopen(const char* name, int oflag, int share, int pmode) {
+    int fd = -1;
+    return crt_sopen_dispatch(name, oflag, share, pmode, &fd, 0) == 0 ? fd : -1;
+}
+
+errno_t __cdecl crt_wsopen_s(int* fd, const wchar_t* name, int oflag, int share, int pmode) {
+    return crt_wsopen_dispatch(name, oflag, share, pmode, fd, 1);
+}
+
+errno_t __cdecl crt_sopen_s(int* fd, const char* name, int oflag, int share, int pmode) {
+    return crt_sopen_dispatch(name, oflag, share, pmode, fd, 1);
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1413,6 +1667,28 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
         {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                     \
         {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)}
+
+// The Universal CRT's opens, under the api set a package DLL links (api-ms-win-crt-stdio-l1-1-0) and under ucrtbase
+// itself, which that set forwards to.
+#define CRT_OPEN_API(dll)                                                                                \
+    {dll, "fopen", reinterpret_cast<void*>(&crt_fopen)},                                                 \
+        {dll, "_wfopen", reinterpret_cast<void*>(&crt_wfopen)},                                          \
+        {dll, "_fsopen", reinterpret_cast<void*>(&crt_fsopen)},                                          \
+        {dll, "_wfsopen", reinterpret_cast<void*>(&crt_wfsopen)},                                        \
+        {dll, "fopen_s", reinterpret_cast<void*>(&crt_fopen_s)},                                         \
+        {dll, "_wfopen_s", reinterpret_cast<void*>(&crt_wfopen_s)},                                      \
+        {dll, "freopen", reinterpret_cast<void*>(&crt_freopen)},                                         \
+        {dll, "_wfreopen", reinterpret_cast<void*>(&crt_wfreopen)},                                      \
+        {dll, "freopen_s", reinterpret_cast<void*>(&crt_freopen_s)},                                     \
+        {dll, "_wfreopen_s", reinterpret_cast<void*>(&crt_wfreopen_s)},                                  \
+        {dll, "_open", reinterpret_cast<void*>(&crt_open)},                                              \
+        {dll, "_wopen", reinterpret_cast<void*>(&crt_wopen)},                                            \
+        {dll, "_sopen", reinterpret_cast<void*>(&crt_sopen)},                                            \
+        {dll, "_wsopen", reinterpret_cast<void*>(&crt_wsopen)},                                          \
+        {dll, "_sopen_s", reinterpret_cast<void*>(&crt_sopen_s)},                                        \
+        {dll, "_wsopen_s", reinterpret_cast<void*>(&crt_wsopen_s)},                                      \
+        {dll, "_sopen_dispatch", reinterpret_cast<void*>(&crt_sopen_dispatch)},                          \
+        {dll, "_wsopen_dispatch", reinterpret_cast<void*>(&crt_wsopen_dispatch)}
 }  // namespace
 
 SHIM_TABLE(file_system,
@@ -1421,4 +1697,6 @@ SHIM_TABLE(file_system,
     FILE_API("api-ms-win-core-file-l1-1-0.dll"),
     FILE_API("api-ms-win-core-file-l1-2-0.dll"),
     FILE_API("api-ms-win-core-file-l2-1-0.dll"),
+    CRT_OPEN_API("api-ms-win-crt-stdio-l1-1-0.dll"),
+    CRT_OPEN_API("ucrtbase.dll"),
 );

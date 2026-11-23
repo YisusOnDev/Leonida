@@ -284,6 +284,18 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   entry; a package file gets an overlay copy under the new spelling, and a package folder is refused like any other
   move of one.
 
+- The Universal CRT's opens follow the same rules (RT-354): `fopen`, `_wfopen`, `_fsopen`, `_wfsopen`, `fopen_s`,
+  `_wfopen_s`, `freopen`, `_wfreopen`, `freopen_s`, `_wfreopen_s`, `_open`, `_wopen`, `_sopen`, `_wsopen`,
+  `_sopen_s`, `_wsopen_s` and `_sopen_dispatch`/`_wsopen_dispatch` (which the C++ `_open` overloads call), under
+  `api-ms-win-crt-stdio-l1-1-0.dll` and `ucrtbase.dll`. A package DLL linked against the dynamic CRT opens files
+  through these, and ucrtbase's own `CreateFileW` is the host's, so a `GAME:` path used to reach it as a relative
+  name. The shim maps a console path with the `CreateFile` rules, deriving the access and disposition from the mode
+  or the `_O_` flags as the CRT does (`a` and `r+` copy a package file up, `w` creates in the overlay), and calls
+  ucrtbase's wide function with the host path, so the `FILE*` or descriptor belongs to the CRT the caller reads it
+  with. A refused path fails with `EINVAL` and a missing one with `ENOENT` in that CRT's `errno`. Host paths go to
+  ucrtbase unchanged. Not covered: the host's `msvcp140.dll` (every `std::fstream`), which `gta6rt` loads itself
+  and binds to the host CRT, and the CRT's other path calls (`remove`, `rename`, `_stat`, `_access`, `_mkdir`).
+
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
 ## When an unimplemented import is called
