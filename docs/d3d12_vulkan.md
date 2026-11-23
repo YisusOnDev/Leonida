@@ -2611,6 +2611,14 @@ The trace will enumerate them.
   row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;
   depth and stencil resolves → a `vkCmdBeginRendering` scope with a resolve attachment (section 3.2).
   Partial resolve regions to another offset need a shader or a region copy.
+  - Back-to-back copies are ordered. D3D12 runs two copies that touch one resource in order while it stays in
+    `COPY_DEST` or `COPY_SOURCE`, with no barrier from the application; Vulkan orders nothing by itself. An image's
+    copies are ordered by `copy_layout` (a memory barrier when no layout transition is due). A buffer has no layout,
+    so a copy that reads or writes a buffer is preceded by a memory barrier from earlier transfer writes (transfer
+    stage only). Without it a texture-to-buffer copy followed by a `CopyBufferRegion` over the same bytes read back
+    the texture's rows on an AMD Radeon RX 9060 XT (driver 26.10.44), 16 of 16 times; `d3d12_copy_order_test` holds
+    eight such pairs. `replay_cpu_bench`: a buffer copy's emit goes from 7.4 to 10.0 ns and from one Vulkan call to
+    two.
   - A placed footprint must have an `Offset` that is a multiple of 512 and a `RowPitch` that is a multiple of 256
     (`D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`, `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`). Any other is refused when it is
     recorded, so `Close` returns `E_INVALIDARG` (`CommandList::valid(const CopyLocation&)` in

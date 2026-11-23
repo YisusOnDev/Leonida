@@ -175,6 +175,10 @@ struct MockReplay {
             }
             current->events.push_back("native_copy");
         };
+        // A buffer copy is ordered after earlier transfer writes (vulkan_replay.h, the copy branch of emit); the mock
+        // runs every command in order already, so the barrier is nothing here.
+        v.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, unsigned,
+            const VkMemoryBarrier*, unsigned, const VkBufferMemoryBarrier*, unsigned, const VkImageMemoryBarrier*) {};
         // Capability entries are never called in buffer-only tests.
         v.copy_buffer_to_image = +[](VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, unsigned,
             const VkBufferImageCopy*) {

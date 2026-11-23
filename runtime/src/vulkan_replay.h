@@ -3743,11 +3743,21 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             const auto [dst_id, src_id] = copy_ids(command);
+            // D3D12 orders back-to-back copies on a buffer that stays in COPY_DEST or COPY_SOURCE, as it does on a
+            // texture; Vulkan does not. copy_layout orders an image's copies; a buffer has no layout, so the copy
+            // that reads or writes one comes after every earlier transfer write here. Without it a texture-to-buffer
+            // copy followed by a buffer copy over the same bytes left the texture's rows in the buffer on an AMD
+            // RX 9060 XT (d3d12_copy_order_test).
+            const auto after_buffer_writes = [&](VkAccessFlags access) {
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       access, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            };
             if (!p.predicated_copy.empty()) {
                 end_statistics();
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
             } else if (!p.buffer_copies.empty()) {
+                after_buffer_writes(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
             } else if (p.staged) {
@@ -3804,6 +3814,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 std::vector<VkBufferImageCopy> converted;
                 const std::vector<VkBufferImageCopy>* regions = &p.buffer_image_copies;
                 if (p.tile_scratch) {
+                    after_buffer_writes(VK_ACCESS_TRANSFER_READ_BIT);  // the source buffer's earlier writes
                     vk.copy_buffer(command_buffer, source, p.tile_scratch, std::uint32_t(p.tile_rows.size()),
                                    p.tile_rows.data());
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -3825,6 +3836,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     converted[0].bufferImageHeight = 0;
                     regions = &converted;
                     source = p.depth24.scratch;
+                } else {
+                    after_buffer_writes(VK_ACCESS_TRANSFER_READ_BIT);  // the source buffer's earlier writes
                 }
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
@@ -3836,6 +3849,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
                 if (!p.has_depth24) {
+                    // The destination buffer's earlier writes, also when the rows go through the tile scratch first.
+                    after_buffer_writes(VK_ACCESS_TRANSFER_WRITE_BIT);
                     const auto target = p.tile_scratch ? p.tile_scratch : p.binding.buffer;
                     vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, target,
                                             std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
