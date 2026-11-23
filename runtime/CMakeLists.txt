@@ -209,10 +209,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   endif()
 
   # xmem shim ABI test: resolves the registered xmem.dll exports itself, so xmem.cpp and registry.cpp are compiled
-  # into this executable instead of reusing gta6rt's objects (which would duplicate their symbols).
+  # into this executable instead of reusing gta6rt's objects (which would duplicate their symbols). file_system.cpp
+  # too, for its ReadFile shims, which commit physical pages before the kernel writes them.
   add_executable(xmem_test
     test/xmem_test.cpp
     shims/xmem.cpp
+    shims/file_system.cpp
     shims/registry.cpp
   )
   target_include_directories(xmem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)

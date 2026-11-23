@@ -38,6 +38,7 @@
 #include "shims.h"
 #include "startup_trace.h"
 #include "xmem.h"
+#include "kernel_write_hook.h"
 
 namespace {
 
@@ -555,8 +556,16 @@ LONG CALLBACK physical_page_fault(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// rt::kernel_write's hook: the file shims' reads commit the destination's physical pages first, since the kernel's
+// write raises no first-touch fault.
+void commit_before_kernel_write(const void* address, size_t size) { rt::xmem::commit_physical_range(address, size); }
+
 bool install_physical_page_fault_handler() {
-    static const bool installed = AddVectoredExceptionHandler(1, &physical_page_fault) != nullptr;
+    static const bool installed = [] {
+        if (!AddVectoredExceptionHandler(1, &physical_page_fault)) return false;
+        rt::kernel_write::set_hook(&commit_before_kernel_write);
+        return true;
+    }();
     return installed;
 }
 

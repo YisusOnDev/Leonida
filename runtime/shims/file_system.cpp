@@ -41,6 +41,7 @@
 #include "file_system.h"
 #include "shims.h"
 #include "startup_trace.h"
+#include "kernel_write_hook.h"
 
 namespace rt::fs {
 namespace {
@@ -1346,9 +1347,35 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
 namespace {
 using namespace rt::fs;
 
+// The title's reads into its own memory. The kernel writes the destination, which raises no fault in it: xmem's
+// physical pages, committed on the title's first touch, would fail the read with ERROR_NOACCESS while not committed
+// yet. So the destination is prepared first (rt::kernel_write::before; xmem commits its pages there).
+BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped) {
+    rt::kernel_write::before(buffer, bytes);
+    return ::ReadFile(file, buffer, bytes, read, overlapped);
+}
+
+BOOL WINAPI read_file_ex(HANDLE file, LPVOID buffer, DWORD bytes, LPOVERLAPPED overlapped,
+                         LPOVERLAPPED_COMPLETION_ROUTINE routine) {
+    rt::kernel_write::before(buffer, bytes);
+    return ::ReadFileEx(file, buffer, bytes, overlapped, routine);
+}
+
+// Each segment is one system page.
+BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWORD bytes, LPDWORD reserved,
+                              LPOVERLAPPED overlapped) {
+    if (segments) {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        for (DWORD i = 0, n = (bytes + info.dwPageSize - 1) / info.dwPageSize; i < n; ++i)
+            rt::kernel_write::before(segments[i].Buffer, info.dwPageSize);
+    }
+    return ::ReadFileScatter(file, segments, bytes, reserved, overlapped);
+}
+
 // CreateFile, the FindFirstFile family, the attribute queries and DeleteFile arrive through kernel32/kernelbase
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
-// file-l1-2-0 and file-l2-1-0 for CreateFile).
+// file-l1-2-0 and file-l2-1-0 for CreateFile; ReadFile and its variants are in file-l1-1-0).
 #define FILE_API(dll)                                                                                    \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
@@ -1382,7 +1409,10 @@ using namespace rt::fs;
         {dll, "CopyFileExW", reinterpret_cast<void*>(&copy_file_ex_w)},                                  \
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
-        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
+        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
+        {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                     \
+        {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)}
 }  // namespace
 
 SHIM_TABLE(file_system,

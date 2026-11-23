@@ -754,6 +754,112 @@ void test_first_touch_during_remap(const PhysicalApi& api) {
 }
 
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
+// The title's ReadFile into physical pages it never touched. xmem commits a physical page on the title's first touch
+// (a fault); the kernel's write raises none, so a plain ReadFile into a page not committed yet fails with
+// ERROR_NOACCESS (the control). The file shims the title's ReadFile, ReadFileEx and ReadFileScatter resolve to
+// (file_system.cpp) commit the destination first: the read succeeds with the file's bytes, synchronously and with an
+// overlapped read on an asynchronous handle. Each read lands in a page nothing touched before, checked with
+// VirtualQuery.
+using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+using ReadFileExFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE);
+
+bool committed(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT;
+}
+
+void CALLBACK read_done(DWORD, DWORD, LPOVERLAPPED) {}
+
+void test_read_file_into_untouched_pages(const PhysicalApi& api) {
+    const auto read_file = reinterpret_cast<ReadFileFn>(rt::shims::find("kernel32.dll", "ReadFile"));
+    const auto read_file_set = reinterpret_cast<ReadFileFn>(rt::shims::find("api-ms-win-core-file-l1-1-0.dll", "ReadFile"));
+    const auto read_file_ex = reinterpret_cast<ReadFileExFn>(rt::shims::find("kernel32.dll", "ReadFileEx"));
+    check(read_file != nullptr && read_file_set != nullptr && read_file_ex != nullptr &&
+              rt::shims::find("kernelbase.dll", "ReadFileScatter") != nullptr,
+          "the registry exposes the ReadFile shims (kernel32, kernelbase, file-l1-1-0)");
+    if (!read_file || !read_file_ex) return;
+
+    constexpr uint64_t kCount = 5;
+    std::vector<uint64_t> pages(kCount);
+    uint64_t got = kCount;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kCount * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    if (!window || api.allocate(0x380, &got, pages.data()) != TRUE || got != kCount ||
+        api.map(window, kCount, pages.data()) != window) {
+        check(false, "a window of five untouched physical pages for the ReadFile checks");
+        return;
+    }
+    bool untouched = true;
+    for (uint64_t i = 0; i < kCount; ++i) untouched = untouched && !committed(window + i * kPage64k);
+    check(untouched, "the five mapped pages are not committed before anything touches them");
+
+    wchar_t directory[MAX_PATH]{};
+    wchar_t path[MAX_PATH]{};
+    std::vector<uint8_t> file(2 * kPage64k);
+    for (size_t i = 0; i < file.size(); ++i) file[i] = static_cast<uint8_t>(i * 151u + (i >> 12) + 3u);
+    bool wrote = false;
+    if (GetTempPathW(MAX_PATH, directory) && GetTempFileNameW(directory, L"xrf", 0, path)) {
+        const HANDLE out = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        DWORD bytes = 0;
+        wrote = out != INVALID_HANDLE_VALUE &&
+                WriteFile(out, file.data(), static_cast<DWORD>(file.size()), &bytes, nullptr) && bytes == file.size();
+        if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    }
+    check(wrote, "a 128 KiB file to read from");
+    if (wrote) {
+        HANDLE in = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        // The control: the host's ReadFile into an untouched page fails, and the page stays uncommitted.
+        DWORD bytes = 0;
+        const BOOL plain = ::ReadFile(in, window, static_cast<DWORD>(kPage64k), &bytes, nullptr);
+        const DWORD plain_error = plain ? 0 : GetLastError();
+        check(!plain && plain_error == ERROR_NOACCESS && !committed(window),
+              "control: the host's ReadFile into an untouched physical page fails with ERROR_NOACCESS");
+
+        // Through the kernel32 shim, into the same page.
+        SetFilePointer(in, 0, nullptr, FILE_BEGIN);
+        bytes = 0;
+        const BOOL ok = read_file(in, window, static_cast<DWORD>(kPage64k), &bytes, nullptr);
+        check(ok && bytes == kPage64k && std::memcmp(window, file.data(), kPage64k) == 0,
+              "ReadFile through the shim fills an untouched physical page with the file's bytes");
+        // Through the api-set entry, into the next page, at an offset inside it and across into the page after.
+        SetFilePointer(in, 0, nullptr, FILE_BEGIN);
+        bytes = 0;
+        uint8_t* const straddle = window + kPage64k + 0x8000;
+        const BOOL ok_set = read_file_set(in, straddle, static_cast<DWORD>(kPage64k), &bytes, nullptr);
+        check(ok_set && bytes == kPage64k && std::memcmp(straddle, file.data(), kPage64k) == 0,
+              "ReadFile through api-ms-win-core-file-l1-1-0 fills a read that straddles two untouched pages");
+        CloseHandle(in);
+
+        // Overlapped, on an asynchronous handle, into the fourth page; then ReadFileEx into the fifth.
+        in = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        OVERLAPPED overlapped{};
+        overlapped.Offset = static_cast<DWORD>(kPage64k);
+        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        uint8_t* const fourth = window + 3 * kPage64k;
+        BOOL queued = read_file(in, fourth, static_cast<DWORD>(kPage64k), nullptr, &overlapped);
+        const bool pending = !queued && GetLastError() == ERROR_IO_PENDING;
+        bytes = 0;
+        const bool done = (queued || pending) && GetOverlappedResult(in, &overlapped, &bytes, TRUE) && bytes == kPage64k;
+        check(done && std::memcmp(fourth, file.data() + kPage64k, kPage64k) == 0,
+              "an overlapped ReadFile through the shim fills an untouched physical page");
+        OVERLAPPED ex{};
+        ex.hEvent = overlapped.hEvent;
+        ResetEvent(overlapped.hEvent);
+        uint8_t* const fifth = window + 4 * kPage64k;
+        queued = read_file_ex(in, fifth, static_cast<DWORD>(kPage64k), &ex, &read_done);
+        bytes = 0;
+        const bool ex_done = queued && GetOverlappedResult(in, &ex, &bytes, TRUE) && bytes == kPage64k;
+        SleepEx(0, TRUE);  // runs the completion routine
+        check(ex_done && std::memcmp(fifth, file.data(), kPage64k) == 0,
+              "ReadFileEx through the shim fills an untouched physical page");
+        CloseHandle(overlapped.hEvent);
+        CloseHandle(in);
+        DeleteFileW(path);
+    }
+    check(api.map(window, kCount, nullptr) == window, "the window unmaps");
+    check(api.free_pages(kCount, pages.data()) == TRUE, "XMemFreePhysicalPages frees the five pages");
+}
+
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
         api.virtual_alloc(nullptr, 6 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
@@ -1066,6 +1172,7 @@ int main() {
         test_first_touch_during_remap(physical);
         test_placeholders(physical);
         test_write_combine_window(physical);
+        test_read_file_into_untouched_pages(physical);
     }
 
     print_result();
