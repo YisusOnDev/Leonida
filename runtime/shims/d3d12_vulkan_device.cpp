@@ -30,6 +30,7 @@
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
+#include "../src/title_va_alias.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
@@ -118,6 +119,17 @@ leonida::DebugProbe debug_probe_from_env() {
     if (!settings.problem.empty() && first_time(settings.problem))
         std::fprintf(stderr, "[rt] d3d12: %s\n", settings.problem.c_str());
     return settings;
+// The base address a V# gets for a buffer address: inside a buffer the title placed at its own VA (device slot
+// 133), the console VA of the buffer's GPU copy (src/title_va_alias.h, docs/d3d12_vulkan.md section 3.3); anything
+// else unchanged. A V# keeps 48 address bits. An arena copy always fits; an imported buffer's address is its device
+// address minus heap_base, which wraps when the driver put it below the arena: logged, and written as before.
+std::uint64_t vsharp_address(std::uint64_t va) {
+    const std::uint64_t to = leonida::title_va_aliases().shader_va(va);
+    if (to != va && (to >> 48))
+        log_once("a V# names a title-placed buffer whose GPU copy lies below heap_base, out of a V#'s 48 bits; "
+                 "address bits 48-63:",
+                 int(to >> 48));
+    return to;
 }
 
 // memcpy that a page fault ends instead of killing the process: the title may decommit a page between the
@@ -2072,6 +2084,7 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
+        if (aliased_) leonida::title_va_aliases().remove(va_, title_alias_);
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
@@ -2379,7 +2392,17 @@ public:
         binding.host_readable = true;
         binding.va = va_;
         device_.context->add_resource(id(), binding);
+        // Shaders reach the imported pages by their device address (src/title_va_alias.h).
+        if (buffer_va_) alias_title_va(buffer_va_ - device_.arena.address);
         return S_OK;
+    }
+
+    // Registers [va_, va_ + width) as reached by shaders at `shader_va` (src/title_va_alias.h): the root views and
+    // buffer V#s the layer writes for an address in it get the matching address of the buffer's GPU copy.
+    void alias_title_va(std::uint64_t shader_va) {
+        if (!leonida::title_va_aliases().add(va_, desc_.Width, shader_va)) return;
+        title_alias_ = shader_va;
+        aliased_ = true;
     }
 
     // The fallback of create_host_buffer, for pages the driver will not import: write-combined or uncached ones (in
@@ -2396,6 +2419,35 @@ public:
         auto& vk = device_.context->vk;
         if (!address || !desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
             return E_INVALIDARG;
+        const auto* pages = static_cast<const std::uint8_t*>(address);
+        // The shadow is a range of the GPU address arena when it fits there (docs/d3d12_vulkan.md section 3.3).
+        // The title's VA is about 1.5 TiB on Windows, far past the arena, so a shader's heap_base + VA would miss
+        // any buffer of the layer's; the root views and V#s the layer writes for that VA name the arena offset
+        // instead (src/title_va_alias.h), a VA below 4 GiB that a root view and a V#'s 48 bits both hold. The arena
+        // is host-visible, so the per-submission copy writes it in place.
+        if (device_.arena.mapped && device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                                                           arena_offset_, DeviceState::arena_buffer)) {
+            in_arena_ = true;
+            title_shadow_ = device_.arena.mapped + arena_offset_;
+            copy_title_pages(title_shadow_, pages, std::size_t(desc_.Width));
+            mapped_ = address;
+            va_ = reinterpret_cast<std::uintptr_t>(address);
+            buffer_va_ = gpu_va_ = device_.arena.address + arena_offset_;
+            device_.log_va("title-placed buffer (arena shadow)", va_, desc_.Width);
+            leonida::ResourceBinding binding{};
+            binding.buffer = device_.arena.buffer;
+            binding.buffer_offset = arena_offset_;
+            binding.size = desc_.Width;
+            binding.host = title_shadow_;
+            binding.va = va_;
+            device_.context->add_resource(id(), binding);
+            device_.add_shadow({pages, title_shadow_, std::size_t(desc_.Width)});
+            alias_title_va(arena_offset_);
+            return S_OK;
+        }
+        log_once("a title-placed shadow buffer does not fit the GPU address arena (raise LEONIDA_ARENA_MB), so it "
+                 "has its own memory; size in KiB:",
+                 int(desc_.Width / 1024));
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = desc_.Width;
@@ -2442,6 +2494,7 @@ public:
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         device_.add_shadow({pages, title_shadow_, std::size_t(desc_.Width)});
+        if (buffer_va_) alias_title_va(buffer_va_ - device_.arena.address);
         return S_OK;
     }
 
@@ -3099,6 +3152,8 @@ private:
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
     std::uint8_t* title_shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
+    bool aliased_ = false;            // va_ is in leonida::title_va_aliases(), reached at title_alias_
+    std::uint64_t title_alias_ = 0;
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -7114,6 +7169,7 @@ public:
         buffer.num_records = desc->SizeInBytes;
         buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
         buffer.oob_select = leonida::gfx10::OobSelect::raw;
+        buffer.address = vsharp_address(buffer.address);
         const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
@@ -7205,6 +7261,7 @@ public:
                 }
                 buffer.oob_select = leonida::gfx10::OobSelect::structured;
             }
+            buffer.address = vsharp_address(buffer.address);
             const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
             std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
             return;
@@ -7368,11 +7425,12 @@ public:
         buffer.swizzle = channels;
         buffer.oob_select = typed ? g::OobSelect::structured
                                   : structured ? g::OobSelect::structured_with_offset : g::OobSelect::raw;
+        buffer.address = vsharp_address(buffer.address);
         const g::BufferWords words = g::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         if (counter) {
             g::Buffer counter_buffer{};
-            counter_buffer.address = counter_va + view.CounterOffsetInBytes;
+            counter_buffer.address = vsharp_address(counter_va + view.CounterOffsetInBytes);
             counter_buffer.num_records = 4;
             counter_buffer.oob_select = g::OobSelect::raw;
             const g::BufferWords counter_words = g::encode(counter_buffer);
