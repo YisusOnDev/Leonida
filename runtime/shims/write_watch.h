@@ -1,7 +1,7 @@
 // LEONIDA_WATCH_XVA=<call>:<offset> (diagnostic): a hardware write watchpoint on the 8 bytes at <offset> (hex) into
 // the region the <call>-th XMemVirtualAlloc (0-based, counting every call) returns. Every thread gets debug register
 // DR0, re-applied every 20 ms for threads created later, and each hit goes to stderr with the thread, the value now
-// there and the writer's stack (module+RVA). Hits are logged and execution goes on, so the title's own writes (its
+// there and the writer's stack (module+RVA) and general registers. Hits are logged and execution goes on, so the title's own writes (its
 // constructor, its destructor) show up next to the one that corrupts it. Writes by the kernel (ReadFile into the
 // buffer) or the GPU raise no hit: a corrupted value with no hit for it came from one of those.
 #pragma once
@@ -38,6 +38,11 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
         std::fprintf(stderr, "[rt] watch: hit %d thread %lu value %016llx after %s stack %s\n", n, GetCurrentThreadId(),
                      static_cast<unsigned long long>(value), rt::startup_trace::where(c.Rip).c_str(),
                      rt::startup_trace::detail::stack_from(c).c_str());
+        std::fprintf(stderr,
+                     "[rt] watch: hit %d regs rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx rsp=%llx "
+                     "r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+                     n, c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13,
+                     c.R14, c.R15);
         std::fflush(stderr);
     }
     return EXCEPTION_CONTINUE_EXECUTION;
