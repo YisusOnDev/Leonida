@@ -9,15 +9,18 @@
 // (imported with VK_EXT_external_memory_host where the driver takes them) and write-combined pages (refused by the
 // import, so a shadow copy in the arena, the retail case on an RTX 5070 Ti). The data is written after the buffer
 // exists, so the shadow's copy before the submission is what the GPU reads.
-// Negative controls: a second title buffer with other data must not be what the first one's V# reads; an address
-// one byte past the title range, an arena buffer's VA, and the title's VA after the buffer is released are written
-// to a V# unchanged. The shader is test/glsl/cs_user_data.comp. No game data. LEONIDA_VK_VALIDATION=1 for the
+// Then the title's own memory outside any slot-133 buffer (a constant ring, #8862 section 3.5): a V# the CPU writes
+// into a bound table itself, a created CBV and a root view.
+// Negative controls: a second title buffer with other data must not be what the first one's V# reads; an arena
+// buffer's V# keeps its VA; the title's range is forgotten when the buffer is released; a raw arena V# and a
+// T#-shaped slot in a scanned table keep their bytes; a reserved, uncommitted address is left alone. The shader is test/glsl/cs_user_data.comp. No game data. LEONIDA_VK_VALIDATION=1 for the
 // Khronos validation layer.
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/gfx10_descriptors.h"
 #include "../src/shader_library.h"
 #include "../src/title_va_alias.h"
 
@@ -201,11 +204,6 @@ int check_kind(Context& c, const char* kind, DWORD protect, int& checks) {
     c.device->CreateShaderResourceView(title.p, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{cpu});
     c.device->CreateShaderResourceView(other.p, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + inc});
     EXPECT(vsharp_base(cpu) == ((shader_va + kSrvWord * 4) & 0xFFFFFFFFFFFFull));
-    // Negative controls, descriptor level: one byte past the title range is not translated.
-    const D3D12_CONSTANT_BUFFER_VIEW_DESC past{title_va + kPages, 256};
-    c.device->CreateConstantBufferView(&past, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 2 * inc});
-    EXPECT(vsharp_base(cpu + 2 * inc) == ((title_va + kPages) & 0xFFFFFFFFFFFFull));
-    ++checks;
 
     // An arena buffer for the V# read's result, a READBACK buffer for both results.
     const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
@@ -286,17 +284,163 @@ int check_kind(Context& c, const char* kind, DWORD protect, int& checks) {
     }
     EXPECT(root_ok == kElements);
 
-    // After release, the title's VA is no longer translated: a new view of it names the title's VA itself.
+    // After release, the buffer's range is gone from the table: its old copy is not named any more.
     title.reset();
-    const D3D12_CONSTANT_BUFFER_VIEW_DESC released{title_va, 256};
-    c.device->CreateConstantBufferView(&released, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 4 * inc});
-    EXPECT(vsharp_base(cpu + 4 * inc) == (title_va & 0xFFFFFFFFFFFFull));
     EXPECT(leonida::title_va_aliases().shader_va(title_va) == title_va);
     checks += 2;
     other.reset();
     heap.reset();
     VirtualFree(pages, 0, MEM_RELEASE);
     VirtualFree(other_pages, 0, MEM_RELEASE);
+    return 0;
+}
+
+// The title's own memory outside any slot-133 buffer: a VirtualAlloc range standing for its per-frame constant ring
+// (#8862 section 3.5). Three ways a shader is given an address in it, each read back through an arena buffer:
+//   - a buffer V# the CPU writes into a shader-visible heap itself, as the title does (rewritten before the submission);
+//   - a V# made by CreateConstantBufferView (translated when written);
+//   - a root view (translated when set).
+// Negative controls: a raw V# whose base is an arena buffer and a T#-shaped slot whose base is the ring keep their
+// bytes; an address the ring does not hold is left alone.
+int check_title_memory(Context& c, int& checks) {
+    constexpr UINT64 ring_bytes = 256 * 1024;
+    auto* ring = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, ring_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(ring);
+    const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
+    EXPECT(ring_va >= c.arena);
+    auto& aliases = leonida::title_va_aliases();
+    const std::uint64_t table_before = aliases.translated(leonida::TitleVaAliases::table_view);
+    const std::uint64_t created_before = aliases.translated(leonida::TitleVaAliases::created_view);
+    const std::uint64_t root_before = aliases.translated(leonida::TitleVaAliases::root_view);
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Ref<ID3D12Resource> out[3], readback;
+    for (auto& o : out)
+        EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                           IID_PPV_ARGS(&o.p))));
+    const auto readback_desc = buffer_desc(3 * kBytes);
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&readback.p))));
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    const std::uint64_t cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
+    const std::uint64_t gpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p);
+    const UINT inc = c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const auto raw_vsharp = [](std::uint64_t address) {
+        leonida::gfx10::Buffer b{};
+        b.address = address;
+        b.num_records = kBytes;
+        b.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+        b.oob_select = leonida::gfx10::OobSelect::raw;
+        return leonida::gfx10::encode(b);
+    };
+    // Slot 0: a V# the CPU writes itself, its base in the ring. Slot 1: CreateConstantBufferView of the ring.
+    // Slot 2: a raw 64-bit VA (out[2]) for the root-view mode. Slots 3 and 4: the negative controls.
+    const auto v0 = raw_vsharp(ring_va + 0x1000);
+    std::memcpy(reinterpret_cast<void*>(cpu), v0.data(), sizeof(v0));
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{ring_va + 0x2000, 256};
+    c.device->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + inc});
+    EXPECT(vsharp_base(cpu + inc) < c.arena);  // translated when written
+    const std::uint64_t out2 = out[2]->GetGPUVirtualAddress();
+    std::memcpy(reinterpret_cast<void*>(cpu + 2 * inc), &out2, sizeof(out2));
+    const auto arena_vsharp = raw_vsharp(out[0]->GetGPUVirtualAddress());
+    std::memcpy(reinterpret_cast<void*>(cpu + 3 * inc), arena_vsharp.data(), sizeof(arena_vsharp));
+    auto image_like = raw_vsharp(ring_va + 0x4000);
+    image_like[3] |= 0x8u << 28;  // TYPE: an image
+    std::memcpy(reinterpret_cast<void*>(cpu + 4 * inc), image_like.data(), sizeof(image_like));
+    std::uint8_t before3[32], before4[32];
+    std::memcpy(before3, reinterpret_cast<const void*>(cpu + 3 * inc), 32);
+    std::memcpy(before4, reinterpret_cast<const void*>(cpu + 4 * inc), 32);
+
+    // The ring's data, written before the submission (after the descriptors, as a title fills its ring per frame).
+    for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0xC0000000u + i * 7u;
+
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    ID3D12DescriptorHeap* heaps[] = {heap.p};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(c.root);
+    // The CPU-written V# (buffer SRV mode).
+    list->SetComputeRoot32BitConstant(0, 0, 0);
+    list->SetComputeRoot32BitConstant(0, 0xFFFFFFFFu, 1);
+    list->SetComputeRootUnorderedAccessView(1, out[0]->GetGPUVirtualAddress());
+    list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
+    list->Dispatch(1, 1, 1);
+    // The created CBV (CBV mode).
+    list->SetComputeRoot32BitConstant(0, 0, 1);
+    list->SetComputeRootUnorderedAccessView(1, out[1]->GetGPUVirtualAddress());
+    list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + inc});
+    list->Dispatch(1, 1, 1);
+    // A root view into the ring, read 256 bytes past its base, written through slot 2's raw VA.
+    list->SetComputeRoot32BitConstant(0, kRootAdd, 0);
+    list->SetComputeRoot32BitConstant(0, 0xFFFFFFFDu, 1);
+    list->SetComputeRootUnorderedAccessView(1, ring_va + 0x3000);
+    list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 2 * inc});
+    list->Dispatch(1, 1, 1);
+    // The negative-control slots are bound too, so the scan reads them.
+    list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 3 * inc});
+    list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 4 * inc});
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    list->ResourceBarrier(1, &barrier);
+    for (UINT k = 0; k < 3; ++k) {
+        D3D12_RESOURCE_BARRIER to_copy{};
+        to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy.Transition.pResource = out[k].p;
+        to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &to_copy);
+        list->CopyBufferRegion(readback.p, k * kBytes, out[k].p, 0, kBytes);
+    }
+    EXPECT(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    c.queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(c.queue->Signal(c.fence, ++c.fence_value)));
+    EXPECT(SUCCEEDED(c.fence->SetEventOnCompletion(c.fence_value, nullptr)));
+
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    const auto* got = static_cast<const std::uint32_t*>(mapped);
+    UINT raw_ok = 0, cbv_ok = 0, root_ok = 0;
+    for (UINT i = 0; i < kElements; ++i) {
+        if (got[i] == ring[0x1000 / 4 + i]) ++raw_ok;
+        if (got[kElements + i] == ring[0x2000 / 4 + i]) ++cbv_ok;
+        if (got[2 * kElements + i] == ring[0x3000 / 4 + 64 + i] + kRootAdd) ++root_ok;
+    }
+    readback->Unmap(0, nullptr);
+    const bool rewritten = vsharp_base(cpu) < c.arena;
+    const bool arena_kept = !std::memcmp(before3, reinterpret_cast<const void*>(cpu + 3 * inc), 32);
+    const bool image_kept = !std::memcmp(before4, reinterpret_cast<const void*>(cpu + 4 * inc), 32);
+    std::printf("title memory (a constant ring): CPU-written table V# %u/%u (rewritten before the submission: %s), "
+                "created CBV %u/%u, root view %u/%u; negative controls: arena V# kept %s, T#-shaped slot kept %s; "
+                "translated: %llu table V#, %llu created, %llu root\n",
+                raw_ok, kElements, rewritten ? "yes" : "no", cbv_ok, kElements, root_ok, kElements,
+                arena_kept ? "yes" : "no", image_kept ? "yes" : "no",
+                static_cast<unsigned long long>(aliases.translated(leonida::TitleVaAliases::table_view) - table_before),
+                static_cast<unsigned long long>(aliases.translated(leonida::TitleVaAliases::created_view) -
+                                                created_before),
+                static_cast<unsigned long long>(aliases.translated(leonida::TitleVaAliases::root_view) - root_before));
+    EXPECT(raw_ok == kElements && cbv_ok == kElements && root_ok == kElements);
+    EXPECT(rewritten && arena_kept && image_kept);
+    // An address in no committed page is not title memory: left alone, nothing made for it.
+    void* gone = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_READWRITE);
+    const auto gone_va = reinterpret_cast<std::uint64_t>(gone);
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC reserved_only{gone_va, 256};
+    c.device->CreateConstantBufferView(&reserved_only, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 5 * inc});
+    EXPECT(vsharp_base(cpu + 5 * inc) == (gone_va & 0xFFFFFFFFFFFFull));
+    VirtualFree(gone, 0, MEM_RELEASE);
+    checks += 3;
     return 0;
 }
 
@@ -386,6 +530,7 @@ int main() {
         EXPECT(c.arena > 0);
         if (check_kind(c, "read-write", PAGE_READWRITE, checks)) return 1;
         if (check_kind(c, "write-combined", PAGE_READWRITE | PAGE_WRITECOMBINE, checks)) return 1;
+        if (check_title_memory(c, checks)) return 1;
     }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
