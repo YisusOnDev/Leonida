@@ -196,6 +196,9 @@ struct VulkanDeviceInfo {
     // minImportedHostPointerAlignment): OpenExistingHeapFromAddress backs a heap with the caller's own committed
     // memory. Zero: existing heaps stay unsupported.
     VkDeviceSize host_pointer_alignment = 0;
+    // VK_EXT_device_fault (with deviceFault) is enabled on `device`: when VK_ERROR_DEVICE_LOST occurs,
+    // vkGetDeviceFaultInfoEXT is queried once for fault description, address records, and vendor fault codes.
+    bool device_fault = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -374,6 +377,7 @@ private:
     IUnknown* device_;
     HWND window_ = nullptr;
     std::unique_ptr<leonida::VulkanPresenter> presenter_;
+    std::atomic<bool> logged_device_lost_{false};
 };
 
 // Whether `device` (from create_vulkan_device*) was created with VK_EXT_swapchain_colorspace on its instance.

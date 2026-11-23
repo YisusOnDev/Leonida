@@ -29,6 +29,7 @@
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
 #include "../src/frame_pacer.h"
+#include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -135,6 +136,8 @@ struct DescriptorRange {
     SIZE_T real_start;
     const DeviceProxy* device;
     const HeapProxy* heap;
+    UINT stride;  // the layer's descriptor increment for the heap's type (slot 15), which sized the backing
+    bool mirror;  // the layer's handles in the range are readable memory: device writes are copied to the backing
 };
 
 // Immortal: late COM Release calls during process teardown may still unregister a heap or check the table.
@@ -159,13 +162,37 @@ DescriptorHeapBackingAlloc g_heap_alloc = nullptr;
 DescriptorHeapBackingFree g_heap_free = nullptr;
 bool g_heap_alloc_explicit = false;
 
+// True when [start, start + size) is committed memory that can be read. A PC driver's CPU descriptor handle may be
+// an opaque value rather than an address; the D3D12 layer's handles are addresses into its heap's storage.
+bool readable_memory(SIZE_T start, SIZE_T size) {
+    if (start == 0 || size == 0 || start > (std::numeric_limits<SIZE_T>::max)() - size) return false;
+    constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    for (SIZE_T at = start; at < start + size;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !(mbi.Protect & kReadable))
+            return false;
+        at = reinterpret_cast<SIZE_T>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+}
+
 bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap, SIZE_T custom_start,
-                               SIZE_T byte_size, SIZE_T real_start) {
+                               SIZE_T byte_size, SIZE_T real_start, UINT stride) {
     if (custom_start == 0 || byte_size == 0 || custom_start > (std::numeric_limits<SIZE_T>::max)() - byte_size)
         return false;
+    const bool mirror = stride != 0 && byte_size % stride == 0 && readable_memory(real_start, byte_size);
+    if (!mirror) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: a title-backed descriptor heap's layer handles are not readable "
+                                 "memory; device writes into it are not copied to the title's backing\n");
+    }
     try {
         std::lock_guard lock(descriptor_range_mutex());
-        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap});
+        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap, stride,
+                                       mirror});
         g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
         return true;
     } catch (const std::bad_alloc&) {
@@ -198,6 +225,29 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D1
         }
     }
     return handle;
+}
+
+// On the console a descriptor heap is plain memory, and a title may build a view in a CPU-only heap and then copy
+// it into a shader-visible table with CPU stores, reading its own backing. Device slots 17-24 write the layer's heap
+// through translate_cpu_handle, so after each one the bytes the layer wrote are copied over the title's backing:
+// `count` descriptors from the title's handle on, clamped to the heap. The backing was sized with the layer's
+// increment (slot 14) and the title steps its handles by the increment slot 15 forwards from the layer, so an offset
+// in the backing is the same offset in the layer's heap.
+void mirror_title_descriptors(const DeviceProxy* device, SIZE_T title_ptr, UINT count) {
+    if (title_ptr == 0 || count == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lock(descriptor_range_mutex());
+    const auto& ranges = descriptor_ranges();
+    for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+        if (device && it->device != device) continue;
+        if (title_ptr < it->custom_start || title_ptr >= it->custom_end) continue;
+        if (!it->mirror) return;
+        const SIZE_T room = it->custom_end - title_ptr;
+        const SIZE_T wanted = static_cast<SIZE_T>(count) * it->stride;
+        std::memcpy(reinterpret_cast<void*>(title_ptr),
+                    reinterpret_cast<const void*>(it->real_start + (title_ptr - it->custom_start)),
+                    wanted < room ? wanted : room);
+        return;
+    }
 }
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -283,6 +333,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 55: return "Xbox CreateDerivedPipelineState -> PC CreatePipelineState of the patched stream (slot 47)";
         case 86: return "Xbox CreatePipelineState -> PC CreatePipelineState (slot 47)";
         case 101: return "Xbox CreateStateObject -> PC CreateStateObject (slot 62)";
         case 108: return "Xbox GetResourceAllocationInfo2 -> PC GetResourceAllocationInfo2 (slot 68)";
@@ -739,7 +790,7 @@ void** get_heap_vtable() {
 
 HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
                           SIZE_T custom_cpu_start = 0, SIZE_T custom_byte_size = 0, SIZE_T real_cpu_start = 0,
-                          DescriptorHeapBackingFree custom_free = nullptr) {
+                          DescriptorHeapBackingFree custom_free = nullptr, UINT custom_stride = 0) {
     if (!real || !device) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -757,8 +808,8 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->custom_free = custom_free;
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
 
-    if (custom_cpu_start != 0 &&
-        !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start)) {
+    if (custom_cpu_start != 0 && !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size,
+                                                            real_cpu_start, custom_stride)) {
         delete proxy;
         proxy_release(device);
         return E_OUTOFMEMORY;
@@ -2669,6 +2720,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     SIZE_T custom_cpu_start = 0;
     SIZE_T custom_byte_size = 0;
     SIZE_T real_cpu_start = 0;
+    UINT stride = 0;
     DescriptorHeapBackingAlloc alloc_fn = nullptr;
     DescriptorHeapBackingFree free_fn = nullptr;
     {
@@ -2686,6 +2738,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
                 if (addr <= (std::numeric_limits<SIZE_T>::max)() - byte_size) {
                     custom_cpu_start = addr;
                     custom_byte_size = byte_size;
+                    stride = inc;
                     real_cpu_start = raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
                 } else if (free_fn) {
                     free_fn(backing, kXmemDescriptorHeapAttributes);
@@ -2695,7 +2748,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     }
 
     hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
-                           custom_cpu_start ? free_fn : nullptr);
+                           custom_cpu_start ? free_fn : nullptr, stride);
     if (FAILED(hr)) {
         heap->Release();
         if (custom_cpu_start && free_fn)
@@ -2706,40 +2759,47 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 
 // Device slots 17-24 write or copy descriptors using CPU handles. When a title supplies its own descriptor-heap base
 // via __XMemAllocationHooks__, those handles fall in [custom_start, custom_end) and must be translated back to the
-// underlying PC/Vulkan heap before forwarding.
+// underlying PC/Vulkan heap before forwarding, and what the layer wrote there is copied back over the title's
+// backing (mirror_title_descriptors).
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
     self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(18);
     self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
                       const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(19);
     self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(20);
     self->real->CreateRenderTargetView(resource, desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(21);
     self->real->CreateDepthStencilView(resource, desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(22);
     self->real->CreateSampler(desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
@@ -2780,6 +2840,10 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
         return;
     }
     self->real->CopyDescriptors(num_dest, dest_out, dest_sizes, num_src, src_out, src_sizes, type);
+    // A null size array means ranges of one descriptor each, as on the PC.
+    if (dest_starts)
+        for (UINT i = 0; i < num_dest; ++i)
+            mirror_title_descriptors(self, dest_starts[i].ptr, dest_sizes ? dest_sizes[i] : 1);
 }
 
 void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
@@ -2787,6 +2851,7 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
     note_slot(24);
     self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
                                       translate_cpu_handle(self, src_start), type);
+    mirror_title_descriptors(self, dest_start.ptr, num_descriptors);
 }
 
 // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured
@@ -3066,6 +3131,375 @@ void log_refused_resource(unsigned slot, HRESULT hr, const D3D12_RESOURCE_DESC& 
                  slot, static_cast<unsigned long>(hr), static_cast<int>(pc.Dimension), static_cast<int>(pc.Format),
                  static_cast<unsigned long long>(pc.Width), pc.Height, pc.DepthOrArraySize, pc.MipLevels,
                  pc.SampleDesc.Count, xbox_flags, static_cast<unsigned>(pc.Flags));
+}
+
+// Xbox slot 57 (+0x1c8): DeserializeGraphicsPipelineStateX(const XboxNativeGraphicsPipelineStateDesc* desc,
+// REFIID riid, void** ppPipelineState).
+struct XboxNativeGraphicsPipelineStateDesc {
+    ID3D12RootSignature* root_signature;  // +0x00
+    const void* state_blob;               // +0x08: 380..404 B state blob (magic 0x4005d800 / 0x4005d808 / 0x4005d810)
+    std::uint64_t state_blob_size;        // +0x10
+    const void* pipeline_blob;            // +0x18: 80..224 B pipeline / input-layout blob (188 B in boot PSOs 1..3)
+    std::uint64_t pipeline_blob_size;     // +0x20
+    const void* prog_a;                   // +0x28: native RDNA2 program #1 (or nullptr/0 if absent, as in boot PSO 3)
+    std::uint64_t prog_a_size;            // +0x30
+    const void* stage_a;                  // +0x38: stage blob #1 (kind-2, e.g. 208 B, or nullptr/0 if absent)
+    std::uint64_t stage_a_size;           // +0x40
+    const void* prog_b;                   // +0x48: native RDNA2 program #2 (e.g. 320..384 B)
+    std::uint64_t prog_b_size;            // +0x50
+    const void* stage_b;                  // +0x58: stage blob #2 (kind-2, e.g. 752 B)
+    std::uint64_t stage_b_size;           // +0x60
+};
+
+// Measured offsets in the 380..388 B state blob across the 24,797 graphics records of the pipeline library.
+// None is confirmed as a specific D3D12 state field yet; each offset is logged once with its observed u32 word.
+struct MeasuredStateBlobField {
+    std::uint32_t offset;
+    const char* note;
+};
+
+constexpr MeasuredStateBlobField kMeasuredStateBlobFields[] = {
+    {0x000, "version/type tag (0x4005d800 / 0x4005d808 / 0x4005d810)"},
+    {0x004, "PSO family (4 or 6)"},
+    {0x00c, "per-PSO state word"},
+    {0x028, "per-PSO state word"},
+    {0x02c, "constant 2"},
+    {0x038, "per-PSO state word"},
+    {0x03c, "small counter"},
+    {0x040, "mask (0xfffe or 0)"},
+    {0x044, "mask (0xfffffffe or 0xffff0000)"},
+    {0x04c, "boot-PSO diff word"},
+    {0x050, "small counter"},
+    {0x054, "boot-PSO diff word"},
+    {0x058, "boot-PSO diff word"},
+    {0x05c, "boot-PSO diff word"},
+    {0x064, "per-PSO state word"},
+    {0x068, "boot-PSO diff word"},
+    {0x06c, "boot-PSO diff word"},
+    {0x070, "boot-PSO diff word"},
+    {0x074, "per-PSO state word (0x060201bc or 0x80)"},
+    {0x07c, "per-PSO state word (0xcc0010 / 0 / 0xcc0011)"},
+    {0x084, "boot-PSO diff word"},
+    {0x0a0, "per-PSO state word"},
+    {0x0a8, "per-PSO state word (0x1000 or 0x8004)"},
+    {0x0b8, "boot-PSO diff word"},
+    {0x0f0, "per-PSO state word"},
+    {0x0f4, "constant 5"},
+    {0x0f8, "constant 1"},
+    {0x0fc, "0x33333333 (float 0.1)"},
+    {0x100, "repeated 0x00060006 slot 0"},
+    {0x104, "repeated 0x00060006 slot 1"},
+    {0x108, "repeated 0x00060006 slot 2"},
+    {0x10c, "repeated 0x00060006 slot 3"},
+    {0x110, "repeated 0x00060006 slot 4"},
+    {0x114, "repeated 0x00060006 slot 5"},
+    {0x118, "repeated 0x00060006 slot 6"},
+    {0x11c, "repeated 0x00060006 slot 7"},
+    {0x128, "boot-PSO diff word"},
+    {0x144, "mask (0 or 0xffffffff)"},
+    {0x150, "constant 0x40"},
+    {0x158, "constant 0xffffffff"},
+    {0x174, "per-PSO state word"},
+    {0x17c, "constant 0x10000a00 (present when size >= 384)"},
+};
+
+std::atomic<bool> g_state_blob_field_logged[std::size(kMeasuredStateBlobFields)]{};
+
+void log_measured_state_blob_fields(const void* blob, std::size_t blob_size) {
+    if (!blob || blob_size < 4) return;
+    const auto* bytes = static_cast<const std::uint8_t*>(blob);
+    for (std::size_t i = 0; i < std::size(kMeasuredStateBlobFields); ++i) {
+        const std::uint32_t off = kMeasuredStateBlobFields[i].offset;
+        if (static_cast<std::size_t>(off) + 4 > blob_size) continue;
+        bool expected = false;
+        if (g_state_blob_field_logged[i].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+            std::uint32_t val = 0;
+            std::memcpy(&val, bytes + off, 4);
+            std::fprintf(stderr, "[rt] d3d12_xs: state blob: campo sin identificar en 0x%03x = 0x%08x\n",
+                         static_cast<unsigned>(off), static_cast<unsigned>(val));
+        }
+    }
+}
+
+bool parse_xbox_pipeline_blob_input_layout_impl(const void* blob, std::size_t blob_size,
+                                                std::vector<XboxPipelineInputElement>& out_elements) {
+    out_elements.clear();
+    if (!blob || blob_size < 0x54) return false;
+    const auto* bytes = static_cast<const std::uint8_t*>(blob);
+    const auto read_u32 = [&](std::size_t off, std::uint32_t& v) -> bool {
+        if (off + 4 > blob_size) return false;
+        std::memcpy(&v, bytes + off, 4);
+        return true;
+    };
+    std::uint32_t magic_const = 0;
+    std::uint32_t field_block_size = 0;
+    std::uint32_t tag_3c = 0;
+    std::uint32_t num_elements = 0;
+    if (!read_u32(0x04, magic_const) || !read_u32(0x10, field_block_size) ||
+        !read_u32(0x3c, tag_3c) || !read_u32(0x4c, num_elements))
+        return false;
+    if (num_elements == 0 || num_elements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) return true;
+    // Measured at +0x10: 0x1c (28 bytes = 7 u32) in PSOs 1 and 2, 0 in PSO 3 where the element stride is still 28 B.
+    // In the retail boot's later PSOs +0x10 holds 24 or 26 with three elements, and taking it as the stride lands
+    // inside the next semantic name: the stride after the name is 28 B, and +0x10 is something else.
+    (void)field_block_size;
+    constexpr std::size_t stride_after_name = 28u;
+    // A semantic name: an identifier of at least two characters, NUL-terminated within the blob.
+    const auto name_at = [&](std::size_t at) -> std::size_t {
+        std::size_t n = 0;
+        while (at + n < blob_size && bytes[at + n]) {
+            const char c = static_cast<char>(bytes[at + n]);
+            const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+            if (!alpha && !(n && c >= '0' && c <= '9')) return 0;
+            ++n;
+        }
+        return (at + n < blob_size && n >= 2) ? n : 0;
+    };
+    std::size_t pos = 0x54;
+    for (std::uint32_t idx = 0; idx < num_elements && pos + 4 <= blob_size; ++idx) {
+        if (idx && !name_at(pos)) {  // not where the measured stride puts it: look a little further on
+            std::size_t found = 0;
+            for (std::size_t at = pos > 12 ? pos - 12 : pos; at < pos + 36 && at < blob_size; ++at)
+                if (name_at(at) && (at == 0 || bytes[at - 1] == 0 || bytes[at - 1] > 0x7f || bytes[at - 1] < 0x20)) {
+                    found = at;
+                    break;
+                }
+            if (!found) break;
+            pos = found;
+        }
+        const void* nul = std::memchr(bytes + pos, 0, blob_size - pos);
+        if (!nul) break;
+        const std::size_t name_len = static_cast<const std::uint8_t*>(nul) - (bytes + pos);
+        if (name_len == 0) break;
+        const std::size_t fields_pos = pos + name_len + 1;
+        // Need at least the first 4 u32s (+0x00 SemanticIndex, +0x04 DXGI_FORMAT, +0x08 input slot, +0x0c AlignedByteOffset;
+        // the retail boot's COLOR0/COLOR1/POSITION0 layouts at offsets 0/4/8 of one buffer give the index and slot order)
+        // inside blob_size; never read past blob_size even when the last 1..4 bytes of the 28-byte block are truncated.
+        if (fields_pos + 16 > blob_size) break;
+        std::uint32_t slot = 0, fmt = 0, sem_idx = 0, byte_off = 0;
+        read_u32(fields_pos + 0x00, sem_idx);
+        read_u32(fields_pos + 0x04, fmt);
+        read_u32(fields_pos + 0x08, slot);
+        read_u32(fields_pos + 0x0c, byte_off);
+        XboxPipelineInputElement elem;
+        elem.semantic_name.assign(reinterpret_cast<const char*>(bytes + pos), name_len);
+        elem.semantic_index = sem_idx;
+        elem.format = static_cast<DXGI_FORMAT>(fmt);
+        elem.input_slot = slot < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT ? slot : 0;
+        elem.aligned_byte_offset = byte_off;
+        out_elements.push_back(std::move(elem));
+        pos = fields_pos + stride_after_name;
+    }
+    return true;
+}
+
+SRWLOCK g_fspx_stage_lock = SRWLOCK_INIT;
+leonida::ShaderLibrary* g_fspx_stage_lib = nullptr;
+std::wstring* g_fspx_stage_dir = nullptr;
+
+std::wstring current_shaders_env_dir() {
+    wchar_t buf[32768]{};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SHADERS", buf, static_cast<DWORD>(std::size(buf)));
+    if (n == 0 || n >= std::size(buf)) return {};
+    return std::wstring(buf, n);
+}
+
+std::string lookup_xbox_fspx_program_stage_impl(const void* program_bytes, std::size_t program_size) {
+    if (!program_bytes || !program_size || program_size > leonida::kFspxPartLimit) return {};
+    const std::span<const std::uint8_t> code{static_cast<const std::uint8_t*>(program_bytes), program_size};
+    if (!leonida::fspx_bare_program(code)) return {};
+    const std::string hash = leonida::sha256_hex(code);
+    const std::wstring dir = current_shaders_env_dir();
+    if (dir.empty()) return {};
+    AcquireSRWLockExclusive(&g_fspx_stage_lock);
+    if (!g_fspx_stage_lib) g_fspx_stage_lib = new (std::nothrow) leonida::ShaderLibrary();
+    if (!g_fspx_stage_dir) g_fspx_stage_dir = new (std::nothrow) std::wstring();
+    if (g_fspx_stage_lib && g_fspx_stage_dir && *g_fspx_stage_dir != dir) {
+        *g_fspx_stage_dir = dir;
+        g_fspx_stage_lib->load_fspx_only(std::filesystem::path(dir));
+    }
+    const leonida::ShaderEntry* entry = g_fspx_stage_lib ? g_fspx_stage_lib->find_fspx_by_code(hash) : nullptr;
+    const std::string stage = entry ? entry->stage : std::string{};
+    ReleaseSRWLockExclusive(&g_fspx_stage_lock);
+    return stage;
+}
+
+std::atomic<std::uint64_t> g_slot57_calls{0};
+
+HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const void* desc,
+                                                        const IID* riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
+    if (!riid) return E_POINTER;
+
+    const auto* xbox_desc = static_cast<const XboxNativeGraphicsPipelineStateDesc*>(desc);
+    const std::uint64_t call = g_slot57_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    // LEONIDA_SLOT57_OFF (diagnostic): refuse every slot-57 PSO, to tell its draws from the stream PSOs' (slot 86).
+    static const bool refuse_all = GetEnvironmentVariableW(L"LEONIDA_SLOT57_OFF", nullptr, 0) != 0;
+    if (refuse_all) return E_INVALIDARG;
+
+    // 1. Inspect and log measured state-blob fields once per offset (no unmeasured offsets).
+    if (xbox_desc->state_blob && xbox_desc->state_blob_size) {
+        if (xbox_desc->state_blob_size > leonida::kFspxPartLimit) return E_INVALIDARG;
+        log_measured_state_blob_fields(xbox_desc->state_blob, static_cast<std::size_t>(xbox_desc->state_blob_size));
+    }
+
+    // 2. Defensively decode input layout from the pipeline blob (+0x18 / +0x20).
+    std::vector<XboxPipelineInputElement> parsed_inputs;
+    if (xbox_desc->pipeline_blob && xbox_desc->pipeline_blob_size) {
+        if (xbox_desc->pipeline_blob_size > leonida::kFspxPartLimit) return E_INVALIDARG;
+        parse_xbox_pipeline_blob_input_layout_impl(
+            xbox_desc->pipeline_blob, static_cast<std::size_t>(xbox_desc->pipeline_blob_size), parsed_inputs);
+    }
+    std::vector<D3D12_INPUT_ELEMENT_DESC> input_descs;
+    input_descs.reserve(parsed_inputs.size());
+    for (const auto& elem : parsed_inputs) {
+        D3D12_INPUT_ELEMENT_DESC d{};
+        d.SemanticName = elem.semantic_name.c_str();
+        d.SemanticIndex = elem.semantic_index;
+        d.Format = elem.format;
+        d.InputSlot = elem.input_slot;
+        d.AlignedByteOffset = elem.aligned_byte_offset;
+        d.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        d.InstanceDataStepRate = 0;
+        input_descs.push_back(d);
+    }
+
+    // 3. Resolve each present RDNA2 program (+0x28/+0x30 and +0x48/+0x50) by sha256(program bytes) and assign its
+    //    stage from the index entry ("vs", "ps", "ms", "gs"), never from its position in the description.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pc_desc{};
+    pc_desc.pRootSignature = xbox_desc->root_signature;
+    pc_desc.InputLayout.pInputElementDescs = input_descs.empty() ? nullptr : input_descs.data();
+    pc_desc.InputLayout.NumElements = static_cast<UINT>(input_descs.size());
+
+    struct ProgPair {
+        const void* data;
+        std::uint64_t size;
+    };
+    const ProgPair pairs[2] = {{xbox_desc->prog_a, xbox_desc->prog_a_size},
+                               {xbox_desc->prog_b, xbox_desc->prog_b_size}};
+    for (const ProgPair& p : pairs) {
+        if (!p.data && !p.size) continue;
+        if (!p.data || !p.size || p.size > leonida::kFspxPartLimit) return E_INVALIDARG;
+        const std::span<const std::uint8_t> code{static_cast<const std::uint8_t*>(p.data),
+                                                 static_cast<std::size_t>(p.size)};
+        if (!leonida::fspx_bare_program(code)) {
+            static std::atomic<int> bad_prog_log{0};
+            if (bad_prog_log.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 57 call %llu: non-RDNA2 program blob (%llu B)\n",
+                             static_cast<unsigned long long>(call), static_cast<unsigned long long>(p.size));
+            return E_INVALIDARG;
+        }
+        const std::string stage = lookup_xbox_fspx_program_stage_impl(p.data, static_cast<std::size_t>(p.size));
+        if (stage == "vs") {
+            pc_desc.VS = {p.data, static_cast<SIZE_T>(p.size)};
+        } else if (stage == "ps") {
+            pc_desc.PS = {p.data, static_cast<SIZE_T>(p.size)};
+        } else if (stage == "gs") {
+            pc_desc.GS = {p.data, static_cast<SIZE_T>(p.size)};
+        } else {
+            static std::atomic<int> miss_log{0};
+            if (miss_log.fetch_add(1, std::memory_order_relaxed) < 16) {
+                const std::string hash = leonida::sha256_hex(code);
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 57 call %llu: no translated graphics stage in fspx_gfx for kind-6 "
+                             "sha256 %s (%llu B)\n",
+                             static_cast<unsigned long long>(call), hash.c_str(),
+                             static_cast<unsigned long long>(p.size));
+            }
+            return E_INVALIDARG;
+        }
+    }
+
+    // 4. Safe default fixed-function state (blend disabled, depth test on/LESS, cull none, triangle list, 1x sample).
+    pc_desc.BlendState.AlphaToCoverageEnable = FALSE;
+    pc_desc.BlendState.IndependentBlendEnable = FALSE;
+    for (auto& rt : pc_desc.BlendState.RenderTarget) {
+        rt.BlendEnable = FALSE;
+        rt.LogicOpEnable = FALSE;
+        rt.SrcBlend = D3D12_BLEND_ONE;
+        rt.DestBlend = D3D12_BLEND_ZERO;
+        rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    pc_desc.SampleMask = UINT_MAX;
+    pc_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pc_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pc_desc.RasterizerState.FrontCounterClockwise = FALSE;
+    pc_desc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+    pc_desc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    pc_desc.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    pc_desc.RasterizerState.DepthClipEnable = TRUE;
+    pc_desc.RasterizerState.MultisampleEnable = FALSE;
+    pc_desc.RasterizerState.AntialiasedLineEnable = FALSE;
+    pc_desc.RasterizerState.ForcedSampleCount = 0;
+    pc_desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+    pc_desc.DepthStencilState.DepthEnable = TRUE;
+    pc_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pc_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pc_desc.DepthStencilState.StencilEnable = FALSE;
+    pc_desc.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    pc_desc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    const D3D12_DEPTH_STENCILOP_DESC default_stencil_op = {
+        D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
+    pc_desc.DepthStencilState.FrontFace = default_stencil_op;
+    pc_desc.DepthStencilState.BackFace = default_stencil_op;
+
+    pc_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    if (pc_desc.PS.pShaderBytecode && pc_desc.PS.BytecodeLength) {
+        pc_desc.NumRenderTargets = 1;
+        pc_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    } else {
+        pc_desc.NumRenderTargets = 0;
+    }
+    pc_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pc_desc.SampleDesc.Count = 1;
+    pc_desc.SampleDesc.Quality = 0;
+    pc_desc.NodeMask = 0;
+    pc_desc.CachedPSO = {nullptr, 0};
+    pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    const HRESULT hr = self->real->CreateGraphicsPipelineState(&pc_desc, *riid, out);
+    static std::atomic<std::uint64_t> ok_count{0}, fail_count{0};
+    (FAILED(hr) ? fail_count : ok_count).fetch_add(1, std::memory_order_relaxed);
+    if (call % 1000 == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 tally: %llu calls, %llu created, %llu refused by the PC device\n",
+                     static_cast<unsigned long long>(call),
+                     static_cast<unsigned long long>(ok_count.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(fail_count.load(std::memory_order_relaxed)));
+    if (FAILED(hr)) {
+        static std::atomic<int> fail_log{0};
+        const int failure = fail_log.fetch_add(1, std::memory_order_relaxed);
+        if (failure < 6) {  // the input layout read from the pipeline blob, to check the parser against the VS
+            std::uint32_t declared = 0, block = 0;
+            if (xbox_desc->pipeline_blob && xbox_desc->pipeline_blob_size >= 0x50) {
+                std::memcpy(&declared, static_cast<const std::uint8_t*>(xbox_desc->pipeline_blob) + 0x4c, 4);
+                std::memcpy(&block, static_cast<const std::uint8_t*>(xbox_desc->pipeline_blob) + 0x10, 4);
+            }
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 call %llu layout: +0x4c count %u, +0x10 %u, parsed %zu:",
+                         static_cast<unsigned long long>(call), declared, block, parsed_inputs.size());
+            for (const auto& e : parsed_inputs)
+                std::fprintf(stderr, " %s%u fmt %d slot %u off %u;", e.semantic_name.c_str(), e.semantic_index,
+                             static_cast<int>(e.format), e.input_slot, e.aligned_byte_offset);
+            std::fprintf(stderr, "\n");
+        }
+        if (failure < 16)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 57 call %llu failed with 0x%08lx (state %llu B, pipe %llu B, progA %llu B, "
+                         "progB %llu B)\n",
+                         static_cast<unsigned long long>(call), static_cast<unsigned long>(hr),
+                         static_cast<unsigned long long>(xbox_desc->state_blob_size),
+                         static_cast<unsigned long long>(xbox_desc->pipeline_blob_size),
+                         static_cast<unsigned long long>(xbox_desc->prog_a_size),
+                         static_cast<unsigned long long>(xbox_desc->prog_b_size));
+    }
+    return hr;
 }
 
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
@@ -3438,15 +3872,69 @@ std::uint64_t proxy_slot74(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3)
     return hr_to_u64(S_OK);
 }
 
+// Keeps a copy of the stream a PSO was created from, on the PSO, so slot 55 can derive from it. A stream the module
+// does not model is logged once: the PSO is still returned, and slot 55 refuses it as a base.
+void keep_pso_stream(IUnknown* pso, const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
+    ID3D12Object* object = nullptr;
+    if (FAILED(pso->QueryInterface(__uuidof(ID3D12Object), reinterpret_cast<void**>(&object))) || !object) return;
+    auto record = PsoStreamRecord::capture(desc);
+    static std::atomic<bool> logged{false};
+    if (!record || !attach_pso_record(object, std::move(record))) {
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: a pipeline state stream is not kept for derivation (unmodelled subobject or allocation failure); slot 55 refuses that PSO as a base\n");
+    }
+    object->Release();
+}
+
+// The PC CreatePipelineState (PC slot 47) that slots 86 and 55 share: on success the stream is kept on the PSO.
+HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
+                               void** out) {
+    if (!riid) return E_POINTER;
+    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+    const HRESULT hr = reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    if (SUCCEEDED(hr) && out && *out && desc) keep_pso_stream(static_cast<IUnknown*>(*out), *desc);
+    return hr;
+}
+
 // Xbox slot 86: CreatePipelineState(desc, riid, out), forwarded to PC ID3D12Device2::CreatePipelineState (PC slot 47).
 HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
                                     void** out) {
     note_slot(86);
     if (out) *out = nullptr;
     if (self->slot_count <= 47) return refuse_beyond_device(86, self->slot_count);  // predates ID3D12Device2
-    if (!riid) return E_POINTER;
-    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
-    return reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    return create_pso_from_stream(self, desc, riid, out);
+}
+
+// Logs a slot 55 refusal once per reason, and returns the HRESULT.
+HRESULT refuse_derived(unsigned reason, const char* why, HRESULT hr) {
+    static std::atomic<bool> logged[4]{};
+    if (!logged[reason].exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: derived pipeline state (device slot 55) refused: %s\n", why);
+    return hr;
+}
+
+// Xbox slot 55: CreateDerivedPipelineState(pBasePSO, n, pRecords, riid, ppv). The base must be a PSO that slot 86 or
+// slot 55 created with a kept stream; n is 1..4 records of 0x14c bytes (d3d12_xs_pso_stream.h). The patched stream
+// goes through the slot 86 path. Every refusal leaves *ppv null and returns a failure, never a fake success.
+HRESULT proxy_create_derived_pso(DeviceProxy* self, ID3D12PipelineState* base, std::uint32_t count,
+                                 const unsigned char* records, const IID* riid, void** out) {
+    note_slot(55);
+    if (out) *out = nullptr;
+    if (self->slot_count <= 47) return refuse_beyond_device(55, self->slot_count);  // predates ID3D12Device2
+    if (!out || !riid || !records) return E_POINTER;
+    const PsoStreamRecord* base_record = base ? find_pso_record(base) : nullptr;
+    if (!base_record) return refuse_derived(0, "base PSO has no kept stream", E_FAIL);
+    std::vector<unsigned char> patched;
+    switch (derive_stream(*base_record, records, count, patched)) {
+        case DeriveStatus::ok: break;
+        case DeriveStatus::unknown_tag: return refuse_derived(1, "record tag not known", E_INVALIDARG);
+        case DeriveStatus::missing_state: return refuse_derived(2, "base has no subobject for a record", E_INVALIDARG);
+        case DeriveStatus::malformed: return refuse_derived(3, "record count or base stream malformed", E_INVALIDARG);
+    }
+    D3D12_PIPELINE_STATE_STREAM_DESC desc{};
+    desc.SizeInBytes = patched.size();
+    desc.pPipelineStateSubobjectStream = patched.data();
+    return create_pso_from_stream(self, &desc, riid, out);
 }
 
 // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,
@@ -3629,6 +4117,26 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                       D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)},
                                       static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(static_cast<UINT>(a4)));
         return 0;
+    } else if constexpr (Slot == 57) {
+        // Xbox slot 57 is DeserializeGraphicsPipelineStateX(desc, riid, out), whereas PC slot 57 is
+        // ID3D12Device4::CreateProtectedResourceSession(desc, riid, out). Both pass `riid` in `a2`; when `riid`
+        // is IID_ID3D12PipelineState (or `a2` is null so the slot-57 null-IID path is tested), route to graphics
+        // PSO deserialization. When `riid` is IID_ID3D12ProtectedResourceSession*, forward to the PC device.
+        const IID* riid = reinterpret_cast<const IID*>(a2);
+        if (!riid || *riid == __uuidof(ID3D12PipelineState)) {
+            note_slot(57);
+            log_xbox_route_once(57, "DeserializeGraphicsPipelineStateX", a1, a2, a3, a4, a5);
+            return hr_to_u64(proxy_create_graphics_pipeline_from_native_code(
+                self, reinterpret_cast<const void*>(a1), riid, reinterpret_cast<void**>(a3)));
+        }
+        note_slot(57);
+        if (57 >= self->slot_count) return hr_to_u64(refuse_beyond_device(57, self->slot_count));
+        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t);
+        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[57]);
+        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
@@ -3664,6 +4172,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 55) {
+        return hr_to_u64(proxy_create_derived_pso(
+            self, reinterpret_cast<ID3D12PipelineState*>(a1), static_cast<std::uint32_t>(a2),
+            reinterpret_cast<const unsigned char*>(a3), reinterpret_cast<const IID*>(a4),
+            reinterpret_cast<void**>(a5)));
     } else if constexpr (Slot == 86) {
         return hr_to_u64(proxy_create_pipeline_state(
             self, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(a1),
@@ -4031,8 +4544,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 13 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
         slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 62 ||
-        slot == 67 || slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133 || slot == 41 || slot == 61 || slot == 74 || slot == 86 || slot == 101 || slot == 108)
-
+        slot == 67 || slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133 || slot == 41 || slot == 61 || slot == 74 || slot == 55 || slot == 86 || slot == 101 || slot == 108)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
@@ -4219,6 +4731,15 @@ void reset_device_proxy_stats() {
     reset_child_stats<ChildKind::queue>();
     reset_child_stats<ChildKind::fence>();
     reset_child_stats<ChildKind::allocator>();
+}
+
+bool parse_xbox_pipeline_blob_input_layout(const void* blob, std::size_t blob_size,
+                                           std::vector<XboxPipelineInputElement>& out_elements) {
+    return parse_xbox_pipeline_blob_input_layout_impl(blob, blob_size, out_elements);
+}
+
+std::string lookup_xbox_fspx_program_stage(const void* program_bytes, std::size_t program_size) {
+    return lookup_xbox_fspx_program_stage_impl(program_bytes, program_size);
 }
 
 }  // namespace rt::d3d12_xs

@@ -2129,13 +2129,17 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
-    if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    if (!pipeline || (!pipeline->pipeline && !pipeline->variant)) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
     p.pipeline = pipeline->pipeline;
+    if (!p.pipeline) {  // built at first use (LEONIDA_LAZY_PSO)
+        p.pipeline = pipeline->variant(0);
+        if (!p.pipeline) return ReplayResult::unsupported;
+    }
     p.area = {UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
     const auto shrink = [&](const ResourceBinding& b, const TargetView& view, const VkImageSubresourceRange& range) {

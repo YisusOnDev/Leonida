@@ -1031,8 +1031,9 @@ struct DeviceState {
                     std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
                 else {
                     const auto path = shader_library.directory().u8string();
-                    std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
-                                 shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
+                    std::fprintf(stderr, "[rt] d3d12: %zu translated shaders (%zu fspx, %zu fspx_gfx, %zu bvh) from %s\n",
+                                 shader_library.size(), shader_library.fspx_size(), shader_library.fspx_gfx_size(),
+                                 shader_library.bvh_size(), reinterpret_cast<const char*>(path.c_str()));
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[rt] d3d12: invalid translated shader path: %s\n", e.what());
@@ -1636,7 +1637,8 @@ struct DeviceState {
             allocate.allocationSize = requirements.size;
             allocate.memoryTypeIndex = i;
             VkDeviceMemory out = VK_NULL_HANDLE;
-            if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
+            const VkResult alloc_result = context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out);
+            if (alloc_result == VK_SUCCESS) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
                 if (chosen_type) *chosen_type = i;
                 if (leonida::spilled_to_host(required, preferred, memory.memoryTypes[i].propertyFlags))
@@ -1649,6 +1651,10 @@ struct DeviceState {
                                      static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20));
                     });
                 return out;
+            }
+            if (alloc_result == VK_ERROR_DEVICE_LOST) {
+                context->mark_device_lost("DeviceState::allocate (vkAllocateMemory)", alloc_result);
+                return VK_NULL_HANDLE;
             }
         }
         return VK_NULL_HANDLE;
@@ -4008,21 +4014,38 @@ public:
                                                 desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
-            stage.fssm = leonida::fssm_program(
-                {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
-            if (stage.fssm.empty()) {
-                log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
-                return E_INVALIDARG;
-            }
-            const std::string hash = leonida::sha256_hex(stage.fssm);
-            // Containers with the same program can differ in their input signature or bindings: a VS must have its
-            // inputs fed by this input layout (else the layout check below reports it).
+            const std::span<const std::uint8_t> raw_bytes{
+                static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength};
+            stage.fssm = leonida::fssm_program(raw_bytes);
             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
-            stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
-                return !vertex || layout_feeds(e, desc.InputLayout);
-            });
-            if (!stage.entry) {
-                std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+            if (!stage.fssm.empty()) {
+                const std::string hash = leonida::sha256_hex(stage.fssm);
+                // Containers with the same program can differ in their input signature or bindings: a VS must have its
+                // inputs fed by this input layout (else the layout check below reports it).
+                stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
+                    return !vertex || layout_feeds(e, desc.InputLayout);
+                });
+                if (!stage.entry) {
+                    std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                    return E_INVALIDARG;
+                }
+            } else if (leonida::fspx_bare_program(raw_bytes)) {
+                // Slot 57 (DeserializeGraphicsPipelineStateX): bare RDNA2 program indexed by fspx_code_sha256 in
+                // <shaders>/fspx_gfx/index.json.
+                const std::string hash = leonida::sha256_hex(raw_bytes);
+                stage.entry = pick_entry(library->fspx_candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
+                    return !vertex || layout_feeds(e, desc.InputLayout);
+                });
+                if (!stage.entry)
+                    stage.entry = pick_entry(library->fspx_candidates(stage.name, hash),
+                                             [](const leonida::ShaderEntry&) { return true; });
+                if (!stage.entry) {
+                    std::fprintf(stderr, "[rt] d3d12: no translated %s for FSPX code sha256 %s (%zu B)\n",
+                                 stage.name, hash.c_str(), raw_bytes.size());
+                    return E_INVALIDARG;
+                }
+            } else {
+                log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
@@ -4241,6 +4264,20 @@ public:
             if (!fed) {  // D3D12 rejects an input layout that leaves a shader input unfed
                 std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
                              e.semantic.c_str(), e.semantic_index, e.register_index);
+                static std::atomic<int> detail{0};
+                if (detail.fetch_add(1, std::memory_order_relaxed) < 6) {
+                    std::fprintf(stderr, "[rt] d3d12:   %s reads:", stages[0].entry->name.c_str());
+                    for (const auto& in : stages[0].entry->input_signature)
+                        std::fprintf(stderr, " %s%u@r%u(sv %u)", in.semantic.c_str(), in.semantic_index,
+                                     in.register_index, in.system_value);
+                    std::fprintf(stderr, "; layout gives:");
+                    for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+                        const auto& el = desc.InputLayout.pInputElementDescs[i];
+                        std::fprintf(stderr, " %s%u fmt %d slot %u", el.SemanticName ? el.SemanticName : "?",
+                                     el.SemanticIndex, static_cast<int>(el.Format), el.InputSlot);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
                 return E_INVALIDARG;
             }
         }
@@ -4484,8 +4521,11 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
-        graphics_.pipeline = build(0);
-        if (!graphics_.pipeline) return E_FAIL;
+        // LEONIDA_LAZY_PSO=1: the fully bound pipeline is built at its first draw, like the variants below, so a title
+        // that creates tens of thousands of PSOs while loading is not held up by the driver's compile of each one.
+        static const bool lazy_pso = GetEnvironmentVariableW(L"LEONIDA_LAZY_PSO", nullptr, 0) != 0;
+        graphics_.pipeline = lazy_pso ? VK_NULL_HANDLE : build(0);
+        if (!lazy_pso && !graphics_.pipeline) return E_FAIL;
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
         if (code_stage) {
@@ -4630,7 +4670,11 @@ public:
             std::fprintf(stderr, "[rt] d3d12: slow compute pipeline compile: %llu ms, %zu SPIR-V words, program "
                                  "sha256 %s, VkResult %d\n", ms, words.size(),
                          leonida::sha256_hex(program.bytes).c_str(), int(created));
-        if (created != VK_SUCCESS) return E_FAIL;
+        if (created != VK_SUCCESS) {
+            if (created == VK_ERROR_DEVICE_LOST)
+                device_.context->mark_device_lost("PipelineState::create_compute (vkCreateComputePipelines)", created);
+            return E_FAIL;
+        }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -4745,9 +4789,13 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
+        const VkResult pipe_res = device_.context->vk.vkCreateGraphicsPipelines(
+            device_.info.device, device_.pipeline_cache(), 1, &info, nullptr, &pipeline);
+        if (pipe_res != VK_SUCCESS) {
+            if (pipe_res == VK_ERROR_DEVICE_LOST)
+                device_.context->mark_device_lost("PipelineState::build (vkCreateGraphicsPipelines)", pipe_res);
             return VK_NULL_HANDLE;
+        }
         return pipeline;
     }
 
@@ -5712,7 +5760,8 @@ public:
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
-                                                                      info.buffer_device_address);
+                                                                      info.buffer_device_address,
+                                                                  info.device_fault);
         state_.context->set_before_execute([this] { state_.refresh_shadows(); });
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
@@ -6073,7 +6122,9 @@ public:
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
-                state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+                const VkResult idle_res = state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+                if (idle_res == VK_ERROR_DEVICE_LOST)
+                    state_.context->mark_device_lost("Device::~Device (vkDeviceWaitIdle)", idle_res);
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_bindless_release(nullptr, nullptr);
@@ -6185,8 +6236,21 @@ public:
         return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event, identity());
     }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
-        if (removed_.load(std::memory_order_acquire)) return DXGI_ERROR_DEVICE_REMOVED;
-        return (state_.context && state_.context->is_device_lost()) ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
+        const bool host_removed = removed_.load(std::memory_order_acquire);
+        const bool context_lost = state_.context && state_.context->is_device_lost();
+        if (!host_removed && !context_lost) return S_OK;
+        std::call_once(removed_logged_, [&] {
+            if (context_lost) {
+                const std::string cause = state_.context->device_lost_summary();
+                std::fprintf(stderr, "[rt] d3d12: GetDeviceRemovedReason -> DXGI_ERROR_DEVICE_REMOVED (%s)\n",
+                             cause.empty() ? "context lost" : cause.c_str());
+            } else {
+                std::fprintf(stderr,
+                             "[rt] d3d12: GetDeviceRemovedReason -> DXGI_ERROR_DEVICE_REMOVED "
+                             "(site=ID3D12Device5::RemoveDevice, reason=host-triggered)\n");
+            }
+        });
+        return DXGI_ERROR_DEVICE_REMOVED;
     }
 
     // Residency and power (D3D-33, docs/d3d12_vulkan.md section 4.1). Vulkan has no residency API: memory from
@@ -6276,7 +6340,11 @@ public:
     }
 
     // STUB
-    void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
+    void STDMETHODCALLTYPE RemoveDevice() override {
+        if (!removed_.exchange(true, std::memory_order_acq_rel)) {
+            std::fprintf(stderr, "[rt] d3d12: device removed via ID3D12Device5::RemoveDevice\n");
+        }
+    }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
@@ -9482,6 +9550,7 @@ private:
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
     std::atomic<bool> removed_{false};
+    mutable std::once_flag removed_logged_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
@@ -9783,10 +9852,14 @@ WindowPresenter::~WindowPresenter() {
 }
 
 namespace {
-HRESULT present_result(VkResult result) {
+HRESULT present_result(VkResult result, std::atomic<bool>& logged_device_lost) {
     if (result == VK_SUCCESS) return S_OK;
+    if (result == VK_ERROR_DEVICE_LOST) {
+        if (!logged_device_lost.exchange(true, std::memory_order_acq_rel))
+            std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
+        return DXGI_ERROR_DEVICE_REMOVED;
+    }
     std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
-    if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
     if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return DXGI_ERROR_UNSUPPORTED;
     return E_FAIL;
 }
@@ -9799,7 +9872,8 @@ HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval
                                                                        src_rect->bottom}
                                                : leonida::PresentRect{};
     return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr,
-                                              tear));
+                                              tear),
+                          logged_device_lost_);
 }
 
 bool WindowPresenter::tear_supported() const { return presenter_->tear_supported(); }
@@ -9807,11 +9881,11 @@ bool WindowPresenter::last_present_tore() const { return presenter_->last_presen
 std::uint64_t WindowPresenter::tear_presents() const { return presenter_->tear_presents(); }
 
 HRESULT WindowPresenter::present_blank(UINT sync_interval) {
-    return present_result(presenter_->present_blank(sync_interval > 0));
+    return present_result(presenter_->present_blank(sync_interval > 0), logged_device_lost_);
 }
 
 HRESULT WindowPresenter::present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear) {
-    return present_result(presenter_->present_planes(planes, sync_interval > 0, tear));
+    return present_result(presenter_->present_planes(planes, sync_interval > 0, tear), logged_device_lost_);
 }
 
 bool WindowPresenter::hdr_active() const { return presenter_->hdr_active(); }
@@ -10620,6 +10694,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         vkGetPhysicalDeviceProperties2(info.physical, &properties);
         info.host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
     }
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+    // Optional: VK_EXT_device_fault reports driver fault descriptions, address faults, and vendor codes after
+    // VK_ERROR_DEVICE_LOST. Keep deviceFaultVendorBinary disabled because binary dumps are not requested or parsed.
+    VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (has_device_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fault_features};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.device_fault = fault_features.deviceFault == VK_TRUE;
+        if (info.device_fault) {
+            fault_features.deviceFaultVendorBinary = VK_FALSE;
+            fault_features.pNext = *v13.next();
+            *v13.next() = &fault_features;
+        }
+    }
+#endif
 
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
@@ -10660,6 +10749,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+    if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+#endif
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

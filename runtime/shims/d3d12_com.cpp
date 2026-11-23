@@ -1596,12 +1596,18 @@ public:
             }
             std::uint64_t now = 0;
             bool signaled = false;
-            if (context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now) == VK_SUCCESS &&
-                now >= queued && now < value) {
+            const VkResult counter_res = context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now);
+            if (counter_res == VK_ERROR_DEVICE_LOST) {
+                context->mark_device_lost("Fence::Signal (vkGetSemaphoreCounterValue)", counter_res);
+            } else if (counter_res == VK_SUCCESS && now >= queued && now < value) {
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
                 info.value = value;
-                signaled = context->vk.vkSignalSemaphore(context->device(), &info) == VK_SUCCESS;
+                const VkResult sig_res = context->vk.vkSignalSemaphore(context->device(), &info);
+                if (sig_res == VK_ERROR_DEVICE_LOST) {
+                    context->mark_device_lost("Fence::Signal (vkSignalSemaphore)", sig_res);
+                }
+                signaled = (sig_res == VK_SUCCESS);
             }
             held->fetch_sub(1);
             if (signaled) {
@@ -1935,14 +1941,34 @@ private:
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &stamp_.commands;
         LARGE_INTEGER before{}, after{};
+        VkResult loss_result = VK_SUCCESS;
+        const char* loss_site = nullptr;
         {
             std::lock_guard submit_lock(context_.submit_mutex());
-            if (vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS) return E_FAIL;
-            QueryPerformanceCounter(&before);
-            if (vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS ||
-                vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS)
-                return E_FAIL;
-            QueryPerformanceCounter(&after);
+            const VkResult idle_before = vk.vkQueueWaitIdle(vk_queue_);
+            if (idle_before != VK_SUCCESS) {
+                loss_result = idle_before;
+                loss_site = "CommandQueue::submitted_calibration (vkQueueWaitIdle)";
+            } else {
+                QueryPerformanceCounter(&before);
+                const VkResult sub_res = vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE);
+                if (sub_res != VK_SUCCESS) {
+                    loss_result = sub_res;
+                    loss_site = "CommandQueue::submitted_calibration (vkQueueSubmit)";
+                } else {
+                    const VkResult idle_after = vk.vkQueueWaitIdle(vk_queue_);
+                    if (idle_after != VK_SUCCESS) {
+                        loss_result = idle_after;
+                        loss_site = "CommandQueue::submitted_calibration (vkQueueWaitIdle)";
+                    } else {
+                        QueryPerformanceCounter(&after);
+                    }
+                }
+            }
+        }
+        if (loss_site) {
+            if (loss_result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost(loss_site, loss_result);
+            return E_FAIL;
         }
         std::uint64_t stamp = 0;
         if (stamp_.get_query_pool_results(context_.device(), stamp_.queries, 0, 1, sizeof(stamp), &stamp,
@@ -2171,7 +2197,7 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
         // Unlike a single fence's blocking SetEventOnCompletion, this path invokes Vulkan directly.
         // A lost device must wake its other registered fence waiters and reject later submissions.
         if (result == VK_ERROR_DEVICE_LOST) {
-            context.mark_device_lost();
+            context.mark_device_lost("set_event_on_multiple_fence_completion (vkWaitSemaphores)", result);
             return DXGI_ERROR_DEVICE_REMOVED;
         }
         return result == VK_SUCCESS ? S_OK : E_FAIL;

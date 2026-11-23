@@ -809,7 +809,8 @@ struct SignatureElement {
 
 struct ShaderEntry {
     std::string name;
-    std::string stage;  // "vs", "ps", "cs", "ms", "gs"
+    std::string spv_file;  // optional "<prefix><spv>" filename when the index key is a hash
+    std::string stage;     // "vs", "ps", "cs", "ms", "gs"
     std::string fssm_sha256;
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
@@ -873,7 +874,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* sub_folder : {"fspx", "bvh", "library", "exe"}) {
+        for (const char* sub_folder : {"fspx", "fspx_gfx", "bvh", "library", "exe"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;
@@ -885,6 +886,28 @@ public:
         return true;
     }
 
+    // Loads only the optional FSPX sub-indexes (<dir>/fspx/index.json and <dir>/fspx_gfx/index.json) without parsing
+    // the 26,565-entry main index.json, for fast stage/hash lookups in the Xbox device proxy.
+    bool load_fspx_only(const std::filesystem::path& dir) {
+        dir_ = dir;
+        entries_.clear();
+        fspx_entries_.clear();
+        count_ = 0;
+        fspx_count_ = 0;
+        fspx_gfx_count_ = 0;
+        bvh_count_ = 0;
+        for (const char* folder : {"fspx", "fspx_gfx"}) {
+            try {
+                const auto ignore = [](const std::string&) { return false; };
+                const std::filesystem::path sub = dir / folder;
+                if (std::ifstream(sub / "index.json", std::ios::binary))
+                    load_index(sub, std::string(folder) + "/", ignore);
+            } catch (...) {
+            }
+        }
+        return (fspx_count_ + fspx_gfx_count_) > 0;
+    }
+
     bool loaded() const { return !dir_.empty(); }
     // The folder load() read, made absolute; empty before.
     const std::filesystem::path& directory() const { return dir_; }
@@ -893,6 +916,8 @@ public:
     // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
     // entries with size() must leave them out.
     std::size_t fspx_size() const { return fspx_count_; }
+    // Entries loaded from <dir>/fspx_gfx/index.json (graphics FSPX programs from shaders.rpf's pipeline library).
+    std::size_t fspx_gfx_size() const { return fspx_gfx_count_; }
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
     std::size_t bvh_size() const { return bvh_count_; }
@@ -914,6 +939,15 @@ public:
     // The entries of an FSPX program, by the SHA-256 of its kind-6 bytes (fspx_code_sha256).
     std::vector<const ShaderEntry*> fspx_candidates(std::string_view stage, std::string_view fspx_code_sha256) const {
         return lookup(fspx_entries_, stage, fspx_code_sha256);
+    }
+
+    // Finds an FSPX program by its kind-6 SHA-256 across all stages so the stage comes from the index entry itself.
+    const ShaderEntry* find_fspx_by_code(std::string_view fspx_code_sha256) const {
+        for (std::string_view st : {"vs", "ps", "ms", "gs", "cs"}) {
+            const auto all = fspx_candidates(st, fspx_code_sha256);
+            if (!all.empty()) return all.front();
+        }
+        return nullptr;
     }
 
     // The entries for a program compute_program() found, by the key of its kind (docs/fspx.md, "Build and run-time
@@ -957,6 +991,11 @@ public:
         auto path = dir_;
         path += "/" + entry.name + ".spv";
         std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file && !entry.spv_file.empty()) {
+            auto alt = dir_;
+            alt += "/" + entry.spv_file;
+            file.open(alt, std::ios::binary | std::ios::ate);
+        }
         return read_spirv_words(file, file.tellg());
     }
 
@@ -1005,6 +1044,7 @@ private:
             fspx_entries_.clear();
             count_ = 0;
             fspx_count_ = 0;
+            fspx_gfx_count_ = 0;
             bvh_count_ = 0;
             exe_count_ = 0;
         }
@@ -1017,6 +1057,8 @@ private:
             if ((!by_fssm && !by_fspx) || !stage || stage->kind != Json::Kind::string) continue;
             ShaderEntry e;
             e.name = prefix + name;
+            if (const Json* spv = meta.find("spv"); spv && spv->kind == Json::Kind::string && !spv->string.empty())
+                e.spv_file = prefix + spv->string;
             e.stage = stage->string;
             if (by_fssm) e.fssm_sha256 = hash->string;
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
@@ -1071,6 +1113,7 @@ private:
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
+            if (by_fspx && prefix == "fspx_gfx/") ++fspx_gfx_count_;
             if (prefix == "bvh/") ++bvh_count_;
             if (prefix == "exe/") ++exe_count_;
             ++count_;
@@ -1081,6 +1124,7 @@ private:
     std::filesystem::path dir_;
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
+    std::size_t fspx_gfx_count_ = 0;
     std::size_t bvh_count_ = 0;
     std::size_t exe_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
