@@ -38,6 +38,23 @@ bool blocked(std::future<Result>& f) {
     return f.wait_for(std::chrono::milliseconds(40)) == std::future_status::timeout;
 }
 
+// True when the wait has returned; otherwise the pacer is suspended, which lets the waiter go, so that a failure ends
+// the test instead of hanging it on the fake clock.
+bool finishes(std::future<Result>& f, FramePacer& pacer) {
+    if (f.wait_for(std::chrono::seconds(10)) == std::future_status::ready) return true;
+    pacer.suspend();
+    return false;
+}
+
+// Display time of `token`'s frame, or no_deadline when the pacer has none (not shown, or replaced and never shown).
+std::uint64_t display_time(FramePacer& pacer, std::uint64_t token) {
+    std::uint32_t count = 1;
+    FrameStatistic stat{};
+    if (pacer.get_frame_statistics(token, stat_display, &count, &stat) != pacer_hr::ok || count != 1)
+        return no_deadline;
+    return stat.time_us;
+}
+
 bool setup(FramePacer& pacer, std::uint32_t latency, std::uint32_t offset = 0) {
     return pacer.set_frame_interval(period, latency, 0) == pacer_hr::ok &&
            pacer.schedule_frame_event(frame_event_origin, offset, 0) == pacer_hr::ok;
@@ -229,6 +246,94 @@ int main() {
         Result r = wait.get();
         EXPECT(r.hr == pacer_hr::ok && r.token == 3);
         EXPECT(pacer.frames_in_flight() == 1);
+    }
+
+    // Presents beyond the latency while the event is armed (several presents per wait): at most `latency` frames are
+    // in flight. A present into a full queue replaces the newest queued frame (mailbox) and the older ones keep their
+    // vblanks, so the next wait passes when the oldest is shown, within one period and not 999. Latency 1, 2 and 3.
+    for (std::uint32_t latency = 1; latency <= 3; ++latency) {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, latency));
+        clock.advance_us(period);  // origin 1
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
+
+        // 1000 blank presents with no wait between them: they queue for vblanks 2 .. latency + 1, and no further.
+        for (int i = 0; i < 1000; ++i) pacer.note_untokened_present();
+        EXPECT(pacer.frames_in_flight() == latency);
+        auto wait = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(wait));
+        clock.advance_us(period);  // vblank 2 shows the oldest: the wait passes with origin 2, not 999 periods later
+        EXPECT(finishes(wait, pacer));
+        Result r = wait.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == 2);
+        EXPECT(pacer.frames_in_flight() == latency - 1);
+        clock.advance_us(std::uint64_t(period) * (latency - 1));  // vblank latency + 1 shows the newest
+        EXPECT(pacer.frames_in_flight() == 0);
+
+        // Tokened frames: latency + 1 tokens handed out with nothing in flight, then all presented at once.
+        std::uint64_t tokens[4] = {};
+        for (std::uint32_t i = 0; i <= latency; ++i) {
+            clock.advance_us(period);
+            EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tokens[i]) == pacer_hr::ok);
+            EXPECT(tokens[i] == 3 + i);
+        }
+        const std::uint64_t now = std::uint64_t(period) * (2 * latency + 2);
+        for (std::uint32_t i = 0; i < latency; ++i) {  // `latency` presents fill the queue: nothing is replaced
+            EXPECT(pacer.check_present_token(tokens[i]) == pacer_hr::ok);
+            pacer.commit_present_token(tokens[i], 1);
+        }
+        EXPECT(pacer.frames_in_flight() == latency);
+        pacer.commit_present_token(tokens[latency], 1);  // replaces the newest queued frame and takes its vblank
+        EXPECT(pacer.frames_in_flight() == latency);
+        wait = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(wait));
+        clock.advance_us(period);
+        EXPECT(finishes(wait, pacer));
+        r = wait.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == latency + 4);
+        clock.advance_us(std::uint64_t(period) * (latency - 1));
+        EXPECT(pacer.frames_in_flight() == 0);
+        for (std::uint32_t i = 0; i + 1 < latency; ++i)  // the older frames keep their vblanks
+            EXPECT(display_time(pacer, tokens[i]) == now + std::uint64_t(period) * (i + 1));
+        EXPECT(display_time(pacer, tokens[latency - 1]) == no_deadline);  // replaced: never shown
+        EXPECT(display_time(pacer, tokens[latency]) == now + std::uint64_t(period) * latency);
+
+        // One present per wait, each a quarter period after its origin: nothing is replaced, each frame is shown at the
+        // vblank after its origin, and that vblank is the next origin.
+        token = r.token;
+        clock.advance_us(period);  // back on an origin
+        for (int frame = 0; frame < 8; ++frame) {
+            const std::uint64_t origin = clock.now_us();
+            std::uint64_t next = 0;
+            EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &next) == pacer_hr::ok && next == token + 1);
+            token = next;
+            clock.advance_us(period / 4);
+            pacer.commit_present_token(token, 1);
+            EXPECT(pacer.frames_in_flight() == 1);
+            clock.advance_us(period - period / 4);
+            EXPECT(pacer.frames_in_flight() == 0);
+            EXPECT(display_time(pacer, token) == origin + period);
+        }
+    }
+
+    // SetFrameIntervalX lowering the latency below the frames already queued: the next present cuts the queue back
+    // to the new latency from the newest end, and the oldest frame keeps its vblank.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 3));
+        for (int i = 0; i < 3; ++i) pacer.note_untokened_present();  // vblanks 1, 2 and 3
+        EXPECT(pacer.frames_in_flight() == 3);
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        EXPECT(pacer.frames_in_flight() == 3);  // already queued: left alone until the next present
+        pacer.note_untokened_present();
+        EXPECT(pacer.frames_in_flight() == 1);
+        clock.advance_us(period - 1);
+        EXPECT(pacer.frames_in_flight() == 1);
+        clock.advance_us(1);  // vblank 1, the oldest frame's
+        EXPECT(pacer.frames_in_flight() == 0);
     }
 
     // Tokens: only one that was never handed out is refused. Null, stale and repeated ones are accepted and reported
