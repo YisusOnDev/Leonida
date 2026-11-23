@@ -1014,6 +1014,13 @@ if(BUILD_TESTING)
     add_dependencies(unimplemented_policy_test gta6rt_tls_host)
     add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
 
+    # A name two SHIM_TABLEs register with different functions is reported (duplicate_registrations); the later table
+    # still serves it. gta6rt's own tables are checked by run_tiny_game below. No game files, no GPU.
+    add_executable(shim_registry_test test/shim_registry_test.cpp shims/registry.cpp)
+    target_compile_definitions(shim_registry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(shim_registry_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME shim_registry COMMAND shim_registry_test)
+
     # gta6rt --trace FILE (shims/startup_trace.h): a synthetic image with an unimplemented import, an
     # OutputDebugStringA call and a read of address 0; checks the JSON lines. No game files, no GPU.
     add_executable(startup_trace_test
@@ -1319,6 +1326,8 @@ if(BUILD_TESTING)
       "-DLINE=tiny_crash: the terminate handler ran"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_crash.cmake")
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
+    # gta6rt links every shim table; two serving one import would print this line at startup (shims.h).
+    set_tests_properties(run_tiny_game PROPERTIES FAIL_REGULAR_EXPRESSION "is registered by two shim tables")
     add_test(NAME run_tiny_game_console_paths COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_console_paths.cmake")

@@ -23,6 +23,12 @@ std::map<std::string, void*>& table() {
     return t;
 }
 
+// "dll!name" keys that a second table registered with a different function (see Table::Table).
+std::vector<std::string>& duplicates() {
+    static std::vector<std::string> d;
+    return d;
+}
+
 std::string lower_ascii(std::string s) {
     for (auto& c : s)
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
@@ -517,9 +523,19 @@ const XMemAllocationHooks* xmem_allocation_hooks() {
     return list.empty() ? nullptr : list.back().hooks;
 }
 
+// Two tables that register the same name with different functions are a merge mistake: static tables in different
+// files initialise in link order, which C++ leaves unspecified, so which one serves the title is not decided by the
+// code. The later one still wins, as before; the name is recorded so gta6rt can say so (duplicate_registrations).
 Table::Table(const Entry* entries, size_t count) {
-    for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
+    for (size_t i = 0; i < count; ++i) {
+        const std::string key = lower_ascii(entries[i].dll) + "!" + entries[i].name;
+        const auto [it, inserted] = table().try_emplace(key, entries[i].fn);
+        if (!inserted && it->second != entries[i].fn) duplicates().push_back(key);
+        it->second = entries[i].fn;
+    }
 }
+
+std::vector<std::string> duplicate_registrations() { return duplicates(); }
 
 void* find(const std::string& dll_lower, const std::string& name) {
     auto it = table().find(dll_lower + "!" + name);

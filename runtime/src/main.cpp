@@ -70,6 +70,10 @@ int usage() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // Two shim files serving the same import is a merge mistake whose winner depends on link order (shims.h).
+    for (const std::string& key : rt::shims::duplicate_registrations())
+        std::fprintf(stderr, "[rt] shims: %s is registered by two shim tables; which one serves it depends on link "
+                             "order\n", key.c_str());
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;

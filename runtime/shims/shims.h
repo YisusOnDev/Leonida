@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace rt::shims {
 
@@ -16,6 +17,10 @@ struct Entry {
 struct Table {
     Table(const Entry* entries, size_t count);
 };
+
+// The "dll!name" keys (DLL lower-cased) that more than one table registered with different functions, in the order the
+// second registration happened. Empty in a correct build; gta6rt prints each one at startup.
+std::vector<std::string> duplicate_registrations();
 
 void* find(const std::string& dll_lower, const std::string& name);
 
