@@ -269,6 +269,16 @@ constexpr Format rgb96_format(VkFormat wide, bool typeless = false) {
     return format;
 }
 
+// The console's 16-bit depth with stencil (the Xbox extension of the DXGI enum, values 118-120; the retail title sizes a
+// 2560x1440 depth-stencil texture in it during boot). The PC has no such format and Vulkan's D16_UNORM_S8_UINT is
+// optional (AMD has none), so it is held as D24_UNORM_S8_UINT, which itself falls back to D32_SFLOAT_S8_UINT: a stand-in
+// with more depth precision than the console's. Its planes are viewed as R16_UNORM_X8_TYPELESS (depth) and
+// X16_TYPELESS_G8_UINT (stencil). Values: the Xbox entries of DirectXTex's DXGI format list (a hypothesis until the
+// title's own views are measured).
+const auto kXboxD16UnormS8Uint = static_cast<DXGI_FORMAT>(118);
+const auto kXboxR16UnormX8Typeless = static_cast<DXGI_FORMAT>(119);
+const auto kXboxX16TypelessG8Uint = static_cast<DXGI_FORMAT>(120);
+
 // DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. R32 and R16 typeless become
 // depth formats when the resource allows depth-stencil; R32G8X24 and R24G8 always do, as Vulkan has no colour format
 // with their layout.
@@ -373,6 +383,7 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_D16_UNORM: return {VK_FORMAT_D16_UNORM, d};
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return {VK_FORMAT_D32_SFLOAT_S8_UINT, ds};
     case DXGI_FORMAT_D24_UNORM_S8_UINT: return {VK_FORMAT_D24_UNORM_S8_UINT, ds};
+    case 118: return {VK_FORMAT_D24_UNORM_S8_UINT, ds};  // kXboxD16UnormS8Uint, stand-in (see above)
     case DXGI_FORMAT_R32_TYPELESS:
         return depth ? Format{VK_FORMAT_D32_SFLOAT, d, true} : Format{VK_FORMAT_R32_SFLOAT, color, true};
     case DXGI_FORMAT_R16_TYPELESS:
@@ -4559,7 +4570,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         (view.format == DXGI_FORMAT_X24_TYPELESS_G8_UINT &&
          (desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT)) ||
         (view.format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT &&
-         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT));
+         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) ||
+        (view.format == kXboxX16TypelessG8Uint && desc.Format == kXboxD16UnormS8Uint);
     if (stencil && !stencil_format_fits) {
         log_once("a stencil-plane view needs its texture family's stencil view format; format", int(view.format));
         return false;
@@ -4617,6 +4629,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             (desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
              (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS)) ||
             (desc.Format == DXGI_FORMAT_R24G8_TYPELESS && view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS) ||
+            (desc.Format == kXboxD16UnormS8Uint &&
+             (view.format == DXGI_FORMAT_UNKNOWN || view.format == kXboxR16UnormX8Typeless)) ||
             (desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT &&
              (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)) ||
             (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
