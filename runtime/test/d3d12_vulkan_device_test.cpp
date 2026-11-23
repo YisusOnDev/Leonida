@@ -3246,6 +3246,43 @@ HRESULT heap_create(ID3D12Device* device, D3D12_HEAP_DESC desc) {
     return released(device->CreateHeap(&desc, __uuidof(ID3D12Heap), &out), &out);
 }
 
+// CreateHeap1 with no protected session (D3D-238's neighbour: it is CreateHeap with the extra argument), through
+// ID3D12Device4. E_NOINTERFACE when the device lacks Device4.
+HRESULT heap1_create(ID3D12Device* device, D3D12_HEAP_DESC desc, REFIID riid = __uuidof(ID3D12Heap),
+                     bool output = true) {
+    Ref<ID3D12Device4> device4;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) return E_NOINTERFACE;
+    void* out = nullptr;
+    return released(device4->CreateHeap1(&desc, nullptr, riid, output ? &out : nullptr), &out);
+}
+
+// ID3D12Heap1 / ID3D12Resource1::GetProtectedResourceSession on an unprotected object: DXGI_ERROR_NOT_FOUND on the
+// host runtime and WARP. E_NOINTERFACE when the object has no such interface, E_UNEXPECTED when it can't be made.
+HRESULT heap_protected_session(ID3D12Device* device) {
+    Ref<ID3D12Heap> heap;
+    D3D12_HEAP_DESC desc = heap_desc_of(0);
+    if (FAILED(device->CreateHeap(&desc, IID_PPV_ARGS(&heap.p)))) return E_UNEXPECTED;
+    Ref<ID3D12Heap1> heap1;
+    if (FAILED(heap->QueryInterface(IID_PPV_ARGS(&heap1.p)))) return E_NOINTERFACE;
+    void* out = reinterpret_cast<void*>(1);
+    const HRESULT hr = heap1->GetProtectedResourceSession(__uuidof(ID3D12ProtectedResourceSession), &out);
+    return out ? E_FAIL : hr;  // the output is cleared
+}
+
+HRESULT resource_protected_session(ID3D12Device* device) {
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_RESOURCE_DESC desc = buffer_desc(256);
+    Ref<ID3D12Resource> resource;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                               nullptr, IID_PPV_ARGS(&resource.p))))
+        return E_UNEXPECTED;
+    Ref<ID3D12Resource1> resource1;
+    if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&resource1.p)))) return E_NOINTERFACE;
+    void* out = reinterpret_cast<void*>(1);
+    const HRESULT hr = resource1->GetProtectedResourceSession(__uuidof(ID3D12Fence), &out);  // any IID
+    return out ? E_FAIL : hr;
+}
+
 // CreatePlacedResource in a fresh heap of `heap` made on the same device. A heap the device refuses makes the case
 // itself wrong, so it answers E_UNEXPECTED on either side.
 struct PlacedArgs {
@@ -4607,6 +4644,25 @@ int compare_heap_neighbours(ID3D12Device* ours) {
         {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
          }, true},
+        // CreateHeap1 without a protected session is CreateHeap, whatever the arguments.
+        {"heap1: no session", [](ID3D12Device* d) { return heap1_create(d, heap_desc_of(0)); }},
+        {"heap1: no session, ID3D12Heap1 asked", [](ID3D12Device* d) {
+             return heap1_create(d, heap_desc_of(0), __uuidof(ID3D12Heap1));
+         }},
+        {"heap1: no session, null output", [](ID3D12Device* d) {
+             return heap1_create(d, heap_desc_of(0), __uuidof(ID3D12Heap), false);
+         }},
+        {"heap1: no session, wrong interface", [](ID3D12Device* d) {
+             return heap1_create(d, heap_desc_of(0), __uuidof(ID3D12Fence));
+         }},
+        {"heap1: no session, size 0", [](ID3D12Device* d) {
+             return heap1_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 0));
+         }},
+        {"heap1: no session, size 1000", [](ID3D12Device* d) {
+             return heap1_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 1000));
+         }},
+        {"heap: GetProtectedResourceSession", heap_protected_session},
+        {"resource: GetProtectedResourceSession", resource_protected_session},
     };
     int mismatches = 0;
     for (const Case& c : cases) {
