@@ -808,6 +808,69 @@ struct IGameInputDispatcher : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE OpenWaitHandle(HANDLE* waitHandle) = 0;
 };
 
+// Keyboard and mouse (RT-159). Layouts checked against the v0 header of Microsoft.GameInput 0.2303.22621.3038; the
+// asserts below pin them.
+enum GameInputKeyboardKind : int32_t {
+    GameInputUnknownKeyboard = -1,
+    GameInputAnsiKeyboard = 0,
+    GameInputIsoKeyboard = 1,
+    GameInputKsKeyboard = 2,
+    GameInputAbntKeyboard = 3,
+    GameInputJisKeyboard = 4,
+};
+
+enum GameInputMouseButtons : uint32_t {
+    GameInputMouseNone = 0x00,
+    GameInputMouseLeftButton = 0x01,
+    GameInputMouseRightButton = 0x02,
+    GameInputMouseMiddleButton = 0x04,
+    GameInputMouseButton4 = 0x08,
+    GameInputMouseButton5 = 0x10,
+    GameInputMouseWheelTiltLeft = 0x20,
+    GameInputMouseWheelTiltRight = 0x40,
+};
+
+// One pressed key of a keyboard reading.
+struct GameInputKeyState {
+    uint32_t scanCode;   // set-1 scan code, 0xE0xx for extended keys
+    uint32_t codePoint;  // the character the key gives under the current layout, 0 when it gives none
+    uint8_t virtualKey;
+    bool isDeadKey;
+};
+
+// Positions and wheels are running sums of relative motion since the device appeared, not screen coordinates.
+struct GameInputMouseState {
+    uint32_t buttons;  // GameInputMouseButtons
+    int64_t positionX;
+    int64_t positionY;
+    int64_t wheelX;
+    int64_t wheelY;
+};
+
+struct GameInputKeyboardInfo {
+    GameInputKeyboardKind kind;
+    uint32_t layout;
+    uint32_t keyCount;
+    uint32_t functionKeyCount;
+    uint32_t maxSimultaneousKeys;
+    uint32_t platformType;
+    uint32_t platformSubtype;
+    const GameInputString* nativeLanguage;
+};
+
+struct GameInputMouseInfo {
+    uint32_t supportedButtons;  // GameInputMouseButtons
+    uint32_t sampleRate;
+    uint32_t sensorDpi;
+    bool hasWheelX;
+    bool hasWheelY;
+};
+
+static_assert(sizeof(GameInputKeyState) == 12 && offsetof(GameInputKeyState, virtualKey) == 8);
+static_assert(sizeof(GameInputMouseState) == 40 && offsetof(GameInputMouseState, positionX) == 8);
+static_assert(sizeof(GameInputKeyboardInfo) == 40 && offsetof(GameInputKeyboardInfo, nativeLanguage) == 32);
+static_assert(sizeof(GameInputMouseInfo) == 16 && offsetof(GameInputMouseInfo, hasWheelX) == 12);
+
 using GameInputCreateFn = HRESULT(WINAPI*)(IGameInput** gameInput);
 
 }  // namespace gi

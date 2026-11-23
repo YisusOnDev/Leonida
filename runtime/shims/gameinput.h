@@ -41,6 +41,9 @@ struct Config {
     bool rumble = true;                                 // LEONIDA_RUMBLE=0 turns all rumble off
     bool background_thread = true;                      // LEONIDA_GAMEINPUT_THREAD=0: poll only from poll()
     KeyboardPadMode keyboard_pad = KeyboardPadMode::Off;  // LEONIDA_KEYBOARD_PAD=1|focus|always|off
+    // A keyboard device and a mouse device whose readings carry keys and mouse state (RT-159), for a title that
+    // reads them through GameInput. Same focus modes as the keyboard pad. LEONIDA_KEYBOARD_MOUSE=1|focus|always|off
+    KeyboardPadMode keyboard_mouse = KeyboardPadMode::Off;
 };
 
 // The configuration in use. Read from the environment on the first GameInputCreate.
@@ -116,6 +119,13 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus);
 // replaces GetCursorPos. nullptr restores the default.
 using CursorPosFn = bool (*)(int* x, int* y);
 void set_cursor_source(CursorPosFn cursor_pos);
+// Cumulative raw wheel units; false means unavailable. nullptr restores the system source.
+using WheelSourceFn = bool (*)(int64_t* x, int64_t* y);
+void set_wheel_source(WheelSourceFn source);
+bool raw_mouse_started();
+// Test seams: -1 restores automatic raw detection; force an SDL initialization failure.
+void set_test_raw_mode(int mode);
+void set_test_sdl_failure(bool fail);
 
 // Raw HID (RT-175, docs/gameinput.md "Raw HID"). One report a HID report descriptor declares: its kind
 // (GameInputRawDeviceReportKind: 0 input, 1 output, 2 feature), its report id (0 when the descriptor declares none)
