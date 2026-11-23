@@ -84,6 +84,9 @@ using GetDiskFreeSpaceAFn = BOOL(WINAPI*)(LPCSTR, LPDWORD, LPDWORD, LPDWORD, LPD
 using GetDriveTypeWFn = UINT(WINAPI*)(LPCWSTR);
 using GetDriveTypeAFn = UINT(WINAPI*)(LPCSTR);
 
+using GetFullPathNameWFn = DWORD(WINAPI*)(LPCWSTR, DWORD, LPWSTR, LPWSTR*);
+using GetFullPathNameAFn = DWORD(WINAPI*)(LPCSTR, DWORD, LPSTR, LPSTR*);
+
 int g_checks = 0;
 int g_failures = 0;
 
@@ -1720,6 +1723,106 @@ void run_checks(const std::filesystem::path& root) {
         check(crt_stat64(host_b.c_str(), &st) == 0 && st.st_size == 1 && crt_remove(host_b.c_str()) == 0 &&
                   !std::filesystem::exists(host_dir / "b.txt"),
               "host paths go to the CRT unchanged");
+
+    // A caller that makes its path absolute before opening it (Rust's std::fs, std::filesystem::absolute) goes through
+    // GetFullPathName. The host reads "GAME:\x" as a relative name and answers "<current folder>\GAME:\x", so the
+    // open that follows never reached the game folder: "GAME:\a\b\c.bin" failed with ERROR_PATH_NOT_FOUND
+    // while the same name through CreateFileW opened.
+    {
+        write_path(package / "nested" / "deeper" / "c.bin", "deep");
+        const auto full_w = resolve<GetFullPathNameWFn>("kernel32.dll", "GetFullPathNameW");
+        const auto full_a = resolve<GetFullPathNameAFn>("kernel32.dll", "GetFullPathNameA");
+        check(full_w && full_a, "kernel32.dll serves GetFullPathNameW and GetFullPathNameA");
+        if (full_w && full_a) {
+        wchar_t full[MAX_PATH] = {};
+        wchar_t* file_part = nullptr;
+        const DWORD n = full_w(L"GAME:/nested/./deeper/../deeper/c.bin", MAX_PATH, full, &file_part);
+        check(n == 25 && std::wstring(full) == L"GAME:\\nested\\deeper\\c.bin", "GetFullPathNameW keeps a GAME: path on GAME:, normalized");
+        check(file_part && std::wstring(file_part) == L"c.bin", "and points the file part at the last name");
+        HANDLE h = create_w(full, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "deep", "so the path it answers still opens the package file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(full_w(L"GAME:\\nested\\deeper\\c.bin", 5, full, nullptr) == 26, "a buffer that is too small gets the size with the NUL");
+        check(full_w(L"game:", MAX_PATH, full, &file_part) == 6 && std::wstring(full) == L"GAME:\\" && file_part == nullptr,
+              "GAME: alone is the root with no file part");
+        char narrow[MAX_PATH] = {};
+        char* narrow_part = nullptr;
+        check(full_a("GAME:\\nested\\deeper\\c.bin", MAX_PATH, narrow, &narrow_part) == 25 &&
+                  std::string(narrow) == "GAME:\\nested\\deeper\\c.bin" && narrow_part && std::string(narrow_part) == "c.bin",
+              "GetFullPathNameA answers the same");
+
+        // Every other path is still the host's answer.
+        wchar_t host_ours[MAX_PATH] = {};
+        wchar_t host_real[MAX_PATH] = {};
+        const DWORD ours = full_w(L"relative\\x.txt", MAX_PATH, host_ours, nullptr);
+        const DWORD real = ::GetFullPathNameW(L"relative\\x.txt", MAX_PATH, host_real, nullptr);
+        check(ours == real && std::wstring(host_ours) == std::wstring(host_real), "a host path is answered by the host");
+        // Empty string: the host's answer (0), not a GAME: path.
+        wchar_t empty_ours[4] = {1}, empty_real[4] = {1};
+        check(full_w(L"", 4, empty_ours, nullptr) == ::GetFullPathNameW(L"", 4, empty_real, nullptr),
+              "an empty name is answered by the host");
+
+        // A trailing separator stays and leaves no file part, as GetFullPathNameW(L"C:\\foo\\") does; a trailing "." does not.
+        file_part = nullptr;
+        check(full_w(L"GAME:\\nested\\", MAX_PATH, full, &file_part) == 13 && std::wstring(full) == L"GAME:\\nested\\" &&
+                  file_part == nullptr,
+              "a trailing separator is kept and there is no file part");
+        check(full_w(L"GAME:/nested/./", MAX_PATH, full, &file_part) == 13 && std::wstring(full) == L"GAME:\\nested\\" &&
+                  file_part == nullptr,
+              "\".\\\" before a trailing separator does not remove it");
+        check(full_w(L"GAME:\\nested\\.", MAX_PATH, full, &file_part) == 12 && std::wstring(full) == L"GAME:\\nested" &&
+                  file_part && std::wstring(file_part) == L"nested",
+              "a trailing \".\" removes itself, not the folder name");
+        check(full_w(L"GAME:\\nested\\..\\", MAX_PATH, full, &file_part) == 6 && std::wstring(full) == L"GAME:\\" &&
+                  file_part == nullptr,
+              "a folder left with \"..\\\" is the root");
+        check(full_a("GAME:\\nested\\", MAX_PATH, narrow, &narrow_part) == 13 && std::string(narrow) == "GAME:\\nested\\" &&
+                  narrow_part == nullptr,
+              "GetFullPathNameA keeps the trailing separator too");
+        check(full_a("GAME:\\nested\\deeper\\c.bin", 5, narrow, &narrow_part) == 26,
+              "GetFullPathNameA with a small buffer answers the size with the NUL");
+
+        // A NULL buffer is a size query, however long the length says it is: the size with the NUL, nothing written.
+        wchar_t* query_part = reinterpret_cast<wchar_t*>(1);
+        check(full_w(L"GAME:\\nested\\deeper\\c.bin", MAX_PATH, nullptr, &query_part) == 26 && query_part == nullptr,
+              "GetFullPathNameW with a NULL buffer is a size query");
+        check(full_a("GAME:\\nested\\deeper\\c.bin", MAX_PATH, nullptr, nullptr) == 26, "GetFullPathNameA with a NULL buffer is a size query");
+
+        // lpFilePart is NULL when the buffer is too small and when the name is refused, not left as the caller had it
+        // (Wine's GetFullPathNameW, which the Windows function follows here).
+        wchar_t* sentinel_w = reinterpret_cast<wchar_t*>(1);
+        char* sentinel_a = reinterpret_cast<char*>(1);
+        check(full_w(L"GAME:\\nested\\deeper\\c.bin", 5, full, &sentinel_w) == 26 && sentinel_w == nullptr,
+              "a buffer that is too small clears the file part (W)");
+        check(full_a("GAME:\\nested\\deeper\\c.bin", 5, narrow, &sentinel_a) == 26 && sentinel_a == nullptr,
+              "a buffer that is too small clears the file part (A)");
+        sentinel_w = reinterpret_cast<wchar_t*>(1);
+        sentinel_a = reinterpret_cast<char*>(1);
+        check(full_w(L"GAME:\\..\\x", MAX_PATH, full, &sentinel_w) == 0 && sentinel_w == nullptr,
+              "a refused name clears the file part (W)");
+        check(full_a("GAME:\\..\\x", MAX_PATH, narrow, &sentinel_a) == 0 && sentinel_a == nullptr,
+              "a refused name clears the file part (A)");
+
+        // A path that climbs above GAME:\ is refused the way CreateFileW refuses the same name (ERROR_INVALID_NAME), and
+        // never reaches the host: Windows would clamp "C:\..\x" at the drive root, but the open of "GAME:\..\x" fails, and
+        // an answer that opens something else than the open would is worse than none.
+        for (const wchar_t* climbing : {L"GAME:\\..", L"GAME:\\..\\x", L"GAME:\\nested\\..\\..\\x", L"game:/../x"}) {
+            wchar_t untouched[MAX_PATH] = L"untouched";
+            SetLastError(0);
+            const bool refused = full_w(climbing, MAX_PATH, untouched, nullptr) == 0 && GetLastError() == ERROR_INVALID_NAME &&
+                                 std::wstring(untouched) == L"untouched";
+            SetLastError(0);
+            const bool same_as_open = create_w(climbing, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr) ==
+                                          INVALID_HANDLE_VALUE &&
+                                      GetLastError() == ERROR_INVALID_NAME;
+            check(refused && same_as_open, "a GAME: path above the root is refused by GetFullPathNameW as CreateFileW refuses it");
+        }
+        SetLastError(0);
+        char narrow_untouched[MAX_PATH] = "untouched";
+        check(full_a("GAME:\\..\\x", MAX_PATH, narrow_untouched, nullptr) == 0 && GetLastError() == ERROR_INVALID_NAME &&
+                  std::string(narrow_untouched) == "untouched",
+              "GetFullPathNameA refuses it too");
+        }
     }
 
     std::filesystem::remove_all(root);

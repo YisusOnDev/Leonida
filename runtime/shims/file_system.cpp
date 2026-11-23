@@ -917,6 +917,66 @@ DWORD WINAPI get_file_attributes_a(LPCSTR name) {
     return get_file_attributes_w(wide.c_str());
 }
 
+// GetFullPathName on a "GAME:" path. The host function reads "GAME:\x" as a relative name and answers
+// "<current folder>\GAME:\x", which no longer names the console drive, so a caller that makes its path absolute
+// before opening it (Rust's std::fs, std::filesystem::absolute) lost the game folder: every "GAME:" open failed
+// with ERROR_PATH_NOT_FOUND while the same name through CreateFileW worked. A "GAME:" path is already absolute: it
+// comes back with one separator style and no "." or ".." parts, and a trailing separator stays, as Windows keeps it
+// for "C:\foo\" (then there is no file part). A path that climbs above GAME:\ is refused with ERROR_INVALID_NAME,
+// as CreateFileW refuses the same name, and never reaches the host. Every other path goes to the host.
+enum class FullPath { NotGame, Refused, Answered };
+
+FullPath full_game_path(const wchar_t* name, std::wstring& full, bool& has_file_part) {
+    const std::wstring path = name;
+    size_t prefix_length = 0;
+    if (console_drive(path, prefix_length) != Drive::Game || prefix_length != kGamePrefixLength) return FullPath::NotGame;
+    std::vector<std::wstring> parts;
+    if (parse_console(path, parts) != Parsed::Console) return FullPath::Refused;
+    full = L"GAME:";
+    for (const auto& part : parts) full += L'\\' + part;
+    const bool trailing_separator = !path.empty() && is_separator(path.back());
+    if (parts.empty() || trailing_separator) full += L'\\';
+    has_file_part = !parts.empty() && !trailing_separator;
+    return FullPath::Answered;
+}
+
+DWORD WINAPI get_full_path_name_w(LPCWSTR name, DWORD length, LPWSTR buffer, LPWSTR* file_part) {
+    std::wstring full;
+    bool has_file_part = false;
+    const FullPath kind = name ? full_game_path(name, full, has_file_part) : FullPath::NotGame;
+    if (kind == FullPath::NotGame) return ::GetFullPathNameW(name, length, buffer, file_part);
+    if (file_part) *file_part = nullptr;  // as when the host fails or the buffer is too small: no file part
+    if (kind == FullPath::Refused) {
+        SetLastError(ERROR_INVALID_NAME);
+        return 0;
+    }
+    if (!buffer || full.size() + 1 > length) return static_cast<DWORD>(full.size() + 1);  // size query or too small: the size with the NUL
+    std::wmemcpy(buffer, full.c_str(), full.size() + 1);
+    if (file_part) *file_part = has_file_part ? buffer + full.rfind(L'\\') + 1 : nullptr;
+    return static_cast<DWORD>(full.size());
+}
+
+DWORD WINAPI get_full_path_name_a(LPCSTR name, DWORD length, LPSTR buffer, LPSTR* file_part) {
+    std::wstring full;
+    bool has_file_part = false;
+    const FullPath kind = name ? full_game_path(widen_ansi(name).c_str(), full, has_file_part) : FullPath::NotGame;
+    if (kind == FullPath::NotGame) return ::GetFullPathNameA(name, length, buffer, file_part);
+    if (file_part) *file_part = nullptr;
+    if (kind == FullPath::Refused) {
+        SetLastError(ERROR_INVALID_NAME);
+        return 0;
+    }
+    const int needed = WideCharToMultiByte(CP_ACP, 0, full.c_str(), -1, nullptr, 0, nullptr, nullptr);  // with the NUL
+    if (needed <= 0) {
+        if (GetLastError() == ERROR_SUCCESS) SetLastError(ERROR_NO_UNICODE_TRANSLATION);  // never fail with a stale or zero error
+        return 0;
+    }
+    if (!buffer || static_cast<DWORD>(needed) > length) return static_cast<DWORD>(needed);  // size query or too small
+    WideCharToMultiByte(CP_ACP, 0, full.c_str(), -1, buffer, needed, nullptr, nullptr);
+    if (file_part) *file_part = has_file_part ? std::strrchr(buffer, '\\') + 1 : nullptr;
+    return static_cast<DWORD>(needed - 1);
+}
+
 BOOL WINAPI get_file_attributes_ex_w(LPCWSTR name, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
     if (!name || !info) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -2008,6 +2068,8 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
         {dll, "FindNextFileW", reinterpret_cast<void*>(&find_next_file_w)},                              \
         {dll, "FindClose", reinterpret_cast<void*>(&find_close)},                                        \
         {dll, "GetFileAttributesA", reinterpret_cast<void*>(&get_file_attributes_a)},                    \
+        {dll, "GetFullPathNameA", reinterpret_cast<void*>(&get_full_path_name_a)},                       \
+        {dll, "GetFullPathNameW", reinterpret_cast<void*>(&get_full_path_name_w)},                       \
         {dll, "GetFileAttributesW", reinterpret_cast<void*>(&get_file_attributes_w)},                    \
         {dll, "GetFileAttributesExA", reinterpret_cast<void*>(&get_file_attributes_ex_a)},               \
         {dll, "GetFileAttributesExW", reinterpret_cast<void*>(&get_file_attributes_ex_w)},               \

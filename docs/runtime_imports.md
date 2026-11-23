@@ -252,6 +252,11 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   name, and hides deleted names, the marker folder and the copy folder.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
   cannot reach outside the package and the overlay.
+- `GetFullPathNameA/W` answers a `GAME:` path as itself (one separator style, no `.` or `..`), because the host would
+  turn `GAME:\x` into `<current folder>\GAME:\x`, which no longer names the game folder. Callers that make a path absolute
+  before opening it (Rust's `std::fs`, C++ `std::filesystem::absolute`) otherwise failed every `GAME:` open with
+  `ERROR_PATH_NOT_FOUND`. `G:` and `T:` already survive the host's answer. The C runtime's `_fullpath` calls the host
+  function inside the UCRT and is not covered.
 
 - `CreateDirectory*` makes the folder in the overlay. A name the title can already see, including a folder only the
   package has, fails with `ERROR_ALREADY_EXISTS`; a missing parent with `ERROR_PATH_NOT_FOUND`.
