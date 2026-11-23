@@ -2074,7 +2074,7 @@ public:
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
         // Before the memory goes to the deferred queue: no submission copies into it after this.
-        if (shadow_) device_.remove_shadow(shadow_);
+        if (title_shadow_) device_.remove_shadow(title_shadow_);
         if (host_import_) {
             // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
             // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
@@ -2413,9 +2413,9 @@ public:
         if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS ||
             vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &shadow) != VK_SUCCESS)
             return E_OUTOFMEMORY;
-        shadow_ = static_cast<std::uint8_t*>(shadow);
+        title_shadow_ = static_cast<std::uint8_t*>(shadow);
         const auto* pages = static_cast<const std::uint8_t*>(address);
-        copy_title_pages(shadow_, pages, std::size_t(desc_.Width));
+        copy_title_pages(title_shadow_, pages, std::size_t(desc_.Width));
         // Map() answers the title's own pages, as the imported buffer does: a write to the shadow's memory would be
         // overwritten by the next copy.
         mapped_ = address;
@@ -2432,10 +2432,10 @@ public:
         binding.size = desc_.Width;
         // CPU-side reads take the shadow, not the title's pages: it is as fresh as what the GPU reads and every byte
         // of it can be read, which the pages do not promise. Not host_readable: GPU writes are not handed back.
-        binding.host = shadow_;
+        binding.host = title_shadow_;
         binding.va = va_;
         device_.context->add_resource(id(), binding);
-        device_.add_shadow({pages, shadow_, std::size_t(desc_.Width)});
+        device_.add_shadow({pages, title_shadow_, std::size_t(desc_.Width)});
         return S_OK;
     }
 
@@ -3092,7 +3092,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
-    std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
+    std::uint8_t* title_shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
