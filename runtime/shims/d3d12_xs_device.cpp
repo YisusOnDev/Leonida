@@ -3010,6 +3010,326 @@ void log_refused_resource(unsigned slot, HRESULT hr, const D3D12_RESOURCE_DESC& 
                  pc.SampleDesc.Count, xbox_flags, static_cast<unsigned>(pc.Flags));
 }
 
+// Xbox slot 57 (+0x1c8): DeserializeGraphicsPipelineStateX(const XboxNativeGraphicsPipelineStateDesc* desc,
+// REFIID riid, void** ppPipelineState).
+struct XboxNativeGraphicsPipelineStateDesc {
+    ID3D12RootSignature* root_signature;  // +0x00
+    const void* state_blob;               // +0x08: 380..404 B state blob (magic 0x4005d800 / 0x4005d808 / 0x4005d810)
+    std::uint64_t state_blob_size;        // +0x10
+    const void* pipeline_blob;            // +0x18: 80..224 B pipeline / input-layout blob (188 B in boot PSOs 1..3)
+    std::uint64_t pipeline_blob_size;     // +0x20
+    const void* prog_a;                   // +0x28: native RDNA2 program #1 (or nullptr/0 if absent, as in boot PSO 3)
+    std::uint64_t prog_a_size;            // +0x30
+    const void* stage_a;                  // +0x38: stage blob #1 (kind-2, e.g. 208 B, or nullptr/0 if absent)
+    std::uint64_t stage_a_size;           // +0x40
+    const void* prog_b;                   // +0x48: native RDNA2 program #2 (e.g. 320..384 B)
+    std::uint64_t prog_b_size;            // +0x50
+    const void* stage_b;                  // +0x58: stage blob #2 (kind-2, e.g. 752 B)
+    std::uint64_t stage_b_size;           // +0x60
+};
+
+// Measured offsets in the 380..388 B state blob across the 24,797 graphics records of the pipeline library.
+// None is confirmed as a specific D3D12 state field yet; each offset is logged once with its observed u32 word.
+struct MeasuredStateBlobField {
+    std::uint32_t offset;
+    const char* note;
+};
+
+constexpr MeasuredStateBlobField kMeasuredStateBlobFields[] = {
+    {0x000, "version/type tag (0x4005d800 / 0x4005d808 / 0x4005d810)"},
+    {0x004, "PSO family (4 or 6)"},
+    {0x00c, "per-PSO state word"},
+    {0x028, "per-PSO state word"},
+    {0x02c, "constant 2"},
+    {0x038, "per-PSO state word"},
+    {0x03c, "small counter"},
+    {0x040, "mask (0xfffe or 0)"},
+    {0x044, "mask (0xfffffffe or 0xffff0000)"},
+    {0x04c, "boot-PSO diff word"},
+    {0x050, "small counter"},
+    {0x054, "boot-PSO diff word"},
+    {0x058, "boot-PSO diff word"},
+    {0x05c, "boot-PSO diff word"},
+    {0x064, "per-PSO state word"},
+    {0x068, "boot-PSO diff word"},
+    {0x06c, "boot-PSO diff word"},
+    {0x070, "boot-PSO diff word"},
+    {0x074, "per-PSO state word (0x060201bc or 0x80)"},
+    {0x07c, "per-PSO state word (0xcc0010 / 0 / 0xcc0011)"},
+    {0x084, "boot-PSO diff word"},
+    {0x0a0, "per-PSO state word"},
+    {0x0a8, "per-PSO state word (0x1000 or 0x8004)"},
+    {0x0b8, "boot-PSO diff word"},
+    {0x0f0, "per-PSO state word"},
+    {0x0f4, "constant 5"},
+    {0x0f8, "constant 1"},
+    {0x0fc, "0x33333333 (float 0.1)"},
+    {0x100, "repeated 0x00060006 slot 0"},
+    {0x104, "repeated 0x00060006 slot 1"},
+    {0x108, "repeated 0x00060006 slot 2"},
+    {0x10c, "repeated 0x00060006 slot 3"},
+    {0x110, "repeated 0x00060006 slot 4"},
+    {0x114, "repeated 0x00060006 slot 5"},
+    {0x118, "repeated 0x00060006 slot 6"},
+    {0x11c, "repeated 0x00060006 slot 7"},
+    {0x128, "boot-PSO diff word"},
+    {0x144, "mask (0 or 0xffffffff)"},
+    {0x150, "constant 0x40"},
+    {0x158, "constant 0xffffffff"},
+    {0x174, "per-PSO state word"},
+    {0x17c, "constant 0x10000a00 (present when size >= 384)"},
+};
+
+std::atomic<bool> g_state_blob_field_logged[std::size(kMeasuredStateBlobFields)]{};
+
+void log_measured_state_blob_fields(const void* blob, std::size_t blob_size) {
+    if (!blob || blob_size < 4) return;
+    const auto* bytes = static_cast<const std::uint8_t*>(blob);
+    for (std::size_t i = 0; i < std::size(kMeasuredStateBlobFields); ++i) {
+        const std::uint32_t off = kMeasuredStateBlobFields[i].offset;
+        if (static_cast<std::size_t>(off) + 4 > blob_size) continue;
+        bool expected = false;
+        if (g_state_blob_field_logged[i].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+            std::uint32_t val = 0;
+            std::memcpy(&val, bytes + off, 4);
+            std::fprintf(stderr, "[rt] d3d12_xs: state blob: campo sin identificar en 0x%03x = 0x%08x\n",
+                         static_cast<unsigned>(off), static_cast<unsigned>(val));
+        }
+    }
+}
+
+bool parse_xbox_pipeline_blob_input_layout_impl(const void* blob, std::size_t blob_size,
+                                                std::vector<XboxPipelineInputElement>& out_elements) {
+    out_elements.clear();
+    if (!blob || blob_size < 0x54) return false;
+    const auto* bytes = static_cast<const std::uint8_t*>(blob);
+    const auto read_u32 = [&](std::size_t off, std::uint32_t& v) -> bool {
+        if (off + 4 > blob_size) return false;
+        std::memcpy(&v, bytes + off, 4);
+        return true;
+    };
+    std::uint32_t magic_const = 0;
+    std::uint32_t field_block_size = 0;
+    std::uint32_t tag_3c = 0;
+    std::uint32_t num_elements = 0;
+    if (!read_u32(0x04, magic_const) || !read_u32(0x10, field_block_size) ||
+        !read_u32(0x3c, tag_3c) || !read_u32(0x4c, num_elements))
+        return false;
+    if (num_elements == 0 || num_elements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) return true;
+    // Measured at +0x10: 0x1c (28 bytes = 7 u32) in PSOs 1 and 2, 0 in PSO 3 where the element stride is still 28 B.
+    const std::size_t stride_after_name = (field_block_size >= 16 && field_block_size <= 64) ? field_block_size : 28u;
+    std::size_t pos = 0x54;
+    for (std::uint32_t idx = 0; idx < num_elements && pos + 4 <= blob_size; ++idx) {
+        const void* nul = std::memchr(bytes + pos, 0, blob_size - pos);
+        if (!nul) break;
+        const std::size_t name_len = static_cast<const std::uint8_t*>(nul) - (bytes + pos);
+        if (name_len == 0) break;
+        const std::size_t fields_pos = pos + name_len + 1;
+        // Need at least the first 4 u32s (+0x00 slot, +0x04 DXGI_FORMAT, +0x08 SemanticIndex, +0x0c AlignedByteOffset)
+        // inside blob_size; never read past blob_size even when the last 1..4 bytes of the 28-byte block are truncated.
+        if (fields_pos + 16 > blob_size) break;
+        std::uint32_t slot = 0, fmt = 0, sem_idx = 0, byte_off = 0;
+        read_u32(fields_pos + 0x00, slot);
+        read_u32(fields_pos + 0x04, fmt);
+        read_u32(fields_pos + 0x08, sem_idx);
+        read_u32(fields_pos + 0x0c, byte_off);
+        XboxPipelineInputElement elem;
+        elem.semantic_name.assign(reinterpret_cast<const char*>(bytes + pos), name_len);
+        elem.semantic_index = sem_idx;
+        elem.format = static_cast<DXGI_FORMAT>(fmt);
+        elem.input_slot = slot < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT ? slot : 0;
+        elem.aligned_byte_offset = byte_off;
+        out_elements.push_back(std::move(elem));
+        pos = fields_pos + stride_after_name;
+    }
+    return true;
+}
+
+SRWLOCK g_fspx_stage_lock = SRWLOCK_INIT;
+leonida::ShaderLibrary* g_fspx_stage_lib = nullptr;
+std::wstring* g_fspx_stage_dir = nullptr;
+
+std::wstring current_shaders_env_dir() {
+    wchar_t buf[32768]{};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SHADERS", buf, static_cast<DWORD>(std::size(buf)));
+    if (n == 0 || n >= std::size(buf)) return {};
+    return std::wstring(buf, n);
+}
+
+std::string lookup_xbox_fspx_program_stage_impl(const void* program_bytes, std::size_t program_size) {
+    if (!program_bytes || !program_size || program_size > leonida::kFspxPartLimit) return {};
+    const std::span<const std::uint8_t> code{static_cast<const std::uint8_t*>(program_bytes), program_size};
+    if (!leonida::fspx_bare_program(code)) return {};
+    const std::string hash = leonida::sha256_hex(code);
+    const std::wstring dir = current_shaders_env_dir();
+    if (dir.empty()) return {};
+    AcquireSRWLockExclusive(&g_fspx_stage_lock);
+    if (!g_fspx_stage_lib) g_fspx_stage_lib = new (std::nothrow) leonida::ShaderLibrary();
+    if (!g_fspx_stage_dir) g_fspx_stage_dir = new (std::nothrow) std::wstring();
+    if (g_fspx_stage_lib && g_fspx_stage_dir && *g_fspx_stage_dir != dir) {
+        *g_fspx_stage_dir = dir;
+        g_fspx_stage_lib->load_fspx_only(std::filesystem::path(dir));
+    }
+    const leonida::ShaderEntry* entry = g_fspx_stage_lib ? g_fspx_stage_lib->find_fspx_by_code(hash) : nullptr;
+    const std::string stage = entry ? entry->stage : std::string{};
+    ReleaseSRWLockExclusive(&g_fspx_stage_lock);
+    return stage;
+}
+
+std::atomic<std::uint64_t> g_slot57_calls{0};
+
+HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const void* desc,
+                                                        const IID* riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
+    if (!riid) return E_POINTER;
+
+    const auto* xbox_desc = static_cast<const XboxNativeGraphicsPipelineStateDesc*>(desc);
+    const std::uint64_t call = g_slot57_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // 1. Inspect and log measured state-blob fields once per offset (no unmeasured offsets).
+    if (xbox_desc->state_blob && xbox_desc->state_blob_size) {
+        if (xbox_desc->state_blob_size > leonida::kFspxPartLimit) return E_INVALIDARG;
+        log_measured_state_blob_fields(xbox_desc->state_blob, static_cast<std::size_t>(xbox_desc->state_blob_size));
+    }
+
+    // 2. Defensively decode input layout from the pipeline blob (+0x18 / +0x20).
+    std::vector<XboxPipelineInputElement> parsed_inputs;
+    if (xbox_desc->pipeline_blob && xbox_desc->pipeline_blob_size) {
+        if (xbox_desc->pipeline_blob_size > leonida::kFspxPartLimit) return E_INVALIDARG;
+        parse_xbox_pipeline_blob_input_layout_impl(
+            xbox_desc->pipeline_blob, static_cast<std::size_t>(xbox_desc->pipeline_blob_size), parsed_inputs);
+    }
+    std::vector<D3D12_INPUT_ELEMENT_DESC> input_descs;
+    input_descs.reserve(parsed_inputs.size());
+    for (const auto& elem : parsed_inputs) {
+        D3D12_INPUT_ELEMENT_DESC d{};
+        d.SemanticName = elem.semantic_name.c_str();
+        d.SemanticIndex = elem.semantic_index;
+        d.Format = elem.format;
+        d.InputSlot = elem.input_slot;
+        d.AlignedByteOffset = elem.aligned_byte_offset;
+        d.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        d.InstanceDataStepRate = 0;
+        input_descs.push_back(d);
+    }
+
+    // 3. Resolve each present RDNA2 program (+0x28/+0x30 and +0x48/+0x50) by sha256(program bytes) and assign its
+    //    stage from the index entry ("vs", "ps", "ms", "gs"), never from its position in the description.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pc_desc{};
+    pc_desc.pRootSignature = xbox_desc->root_signature;
+    pc_desc.InputLayout.pInputElementDescs = input_descs.empty() ? nullptr : input_descs.data();
+    pc_desc.InputLayout.NumElements = static_cast<UINT>(input_descs.size());
+
+    struct ProgPair {
+        const void* data;
+        std::uint64_t size;
+    };
+    const ProgPair pairs[2] = {{xbox_desc->prog_a, xbox_desc->prog_a_size},
+                               {xbox_desc->prog_b, xbox_desc->prog_b_size}};
+    for (const ProgPair& p : pairs) {
+        if (!p.data && !p.size) continue;
+        if (!p.data || !p.size || p.size > leonida::kFspxPartLimit) return E_INVALIDARG;
+        const std::span<const std::uint8_t> code{static_cast<const std::uint8_t*>(p.data),
+                                                 static_cast<std::size_t>(p.size)};
+        if (!leonida::fspx_bare_program(code)) {
+            static std::atomic<int> bad_prog_log{0};
+            if (bad_prog_log.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 57 call %llu: non-RDNA2 program blob (%llu B)\n",
+                             static_cast<unsigned long long>(call), static_cast<unsigned long long>(p.size));
+            return E_INVALIDARG;
+        }
+        const std::string stage = lookup_xbox_fspx_program_stage_impl(p.data, static_cast<std::size_t>(p.size));
+        if (stage == "vs") {
+            pc_desc.VS = {p.data, static_cast<SIZE_T>(p.size)};
+        } else if (stage == "ps") {
+            pc_desc.PS = {p.data, static_cast<SIZE_T>(p.size)};
+        } else if (stage == "gs") {
+            pc_desc.GS = {p.data, static_cast<SIZE_T>(p.size)};
+        } else {
+            static std::atomic<int> miss_log{0};
+            if (miss_log.fetch_add(1, std::memory_order_relaxed) < 16) {
+                const std::string hash = leonida::sha256_hex(code);
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 57 call %llu: no translated graphics stage in fspx_gfx for kind-6 "
+                             "sha256 %s (%llu B)\n",
+                             static_cast<unsigned long long>(call), hash.c_str(),
+                             static_cast<unsigned long long>(p.size));
+            }
+            return E_INVALIDARG;
+        }
+    }
+
+    // 4. Safe default fixed-function state (blend disabled, depth test on/LESS, cull none, triangle list, 1x sample).
+    pc_desc.BlendState.AlphaToCoverageEnable = FALSE;
+    pc_desc.BlendState.IndependentBlendEnable = FALSE;
+    for (auto& rt : pc_desc.BlendState.RenderTarget) {
+        rt.BlendEnable = FALSE;
+        rt.LogicOpEnable = FALSE;
+        rt.SrcBlend = D3D12_BLEND_ONE;
+        rt.DestBlend = D3D12_BLEND_ZERO;
+        rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    pc_desc.SampleMask = UINT_MAX;
+    pc_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pc_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pc_desc.RasterizerState.FrontCounterClockwise = FALSE;
+    pc_desc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+    pc_desc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    pc_desc.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    pc_desc.RasterizerState.DepthClipEnable = TRUE;
+    pc_desc.RasterizerState.MultisampleEnable = FALSE;
+    pc_desc.RasterizerState.AntialiasedLineEnable = FALSE;
+    pc_desc.RasterizerState.ForcedSampleCount = 0;
+    pc_desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+    pc_desc.DepthStencilState.DepthEnable = TRUE;
+    pc_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pc_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pc_desc.DepthStencilState.StencilEnable = FALSE;
+    pc_desc.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    pc_desc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    const D3D12_DEPTH_STENCILOP_DESC default_stencil_op = {
+        D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
+    pc_desc.DepthStencilState.FrontFace = default_stencil_op;
+    pc_desc.DepthStencilState.BackFace = default_stencil_op;
+
+    pc_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    if (pc_desc.PS.pShaderBytecode && pc_desc.PS.BytecodeLength) {
+        pc_desc.NumRenderTargets = 1;
+        pc_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    } else {
+        pc_desc.NumRenderTargets = 0;
+    }
+    pc_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pc_desc.SampleDesc.Count = 1;
+    pc_desc.SampleDesc.Quality = 0;
+    pc_desc.NodeMask = 0;
+    pc_desc.CachedPSO = {nullptr, 0};
+    pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    const HRESULT hr = self->real->CreateGraphicsPipelineState(&pc_desc, *riid, out);
+    if (FAILED(hr)) {
+        static std::atomic<int> fail_log{0};
+        if (fail_log.fetch_add(1, std::memory_order_relaxed) < 16)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 57 call %llu failed with 0x%08lx (state %llu B, pipe %llu B, progA %llu B, "
+                         "progB %llu B)\n",
+                         static_cast<unsigned long long>(call), static_cast<unsigned long>(hr),
+                         static_cast<unsigned long long>(xbox_desc->state_blob_size),
+                         static_cast<unsigned long long>(xbox_desc->pipeline_blob_size),
+                         static_cast<unsigned long long>(xbox_desc->prog_a_size),
+                         static_cast<unsigned long long>(xbox_desc->prog_b_size));
+    }
+    return hr;
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -3515,6 +3835,26 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                       D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)},
                                       static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(static_cast<UINT>(a4)));
         return 0;
+    } else if constexpr (Slot == 57) {
+        // Xbox slot 57 is DeserializeGraphicsPipelineStateX(desc, riid, out), whereas PC slot 57 is
+        // ID3D12Device4::CreateProtectedResourceSession(desc, riid, out). Both pass `riid` in `a2`; when `riid`
+        // is IID_ID3D12PipelineState (or `a2` is null so the slot-57 null-IID path is tested), route to graphics
+        // PSO deserialization. When `riid` is IID_ID3D12ProtectedResourceSession*, forward to the PC device.
+        const IID* riid = reinterpret_cast<const IID*>(a2);
+        if (!riid || *riid == __uuidof(ID3D12PipelineState)) {
+            note_slot(57);
+            log_xbox_route_once(57, "DeserializeGraphicsPipelineStateX", a1, a2, a3, a4, a5);
+            return hr_to_u64(proxy_create_graphics_pipeline_from_native_code(
+                self, reinterpret_cast<const void*>(a1), riid, reinterpret_cast<void**>(a3)));
+        }
+        note_slot(57);
+        if (57 >= self->slot_count) return hr_to_u64(refuse_beyond_device(57, self->slot_count));
+        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t);
+        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[57]);
+        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
@@ -4077,6 +4417,15 @@ void reset_device_proxy_stats() {
     reset_child_stats<ChildKind::queue>();
     reset_child_stats<ChildKind::fence>();
     reset_child_stats<ChildKind::allocator>();
+}
+
+bool parse_xbox_pipeline_blob_input_layout(const void* blob, std::size_t blob_size,
+                                           std::vector<XboxPipelineInputElement>& out_elements) {
+    return parse_xbox_pipeline_blob_input_layout_impl(blob, blob_size, out_elements);
+}
+
+std::string lookup_xbox_fspx_program_stage(const void* program_bytes, std::size_t program_size) {
+    return lookup_xbox_fspx_program_stage_impl(program_bytes, program_size);
 }
 
 }  // namespace rt::d3d12_xs

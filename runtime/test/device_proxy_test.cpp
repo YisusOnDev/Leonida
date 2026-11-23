@@ -28,6 +28,10 @@
 #include "d3d12_xs_device.h"
 #include "shims.h"
 #include "../src/frame_pacer.h"
+#include "../src/shader_library.h"
+
+#include <filesystem>
+#include <fstream>
 
 namespace {
 
@@ -951,6 +955,151 @@ int main(int argc, char** argv) {
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
+    // Slot 57 (DeserializeGraphicsPipelineStateX):
+    // 1. Guard-page test on the measured 188-byte (0xbc) pipeline blob from PSO #1 (record 8916), whose third element
+    //    ("TEXCOORD" at 0x9b, fields at 0xa4) has its 28-byte block truncated by 4 bytes at 0xbc. Placing the 188-byte
+    //    blob at the very end of a committed page right before a PAGE_NOACCESS guard page proves the parser decodes all
+    //    3 elements (POSITION R32G32B32_FLOAT @0, COLOR R8G8B8A8_UNORM @12, TEXCOORD R32G32_FLOAT @16) without reading
+    //    past `blob_size`.
+    // 2. ShaderLibrary `fspx_gfx/index.json` loading and separate `fspx_size()`, `fspx_gfx_size()`, `bvh_size()` counters.
+    {
+        auto put_u32 = [](std::uint8_t* dst, std::size_t off, std::uint32_t v) {
+            std::memcpy(dst + off, &v, 4);
+        };
+        std::uint8_t blob188[0xbc]{};
+        put_u32(blob188, 0x00, 0xea6f6e56u);  // PSO 1 magic/checksum
+        put_u32(blob188, 0x04, 0x00001000u);  // constant
+        put_u32(blob188, 0x08, 0u);
+        put_u32(blob188, 0x0c, 1u);
+        put_u32(blob188, 0x10, 0x0000001cu);  // 28 bytes (7 u32) per element
+        put_u32(blob188, 0x1c, 0xffffffffu);
+        put_u32(blob188, 0x24, 0x00130100u);
+        put_u32(blob188, 0x28, 1u);
+        put_u32(blob188, 0x38, 0x00000070u);  // 4 + 3*28 + (9+6+9) = 112
+        put_u32(blob188, 0x3c, 0x0000000cu);
+        put_u32(blob188, 0x4c, 3u);           // 3 input elements
+        put_u32(blob188, 0x50, 9u);           // max name stride including NUL
+
+        // Element 0 @ 0x54: "POSITION\0" (9 B) + 28 B fields @ 0x5d..0x79
+        std::memcpy(blob188 + 0x54, "POSITION", 9);
+        put_u32(blob188, 0x5d + 0x00, 0u);                                    // InputSlot 0
+        put_u32(blob188, 0x5d + 0x04, static_cast<std::uint32_t>(DXGI_FORMAT_R32G32B32_FLOAT));  // 6
+        put_u32(blob188, 0x5d + 0x08, 0u);                                    // SemanticIndex 0
+        put_u32(blob188, 0x5d + 0x0c, 0u);                                    // AlignedByteOffset 0
+        put_u32(blob188, 0x5d + 0x18, 6u);
+
+        // Element 1 @ 0x79: "COLOR\0" (6 B) + 28 B fields @ 0x7f..0x9b
+        std::memcpy(blob188 + 0x79, "COLOR", 6);
+        put_u32(blob188, 0x7f + 0x00, 0u);
+        put_u32(blob188, 0x7f + 0x04, static_cast<std::uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM));   // 28
+        put_u32(blob188, 0x7f + 0x08, 0u);
+        put_u32(blob188, 0x7f + 0x0c, 12u);
+        put_u32(blob188, 0x7f + 0x18, 9u);
+
+        // Element 2 @ 0x9b: "TEXCOORD\0" (9 B) + 24 B fields @ 0xa4..0xbc (truncated by 4 B at 0xbc!)
+        std::memcpy(blob188 + 0x9b, "TEXCOORD", 9);
+        put_u32(blob188, 0xa4 + 0x00, 0u);
+        put_u32(blob188, 0xa4 + 0x04, static_cast<std::uint32_t>(DXGI_FORMAT_R32G32_FLOAT));     // 16
+        put_u32(blob188, 0xa4 + 0x08, 0u);
+        put_u32(blob188, 0xa4 + 0x0c, 16u);
+
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        const std::size_t page = si.dwPageSize ? si.dwPageSize : 4096;
+        auto* pages = static_cast<std::uint8_t*>(
+            VirtualAlloc(nullptr, page * 2, MEM_RESERVE, PAGE_NOACCESS));
+        check(pages != nullptr, "slot 57 pipeline blob guard pages reserved");
+        if (pages) {
+            void* committed = VirtualAlloc(pages, page, MEM_COMMIT, PAGE_READWRITE);
+            check(committed == pages, "slot 57 pipeline blob first page committed before guard page");
+            std::uint8_t* guarded_blob = pages + page - sizeof(blob188);
+            std::memcpy(guarded_blob, blob188, sizeof(blob188));
+            std::vector<rt::d3d12_xs::XboxPipelineInputElement> elems;
+            const bool ok = rt::d3d12_xs::parse_xbox_pipeline_blob_input_layout(
+                guarded_blob, sizeof(blob188), elems);
+            check(ok && elems.size() == 3,
+                  "slot 57 pipeline blob parser decodes 3 elements from truncated 188-byte blob adjacent to PAGE_NOACCESS");
+            if (elems.size() == 3) {
+                check(elems[0].semantic_name == "POSITION" && elems[0].format == DXGI_FORMAT_R32G32B32_FLOAT &&
+                          elems[0].aligned_byte_offset == 0 && elems[0].input_slot == 0,
+                      "slot 57 pipeline blob element 0 is POSITION R32G32B32_FLOAT @0");
+                check(elems[1].semantic_name == "COLOR" && elems[1].format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                          elems[1].aligned_byte_offset == 12 && elems[1].input_slot == 0,
+                      "slot 57 pipeline blob element 1 is COLOR R8G8B8A8_UNORM @12");
+                check(elems[2].semantic_name == "TEXCOORD" && elems[2].format == DXGI_FORMAT_R32G32_FLOAT &&
+                          elems[2].aligned_byte_offset == 16 && elems[2].input_slot == 0,
+                      "slot 57 pipeline blob element 2 is TEXCOORD R32G32_FLOAT @16");
+            }
+            VirtualFree(pages, 0, MEM_RELEASE);
+        }
+
+        // Slot 57 null-argument checks on the device proxy.
+        void** vtable = *reinterpret_cast<void***>(device.Get());
+        using Slot57Fn = HRESULT(WINAPI*)(void*, const void*, const IID*, void**);
+        const IID iid_pso = __uuidof(ID3D12PipelineState);
+        void* pso_out = reinterpret_cast<void*>(0x1111);
+        hr = reinterpret_cast<Slot57Fn>(vtable[57])(device.Get(), nullptr, &iid_pso, &pso_out);
+        check(FAILED(hr) && pso_out == nullptr, "slot 57 nulls its output for a null description");
+
+        // Synthetic test for ShaderLibrary loading `fspx_gfx/index.json` alongside `fspx/index.json` and `bvh/index.json`
+        // while keeping `fspx_size()`, `fspx_gfx_size()`, and `bvh_size()` independent.
+        wchar_t temp_root[MAX_PATH]{};
+        if (GetTempPathW(MAX_PATH, temp_root)) {
+            const std::filesystem::path tmp_dir =
+                std::filesystem::path(temp_root) / ("leonida_fspx_gfx_test_" + std::to_string(GetCurrentProcessId()));
+            std::error_code ec;
+            std::filesystem::create_directories(tmp_dir / "fspx", ec);
+            std::filesystem::create_directories(tmp_dir / "fspx_gfx", ec);
+            std::filesystem::create_directories(tmp_dir / "bvh", ec);
+            {
+                std::ofstream(tmp_dir / "index.json") << "{\n}\n";
+                std::ofstream(tmp_dir / "fspx" / "index.json")
+                    << "{\n"
+                    << "  \"libcs_00001\": {\n"
+                    << "    \"stage\": \"cs\",\n"
+                    << "    \"fspx_code_sha256\": \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
+                    << "  }\n"
+                    << "}\n";
+                std::ofstream(tmp_dir / "fspx_gfx" / "index.json")
+                    << "{\n"
+                    << "  \"9e5ffd2c6c521c037cf57582a23f8ff7ba494a71ca63bb899357caee8baab850\": {\n"
+                    << "    \"stage\": \"ps\",\n"
+                    << "    \"spv\": \"9e5ffd2c6c521c03_libps_00842.spv\",\n"
+                    << "    \"fspx_code_sha256\": \"9e5ffd2c6c521c037cf57582a23f8ff7ba494a71ca63bb899357caee8baab850\"\n"
+                    << "  },\n"
+                    << "  \"160fbe4368fb1a6349a2683bf72817f183d780c42a35cf25c86560917228061a\": {\n"
+                    << "    \"stage\": \"vs\",\n"
+                    << "    \"spv\": \"160fbe4368fb1a63_libvs_00843.spv\",\n"
+                    << "    \"fspx_code_sha256\": \"160fbe4368fb1a6349a2683bf72817f183d780c42a35cf25c86560917228061a\"\n"
+                    << "  }\n"
+                    << "}\n";
+                std::ofstream(tmp_dir / "bvh" / "index.json")
+                    << "{\n"
+                    << "  \"bvh_00001\": {\n"
+                    << "    \"stage\": \"cs\",\n"
+                    << "    \"fspx_code_sha256\": \"2222222222222222222222222222222222222222222222222222222222222222\"\n"
+                    << "  }\n"
+                    << "}\n";
+            }
+            leonida::ShaderLibrary lib;
+            std::string err;
+            const bool loaded = lib.load(tmp_dir, &err);
+            check(loaded, "ShaderLibrary::load loads index.json + fspx + fspx_gfx + bvh");
+            check(lib.fspx_size() == 1, "ShaderLibrary::fspx_size() counts only fspx/ entries");
+            check(lib.fspx_gfx_size() == 2, "ShaderLibrary::fspx_gfx_size() counts only fspx_gfx/ entries");
+            check(lib.bvh_size() == 1, "ShaderLibrary::bvh_size() counts only bvh/ entries");
+            const auto* ps_entry =
+                lib.find_fspx_by_code("9e5ffd2c6c521c037cf57582a23f8ff7ba494a71ca63bb899357caee8baab850");
+            const auto* vs_entry =
+                lib.find_fspx_by_code("160fbe4368fb1a6349a2683bf72817f183d780c42a35cf25c86560917228061a");
+            check(ps_entry && ps_entry->stage == "ps" && ps_entry->spv_file == "9e5ffd2c6c521c03_libps_00842.spv",
+                  "fspx_gfx PS entry preserves stage and custom spv filename");
+            check(vs_entry && vs_entry->stage == "vs" && vs_entry->spv_file == "160fbe4368fb1a63_libvs_00843.spv",
+                  "fspx_gfx VS entry preserves stage and custom spv filename");
+            std::filesystem::remove_all(tmp_dir, ec);
+        }
+    }
+
     if (real) real->AddRef();
     // Drop every device child before the proxy so the PC device is not released first.
     root_signature.Reset();

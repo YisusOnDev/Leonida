@@ -840,8 +840,9 @@ struct DeviceState {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
             else {
                 const auto path = dir.u8string();
-                std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
-                             shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
+                std::fprintf(stderr, "[rt] d3d12: %zu translated shaders (%zu fspx, %zu fspx_gfx, %zu bvh) from %s\n",
+                             shader_library.size(), shader_library.fspx_size(), shader_library.fspx_gfx_size(),
+                             shader_library.bvh_size(), reinterpret_cast<const char*>(path.c_str()));
             }
         }
         return shader_library.loaded() ? &shader_library : nullptr;
@@ -3424,21 +3425,38 @@ public:
                                                 desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
-            stage.fssm = leonida::fssm_program(
-                {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
-            if (stage.fssm.empty()) {
-                log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
-                return E_INVALIDARG;
-            }
-            const std::string hash = leonida::sha256_hex(stage.fssm);
-            // Containers with the same program can differ in their input signature or bindings: a VS must have its
-            // inputs fed by this input layout (else the layout check below reports it).
+            const std::span<const std::uint8_t> raw_bytes{
+                static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength};
+            stage.fssm = leonida::fssm_program(raw_bytes);
             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
-            stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
-                return !vertex || layout_feeds(e, desc.InputLayout);
-            });
-            if (!stage.entry) {
-                std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+            if (!stage.fssm.empty()) {
+                const std::string hash = leonida::sha256_hex(stage.fssm);
+                // Containers with the same program can differ in their input signature or bindings: a VS must have its
+                // inputs fed by this input layout (else the layout check below reports it).
+                stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
+                    return !vertex || layout_feeds(e, desc.InputLayout);
+                });
+                if (!stage.entry) {
+                    std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                    return E_INVALIDARG;
+                }
+            } else if (leonida::fspx_bare_program(raw_bytes)) {
+                // Slot 57 (DeserializeGraphicsPipelineStateX): bare RDNA2 program indexed by fspx_code_sha256 in
+                // <shaders>/fspx_gfx/index.json.
+                const std::string hash = leonida::sha256_hex(raw_bytes);
+                stage.entry = pick_entry(library->fspx_candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
+                    return !vertex || layout_feeds(e, desc.InputLayout);
+                });
+                if (!stage.entry)
+                    stage.entry = pick_entry(library->fspx_candidates(stage.name, hash),
+                                             [](const leonida::ShaderEntry&) { return true; });
+                if (!stage.entry) {
+                    std::fprintf(stderr, "[rt] d3d12: no translated %s for FSPX code sha256 %s (%zu B)\n",
+                                 stage.name, hash.c_str(), raw_bytes.size());
+                    return E_INVALIDARG;
+                }
+            } else {
+                log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
