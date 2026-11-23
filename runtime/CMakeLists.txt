@@ -1901,15 +1901,6 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_queue_handover COMMAND d3d12_queue_handover_test)
     set_tests_properties(d3d12_queue_handover PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 400
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
-    # A default-heap buffer released under a GPU-gated read keeps its arena range until the read is done, and a full
-    # arena waits for such ranges instead of failing (docs/d3d12_vulkan.md section 4.4, D3D-475).
-    add_executable(d3d12_arena_retire_test test/d3d12_arena_retire_test.cpp)
-    target_link_libraries(d3d12_arena_retire_test PRIVATE gta6rt_d3d12_com)
-    target_compile_definitions(d3d12_arena_retire_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(d3d12_arena_retire_test PRIVATE /W4 /permissive- /utf-8)
-    add_test(NAME d3d12_arena_retire COMMAND d3d12_arena_retire_test)
-    set_tests_properties(d3d12_arena_retire PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
-                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     # The same on a caller-owned device: two VkQueues handed to the layer (the D3D12 queues share them), and one
     # (every D3D12 queue shares it, where a Wait ahead of its Signal would never progress on the GPU).
     add_test(NAME d3d12_queue_handover_two_queues COMMAND d3d12_queue_handover_test --two-queues)

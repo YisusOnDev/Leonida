@@ -825,8 +825,6 @@ struct DeviceState {
         VkDeviceSize in_use = 0, peak_in_use = 0, peak_end = 0;
         VkDeviceSize use_in_use[4] = {}, use_peak[4] = {};
         std::uint64_t allocations = 0, failures = 0;
-        // Bytes of released buffers that wait for the submissions made before their release (arena_retire).
-        VkDeviceSize retiring = 0;
     } arena;
 
     std::uint32_t sparse_buffer_memory_types = 0;
@@ -857,27 +855,9 @@ struct DeviceState {
 
     // A zero-size range is refused: it would share its offset with the next range, and its release would collide
     // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
-    // A released buffer's range comes back only once the GPU is done with it (arena_retire); out of room while some
-    // are on their way, this takes back what is done, then waits for the device to finish and tries once more.
     bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
         if (!bytes || bytes > arena.size) return false;
-        for (int pass = 0;; ++pass) {
-            {
-                std::lock_guard lock(arena.mutex);
-                if (arena_take_locked(bytes, alignment, out, use)) return true;
-                if (pass == 2 || !arena.retiring || !context) {
-                    ++arena.failures;
-                    if (arena.log)
-                        std::fprintf(stderr, "[rt] d3d12: arena %s: no room for 0x%llx bytes\n", kArenaUseNames[use],
-                                     (unsigned long long)bytes);
-                    return false;
-                }
-            }
-            context->reclaim_retired(pass == 1);
-        }
-    }
-
-    bool arena_take_locked(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
+        std::lock_guard lock(arena.mutex);
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
             const VkDeviceSize start = (it->first + alignment - 1) / alignment * alignment;
             const VkDeviceSize end = it->first + it->second;
@@ -898,6 +878,10 @@ struct DeviceState {
                              (unsigned long long)start, (unsigned long long)bytes);
             return true;
         }
+        ++arena.failures;
+        if (arena.log)
+            std::fprintf(stderr, "[rt] d3d12: arena %s: no room for 0x%llx bytes\n", kArenaUseNames[use],
+                         (unsigned long long)bytes);
         return false;
     }
 
@@ -926,10 +910,6 @@ struct DeviceState {
     void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         if (!bytes) return;
         std::lock_guard lock(arena.mutex);
-        arena_release_locked(offset, bytes, use);
-    }
-
-    void arena_release_locked(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         arena.in_use -= bytes;
         arena.use_in_use[use] -= bytes;
         auto it = arena.free.emplace(offset, bytes).first;
@@ -943,27 +923,6 @@ struct DeviceState {
                 arena.free.erase(it);
             }
         }
-    }
-
-    // A default-heap buffer is destroyed: work submitted before may still read or write its range, and the next
-    // buffer placed there is zero-filled through the host mapping at once. So the range goes back through the
-    // device's deletion queue (VulkanContext::defer_destroy, D3D-475) with the buffer's other objects, once every
-    // submission made before has completed. Offset and size fit the item's 64 bits: the arena is below 4 GiB.
-    void arena_retire(VkDeviceSize offset, VkDeviceSize bytes) {
-        if (!bytes) return;
-        {
-            std::lock_guard lock(arena.mutex);
-            arena.retiring += bytes;
-        }
-        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::arena_range, (offset << 32) | bytes);
-    }
-
-    // The deletion queue's DeferredDeletionQueue::ArenaReleaseFn: `user` is the DeviceState.
-    static void arena_retired(void* user, std::uint64_t offset, std::uint64_t bytes) {
-        auto& device = *static_cast<DeviceState*>(user);
-        std::lock_guard lock(device.arena.mutex);
-        device.arena.retiring -= bytes;
-        device.arena_release_locked(offset, bytes, arena_buffer);
     }
 
     // The translator's output, loaded on first use.
@@ -1999,7 +1958,7 @@ public:
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
-        if (in_arena_) device_.arena_retire(arena_offset_, desc_.Width);  // back once the GPU is done with it
+        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_ && !sparse_image_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
@@ -5738,7 +5697,6 @@ public:
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
-        state_.context->set_arena_release(&DeviceState::arena_retired, &state_);
         return true;
     }
 
@@ -5750,7 +5708,6 @@ public:
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_bindless_release(nullptr, nullptr);
-            state_.context->set_arena_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
         state_.staging_queue.reset();  // it uses the context
