@@ -339,11 +339,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/dstorage.cpp
     shims/file_system.cpp
     shims/registry.cpp
+    shims/xmem.cpp
   )
   target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(dstorage_test PRIVATE /OPT:NOREF)
+  target_link_libraries(dstorage_test PRIVATE psapi)  # xmem.cpp: the physical pages a request can name
 
   # LEONIDA_WINDOW_MONITOR / LEONIDA_WINDOW_NO_ACTIVATE: the title's CreateWindowEx/ShowWindow imports through the
   # registry. Creates and destroys a few windows on this desktop; none is activated.

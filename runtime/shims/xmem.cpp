@@ -19,6 +19,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +41,7 @@
 #include "xmem.h"
 #include "kernel_write_hook.h"
 #include "write_watch.h"
+#include "xmem_pages.h"
 
 namespace {
 
@@ -1074,6 +1076,50 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
     return true;
 }
 
+}
+
+// xmem_pages.h. The backings are collected under the lock and written outside it, through each section's own
+// whole-section view (Section::scratch): the shared_ptr keeps a section alive if the title frees the page meanwhile, and
+// that view is the same memory as every window the page is mapped into, so a mapped page shows the bytes at once. The
+// sections are committed page by page (commit_mapped_page), so each run is committed before it is written. Pages that
+// follow one another in one section (what a single XMemAllocatePhysicalPages call returns) are one run.
+bool rt::xmem::write_physical_pages(const uint64_t* page_array, size_t offset, const void* source, size_t size) {
+    if (size == 0) return true;
+    if (!page_array || !source || offset >= kPhysicalPageSize) return false;
+    if (size > (std::numeric_limits<size_t>::max)() - offset - (kPhysicalPageSize - 1)) return false;
+    const size_t count = (offset + size + kPhysicalPageSize - 1) / kPhysicalPageSize;
+
+    std::vector<PhysicalPage> pages;
+    pages.reserve(count);
+    {
+        const std::lock_guard lock(g_phys_mutex);
+        for (size_t i = 0; i < count; ++i) {
+            const auto it = g_pages.find(page_array[i]);
+            if (it == g_pages.end() || !it->second.section->scratch) return false;
+            pages.push_back(it->second);
+        }
+    }
+
+    const auto* from = static_cast<const uint8_t*>(source);
+    size_t first = 0;
+    size_t in_page = offset;  // where the data starts in pages[first]
+    while (size != 0) {
+        size_t last = first + 1;
+        while (last < count && pages[last].section == pages[first].section &&
+               pages[last].offset == pages[last - 1].offset + kPhysicalPageSize) {
+            ++last;
+        }
+        const size_t run_bytes = (last - first) * kPhysicalPageSize;
+        const size_t chunk = (std::min)(size, run_bytes - in_page);
+        auto* const backing = static_cast<uint8_t*>(pages[first].section->scratch) + pages[first].offset;
+        if (!VirtualAlloc(backing, in_page + chunk, MEM_COMMIT, PAGE_READWRITE)) return false;
+        std::memcpy(backing + in_page, from, chunk);
+        from += chunk;
+        size -= chunk;
+        first = last;
+        in_page = 0;
+    }
+    return true;
 }
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
