@@ -999,7 +999,9 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 6, "every event names its caller");
+    check(count("\"kind\":\"xmem_virtual_alloc\"") == 1 && count("\"type\":\"0x3000\",\"attributes\":\"0x183\"") == 1,
+          "the XMemVirtualAlloc call is traced with its request and result");
+    check(count("\"caller\":\"") == 7, "every event names its caller");
     DeleteFileW(path.c_str());
 }
 
