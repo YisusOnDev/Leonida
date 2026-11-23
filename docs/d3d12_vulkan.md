@@ -787,8 +787,13 @@ The compute path, end to end:
   that set they are refused with a log.
 - **Command list**: `Set{Compute,Graphics}RootSignature` (a different signature clears the arguments, as D3D12
   leaves them undefined; setting the bound one again keeps them, as D3D12 does), `SetPipelineState`, the 32-bit
-  constant, root view and descriptor-table setters, `SetDescriptorHeaps` and `ClearState`. A wrong parameter type
-  or out-of-range constants makes `Close` return `E_INVALIDARG`.
+  constant, root view and descriptor-table setters, `SetDescriptorHeaps` and `ClearState`. A wrong parameter type,
+  out-of-range constants, or an invalid `SetDescriptorHeaps` call makes `Close` return `E_INVALIDARG`.
+  - `SetDescriptorHeaps` tracks the currently bound shader-visible `CBV_SRV_UAV` and `SAMPLER` heaps and their
+    arena GPU base VAs, holds references to them until `Reset` or list destruction, unbinds omitted types (clearing
+    both on `ClearState` and `Reset`), refuses `COPY` lists, > 2 heaps, null arrays/elements, non-shader-visible or
+    `RTV`/`DSV`/duplicate-type/foreign-device heaps, and enforces bundle matching against the parent list (`parent`'s
+    currently bound heap for each non-null heap the bundle specifies, `d3d12_set_descriptor_heaps`).
   - The list holds a reference to every root signature and pipeline state it is given, until `Reset` or its own
     release. D3D12 lets an application release them right after setting them, so the root layout the setters read
     and the pipeline `ExecuteCommandLists` looks up must outlive that. Keeping them alive while the GPU runs the
@@ -1572,7 +1577,10 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    graphics stages (question 3 in the table below) is what would confirm it. Which SGPR holds which heap varies
    with the stage and the root signature, so placing the bases belongs to the root-signature mapping, not to a new
    translator input. No stride is read at run time: static offsets of T# loads are multiples of 32 and of S# loads
-   multiples of 16, so the stride is compiled into the code.
+   multiples of 16, so the stride is compiled into the code. In the runtime shim, `CreateRootSignature` records the
+   `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and `SAMPLER_HEAP_DIRECTLY_INDEXED` root-signature flags and `SetDescriptorHeaps`
+   tracks the bound shader-visible heap GPU bases (`d3d12_set_descriptor_heaps`), while placing those bases into
+   per-stage user SGPRs remains open on question 3.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
@@ -4034,6 +4042,15 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     `XBCH` record, which decompresses to `FSSM`; 51 of the 52 programs translate and pass `spirv-val` today
     ([embedded_shaders.md](embedded_shaders.md)). Translating that record is the path that avoids a DXIL lowering
     front end (section 7.2, M6); the bitcode is a second representation.
+- **On the Vulkan device (D3D-557).** With `LEONIDA_BVH_DEVICE=vulkan` the constructor runs on the Vulkan-backed
+  device, where slot 62 needs the translated module of each container's `FSSM` program. `make_game.py` translates
+  the DLL's programs into `<shaders>/bvh/` and the shader library reads that index
+  ([embedded_shaders.md](embedded_shaders.md) section 7). Measured on 1.0.2.1: before that step creation #1 failed
+  (`E_FAIL` with no library, `E_INVALIDARG` with the game's corpus loaded). With it, on an RTX 3070 (NVIDIA 610.74)
+  and on a Ryzen 7 9700X's integrated Radeon (AMD 32.0.21042.62), both with the `--wave64-emulate` translation, 49 of
+  the first 50 creations return `S_OK` and the constructor throws `E_INVALIDARG` at #50, `Box16Rehydration`, the one
+  program the translator has no rule for yet (#1864). With that rule applied locally all 53 are created and the
+  constructor and destructor return. Nothing has been dispatched.
 
 ### A.3 `amd_fidelityfx_upscaler_xbox.dll`
 
