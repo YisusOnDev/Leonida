@@ -625,7 +625,7 @@ Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DW
     bool replaces_package_file = false;
     std::vector<std::wstring> parts;
     if (disposition != OPEN_EXISTING && disposition != TRUNCATE_EXISTING &&
-        parse_console(path, parts) == Parsed::Console) {
+        parse_console(path, parts) == Parsed::Console && !parts.empty()) {  // the root is write_target's to refuse
         const View v = view(roots(), parts);
         if (v.in_package && !v.in_overlay) {
             if (v.kind == Kind::Directory) {
@@ -1645,9 +1645,16 @@ struct OpenIntent {
     DWORD disposition = 0;
 };
 
+// Not a function-local static: those take a guard through the TLS slot, which on a title thread is the exe's.
+std::atomic<HMODULE> g_ucrtbase{nullptr};
+
 template <typename Fn>
 Fn ucrt(const char* name) {
-    static const HMODULE module = ::LoadLibraryW(L"ucrtbase.dll");
+    HMODULE module = g_ucrtbase.load(std::memory_order_acquire);
+    if (!module) {
+        module = ::LoadLibraryW(L"ucrtbase.dll");
+        g_ucrtbase.store(module, std::memory_order_release);
+    }
     return reinterpret_cast<Fn>(::GetProcAddress(module, name));
 }
 

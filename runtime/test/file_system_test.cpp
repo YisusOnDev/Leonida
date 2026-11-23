@@ -1725,6 +1725,7 @@ void run_checks(const std::filesystem::path& root) {
         check(crt_stat64(host_b.c_str(), &st) == 0 && st.st_size == 1 && crt_remove(host_b.c_str()) == 0 &&
                   !std::filesystem::exists(host_dir / "b.txt"),
               "host paths go to the CRT unchanged");
+    }
 
     // A caller that makes its path absolute before opening it (Rust's std::fs, std::filesystem::absolute) goes through
     // GetFullPathName. The host reads "GAME:\x" as a relative name and answers "<current folder>\GAME:\x", so the
@@ -1826,10 +1827,6 @@ void run_checks(const std::filesystem::path& root) {
               "GetFullPathNameA refuses it too");
         }
     }
-
-    std::filesystem::remove_all(root);
-    std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
-    return g_failures == 0 ? 0 : 1;
 
     // Disk-space and drive-type queries for GAME:, G:, and T: match host semantics without creating folders.
     {
@@ -1996,6 +1993,7 @@ void run_checks(const std::filesystem::path& root) {
             check(drive_w(L"T:\\") == DRIVE_NO_ROOT_DIR, "T:\\ with empty overlay reports DRIVE_NO_ROOT_DIR");
             rt::fs::configure(package, overlay);
         }
+    }
 
     // FILE_FLAG_DELETE_ON_CLOSE deletes the file even when the open asks for read access only: the host adds DELETE to
     // such an open. On a package file it is a delete like DeleteFile's, so the package keeps the file.
@@ -2152,6 +2150,7 @@ void run_checks(const std::filesystem::path& root) {
                   !std::filesystem::exists(overlay / "data" / "once5.txt") &&
                   read_path(package / "data" / "once5.txt") == "package",
               "and after the close the name is gone again, with the package file untouched");
+    }
 
     // A host path inside --game-dir names a package file too (a title can build one from GetModuleFileName). It reads
     // the title's view and writes to the overlay, so the package is never written whichever spelling reaches it.
