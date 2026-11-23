@@ -933,6 +933,13 @@ int main() {
 
     check(get<DeviceTypeFn>("XSystemGetDeviceType")() == 7, "XSystemGetDeviceType reports XboxScarlettAnaconda (7)");
 
+    using MemoryUsageFn = uint64_t(__stdcall*)();
+    const auto usage = get<MemoryUsageFn>("XSystemGetAppMemoryUsage")();
+    const auto limit = get<MemoryUsageFn>("XSystemGetAppMemoryUsageLimit")();
+    std::printf("App memory usage: %llu bytes; limit: %llu bytes\n",
+                static_cast<unsigned long long>(usage), static_cast<unsigned long long>(limit));
+    check(usage > 0 && usage <= limit, "XSystemGetAppMemoryUsage is positive and within its limit");
+
     auto console_id = get<ConsoleIdFn>("XSystemGetConsoleId");
     char id[64] = {};
     size_t used = 0;

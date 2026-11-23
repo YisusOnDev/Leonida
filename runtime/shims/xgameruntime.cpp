@@ -12,6 +12,7 @@
 // QueryApiImpl, as libHttpClient.GDK.dll's do, so "xgameruntime.dll" below is the only module name needed. The name
 // occurs in the image as a UTF-16 string, which would be a run-time load.
 #include <windows.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -713,7 +714,8 @@ uint64_t __stdcall XSystemGetAppMemoryUsageLimit() {
 
 // uint64_t XSystemGetAppMemoryUsage()
 uint64_t __stdcall XSystemGetAppMemoryUsage() {
-    return 0;
+    PROCESS_MEMORY_COUNTERS pmc{};
+    return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) ? pmc.WorkingSetSize : 0;
 }
 
 // ---- XSystemImpl (asked for as IXSystemImpl5), offline ----

@@ -350,7 +350,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(xgameruntime_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xgameruntime_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xgameruntime_test PRIVATE /OPT:NOREF)
-  target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue)
+  target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue psapi)
 
   # XUserImpl (offline local user) through QueryApiImpl, slot by slot as xgameruntime.lib's thunks call it.
   add_executable(xgameruntime_user_test
