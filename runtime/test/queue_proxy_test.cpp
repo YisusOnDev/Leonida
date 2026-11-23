@@ -412,7 +412,7 @@ int check_slots(const Backend& b) {
 
         // The refused tail: every slot from the end of the public chain to the end of the table, but fence slot 12.
         for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
-            if (slot == 23 || slot == 30) continue;
+            if (slot == 23 || slot == 30 || xs::queue_slot_overridden(slot)) continue;  // 35: ExecuteCommandListsX
             before = qhits(slot);
             EXPECT(as_hr(call_slot(queue.p, slot)) == S_OK);
             EXPECT(qhits(slot) == before + 1 && xs::queue_slot_first_call_seen(slot));

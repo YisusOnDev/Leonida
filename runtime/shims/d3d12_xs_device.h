@@ -216,6 +216,9 @@ ID3D12Fence* fence_proxy_real_fence(const void* fence);
 unsigned queue_proxy_slot_count(const void* queue);
 unsigned fence_proxy_slot_count(const void* fence);
 unsigned queue_proxy_table_size();
+// True for a queue slot past the public chain that the proxy models instead of answering console-only S_OK: 35,
+// the console ExecuteCommandLists variant, which forwards to PC slot 10 with the list proxies unwrapped.
+bool queue_slot_overridden(unsigned slot);
 unsigned fence_proxy_table_size();
 // Live references on a queue, fence or allocator proxy (0 for anything else). Test helper.
 unsigned long command_object_proxy_ref_count(const void* object);

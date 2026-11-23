@@ -842,7 +842,11 @@ static_assert(kQueueSlots * sizeof(void*) <= 4096 && kFenceSlots * sizeof(void*)
                   kAllocatorSlots * sizeof(void*) <= 4096,
               "a table must fit in the first page of its reservation");
 
+constexpr unsigned kQueueExecuteCommandLists = 10;   // (UINT, ID3D12CommandList* const*)
 constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
+constexpr unsigned kQueueExecuteCommandListsX = 35;  // console ExecuteCommandLists(count, lists) variant (#7286)
+static_assert(kQueueExecuteCommandLists < kQueuePublicSlots && kQueueExecuteCommandListsX < kQueueSlots,
+              "queue execution slots must stay within their respective tables");
 constexpr unsigned kFenceSignal = 10;                    // ID3D12Fence::Signal(UINT64), from the CPU
 constexpr unsigned kFenceCompletedValueSlot = 12;        // one past ID3D12Fence1: the completed value's address
 static_assert(kFenceCompletedValueSlot >= kFence1PublicSlots && kFenceCompletedValueSlot < kFenceSlots,
@@ -901,6 +905,7 @@ const char* child_public_name(unsigned slot) {
     if (slot < 8) return object[slot];
     if constexpr (K == ChildKind::queue) {
         if (slot < kQueuePublicSlots) return queue[slot - 8];
+        if (slot == kQueueExecuteCommandListsX) return "ExecuteCommandListsX";
     } else if constexpr (K == ChildKind::fence) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
     } else {
@@ -1363,6 +1368,21 @@ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::ui
 
 #endif
 
+// Queue slot 35, the console ExecuteCommandLists(count, lists) variant (#7286), forwards to PC slot 10. The title's
+// array holds command-list proxies, so the real queue gets an UnwrappedArray copy with the real lists, as slot 10
+// does (#8851 decided: slot 35 goes through the same unwrap step). The count is a UINT: the upper half of the word
+// is not the title's and is dropped.
+std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
+    const auto count = static_cast<std::uint64_t>(static_cast<UINT>(count_word));
+    UnwrappedArray unwrapped;
+    if (!unwrapped.fill(lists_word, count)) return hr_to_u64(E_OUTOFMEMORY);
+    if (unwrapped.data()) lists_word = unwrapped.data();
+    using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, ID3D12CommandList* const*);
+    reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
+        self->real, count, reinterpret_cast<ID3D12CommandList* const*>(lists_word));
+    return 0;
+}
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1385,6 +1405,11 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         note_child_slot<K>(Slot);
         d3d12_trace::record(child_trace_name<K>(Slot));
         return fence_completed_value_address(self, a1, a2, a3);
+    } else if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
+        // Before the console-only fallback below, which would otherwise answer it S_OK and drop the work.
+        note_child_slot<K>(Slot);
+        d3d12_trace::record(child_trace_name<K>(Slot));
+        return queue_execute_command_lists(self, a1, a2);
     } else {
         note_child_slot<K>(Slot);
         if constexpr (K == ChildKind::queue) {
@@ -3829,6 +3854,7 @@ unsigned fence_proxy_slot_count(const void* fence) {
 }
 
 unsigned queue_proxy_table_size() { return kQueueSlots; }
+bool queue_slot_overridden(unsigned slot) { return slot == kQueueExecuteCommandListsX; }
 unsigned fence_proxy_table_size() { return kFenceSlots; }
 unsigned allocator_proxy_table_size() { return kAllocatorSlots; }
 unsigned allocator_proxy_slot_count(const void* allocator) {

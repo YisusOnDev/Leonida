@@ -371,6 +371,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             default: break;
         }
     }
+    if (m->kind == Kind::queue && slot == 10) copy_array(m, 10, a2, a1);  // ExecuteCommandLists(count, lists)
     if (m->kind == Kind::queue && slot == 16 && a1) {
         // GetTimestampFrequency writes a fixed value — unless a1 is a mock object, which on this slot is a
         // newer-layout Signal's fence, not an out pointer.
@@ -2151,8 +2152,10 @@ int check_tail(bool want_guarded) {
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
     // Console-only queue methods (the tail past the PC chain, SignalX, PresentX) report S_OK instead of
     // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+        if (xs::queue_slot_overridden(slot)) continue;  // 35: ExecuteCommandListsX (check_queue_slot35)
         EXPECT(hr_of(raw(queue, slot)) == S_OK && queue_mock->calls[slot] == 0);
+    }
     EXPECT(raw(fence, 12) != 0);  // the completed value's address (check_fence_completed_value)
     for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
@@ -2362,6 +2365,54 @@ int check_committed_resource_leases() {
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: committed resources lease their slot-25 size through the title's XMem hooks until destroyed\n",
                 g_label);
+    return 0;
+}
+
+// Queue slot 35 (ExecuteCommandListsX, #7286) reaches PC slot 10 with the list proxies replaced by the real lists,
+// as slot 10 does (#8851), instead of the console-only S_OK; the count word's upper half is dropped.
+int check_queue_slot35() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device != nullptr);
+    void* queue = make_queue(device);
+    EXPECT(queue != nullptr);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    const IID iid_alloc = __uuidof(ID3D12CommandAllocator);
+    const IID iid_gcl = __uuidof(ID3D12GraphicsCommandList);
+    void* allocator = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&iid_alloc), word(&allocator)))));
+    void* lists[2] = {};
+    for (void*& list : lists) {
+        EXPECT(SUCCEEDED(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0,
+                                   word(&iid_gcl), word(&list)))));
+        EXPECT(list != nullptr && xs::is_list_proxy(list));
+    }
+    xs::reset_device_proxy_stats();
+    EXPECT(xs::queue_slot_overridden(35) && !xs::queue_slot_overridden(10) && !xs::queue_slot_overridden(34));
+
+    void* const title_array[2] = {lists[0], lists[1]};
+    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 2ull, word(lists)) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 1 && xs::queue_slot_first_call_seen(35) && xs::queue_slot_hits(10) == 0);
+    EXPECT(queue_mock->calls[35] == 0 && queue_mock->calls[10] == 1 && queue_mock->args[10][0] == 2);
+    EXPECT(queue_mock->array[10][0] == word(xs::list_proxy_real_list(lists[0])) &&
+           queue_mock->array[10][1] == word(xs::list_proxy_real_list(lists[1])));
+    EXPECT(queue_mock->args[10][1] != word(lists));                          // a copy, not the title's array
+    EXPECT(lists[0] == title_array[0] && lists[1] == title_array[1]);        // which stays untouched
+
+    // Slot 10 unwraps the same way.
+    queue_mock->array[10][0] = queue_mock->array[10][1] = 0;
+    EXPECT(raw(queue, 10, 2, word(lists)) == 0 && queue_mock->calls[10] == 2);
+    EXPECT(queue_mock->array[10][0] == word(xs::list_proxy_real_list(lists[0])) &&
+           queue_mock->array[10][1] == word(xs::list_proxy_real_list(lists[1])));
+
+    // An empty submission passes through.
+    EXPECT(raw(queue, 35, 0, 0) == 0 && queue_mock->calls[10] == 3 && queue_mock->args[10][0] == 0 &&
+           queue_mock->args[10][1] == 0);
+
+    EXPECT(release(lists[0]) == 0 && release(lists[1]) == 0 && release(allocator) == 0);
+    EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
+    std::printf("%s: queue slot 35 hands PC slot 10 the real lists behind the list proxies
+", g_label);
     return 0;
 }
 
@@ -2778,7 +2829,7 @@ int main(int argc, char** argv) {
         check_descriptor_heap_hooks() || check_slot70() || check_slot70_raw_buffer() ||
         check_committed_resource3_x() || check_render_target_sizes() || check_allocation_descriptions_cleaned() ||
         check_committed_resource_leases() || check_slot74() || check_fence_completed_value() ||
-        check_list_cpu_handles())
+        check_list_cpu_handles() || check_queue_slot35())
         return 1;
     if (check_placed_resource_x()) return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
