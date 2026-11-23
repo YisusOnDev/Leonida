@@ -167,6 +167,28 @@ public:
         return true;
     }
 
+    // A title that gives a descriptor heap its own backing memory (__XMemAllocationHooks__) writes descriptors there
+    // itself, while shaders read the layer's heap. The layer that keeps that mapping registers a source: before a
+    // bound table is scanned, it copies the slots the title wrote in its own memory over the layer's copy
+    // ([real, real + bytes) is the layer heap's CPU memory). Returns how many slots it copied.
+    using DescriptorSource = std::uint64_t (*)(void* context, std::uint8_t* real, std::size_t bytes);
+    void set_descriptor_source(void* context, DescriptorSource source) {
+        std::lock_guard lock(hook_mutex_);
+        source_context_ = context;
+        source_ = source;
+    }
+    void pull_descriptors(std::uint8_t* real, std::size_t bytes) {
+        DescriptorSource source;
+        void* context;
+        {
+            std::lock_guard lock(hook_mutex_);
+            source = source_;
+            context = source_context_;
+        }
+        if (source) pulled_.fetch_add(source(context, real, bytes), std::memory_order_relaxed);
+    }
+    std::uint64_t pulled() const { return pulled_.load(std::memory_order_relaxed); }
+
     // The first device to register keeps the hooks until it clears them.
     void set_hooks(void* context, Resolver resolver, TableScanner scanner) {
         std::lock_guard lock(hook_mutex_);
@@ -209,6 +231,9 @@ private:
     void* hook_context_ = nullptr;
     Resolver resolver_ = nullptr;
     TableScanner scanner_ = nullptr;
+    void* source_context_ = nullptr;
+    DescriptorSource source_ = nullptr;
+    std::atomic<std::uint64_t> pulled_{0};
     std::array<std::atomic<std::uint64_t>, kind_count> translated_{};
     std::array<std::atomic<std::uint64_t>, kind_count> untranslated_{};
     std::atomic<std::uint64_t> scans_{0}, scan_ns_{0}, scan_max_ns_{0};

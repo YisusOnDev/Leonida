@@ -1008,6 +1008,8 @@ struct DeviceState {
                                            kDescriptorSize);
         }
         auto& aliases = leonida::title_va_aliases();
+        // Slots the title wrote in its own backing of this heap, if it gave the heap one.
+        aliases.pull_descriptors(arena.mapped + table_va, std::size_t(end - table_va));
         for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize) {
             auto* w = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
             const std::uint32_t w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
