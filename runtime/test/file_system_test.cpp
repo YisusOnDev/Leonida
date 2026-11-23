@@ -2421,6 +2421,8 @@ void run_checks(const std::filesystem::path& root) {
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
         check(attributes_w(L"GAME:\\exists\\folder\\inside.txt") != INVALID_FILE_ATTRIBUTES,
               "the package folder's file is still visible");
+    }
+
     // The guest can reach a deeply nested file even when its executable and the configured roots are short.
     // Use the explicit Win32 namespace to set up the fixtures, independently of the shim under test.
     {
