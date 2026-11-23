@@ -999,6 +999,7 @@ struct Prepared {
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
     VkFormat clear_format = VK_FORMAT_UNDEFINED; // The clear view format (RTV or reinterpreted UAV), without changing the resource binding.
+    bool load_op_clear = false;       // unpredicated format-reinterpreted clear: use VK_ATTACHMENT_LOAD_OP_CLEAR
     std::vector<VkClearRect> rects;   // rectangle clears, clipped to the mip
     bool skip = false;                // every rectangle was empty
     ResourceBinding source;                   // copies: the source resource
@@ -2714,6 +2715,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                             VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
             } else if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
                        r != ReplayResult::success) return r;
+            p.load_op_clear = !predicated && p.clear_format != VK_FORMAT_UNDEFINED && p.clear_format != p.binding.format;
             if (!p.skip && p.rects.empty() && !vk.clear_color_image) return refuse("the device lacks vkCmdClearColorImage");
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
@@ -2785,6 +2787,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!uav_clear::decode(clear_format, p.element, p.clear_color))
                 return refuse("the element does not decode in the image's format");
             if (reinterpret) p.clear_format = view_format;
+            p.load_op_clear = !predicated && reinterpret;
             if (!uav->rects.empty() && !attachment)
                 return refuse("rectangles of a volume, or of a format that cannot be an attachment");
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
@@ -3661,11 +3664,30 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 rendering.layerCount = color_clear->target.layer_count;
                 rendering.colorAttachmentCount = 1;
                 rendering.pColorAttachments = &info;
-                vk.begin_rendering(command_buffer, &rendering);
-                VkClearAttachment attachment_clear{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
-                attachment_clear.clearValue.color = color;
-                vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
-                vk.end_rendering(command_buffer);
+                if (p.load_op_clear) {
+                    // Unpredicated format-reinterpreted clears use LOAD_OP_CLEAR per rect: AMDVLK ignores
+                    // VkImageView::format in vkCmdClearAttachments under dynamic rendering and converts
+                    // clearValue.color with VkImage::format instead. Predicated clears keep vkCmdClearAttachments
+                    // because VK_ATTACHMENT_LOAD_OP_CLEAR is not predicated by VK_EXT_conditional_rendering.
+                    info.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    info.clearValue.color = color;
+                    for (std::size_t r = 0; r < p.rects.size(); ++r) {
+                        if (r)
+                            detail::memory_barrier(vk, command_buffer, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                        rendering.renderArea = p.rects[r].rect;
+                        vk.begin_rendering(command_buffer, &rendering);
+                        vk.end_rendering(command_buffer);
+                    }
+                } else {
+                    vk.begin_rendering(command_buffer, &rendering);
+                    VkClearAttachment attachment_clear{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+                    attachment_clear.clearValue.color = color;
+                    vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
+                    vk.end_rendering(command_buffer);
+                }
             });
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             // With separate layouts only the cleared planes move; otherwise both do.
@@ -3750,11 +3772,28 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 rendering.layerCount = uav->view.layer_count;
                 rendering.colorAttachmentCount = 1;
                 rendering.pColorAttachments = &info;
-                vk.begin_rendering(command_buffer, &rendering);
-                VkClearAttachment attachment_clear{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
-                attachment_clear.clearValue.color = p.clear_color;
-                vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
-                vk.end_rendering(command_buffer);
+                if (p.load_op_clear) {
+                    // Same as ClearRenderTarget: LOAD_OP_CLEAR honors VkImageView::format across drivers
+                    // (including AMDVLK), while predicated clears keep vkCmdClearAttachments.
+                    info.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    info.clearValue.color = p.clear_color;
+                    for (std::size_t r = 0; r < p.rects.size(); ++r) {
+                        if (r)
+                            detail::memory_barrier(vk, command_buffer, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                        rendering.renderArea = p.rects[r].rect;
+                        vk.begin_rendering(command_buffer, &rendering);
+                        vk.end_rendering(command_buffer);
+                    }
+                } else {
+                    vk.begin_rendering(command_buffer, &rendering);
+                    VkClearAttachment attachment_clear{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+                    attachment_clear.clearValue.color = p.clear_color;
+                    vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
+                    vk.end_rendering(command_buffer);
+                }
             });
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {

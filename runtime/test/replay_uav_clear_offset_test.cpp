@@ -17,22 +17,24 @@ struct Write {
 };
 std::vector<Write> writes;
 
-unsigned image_clears = 0, attachment_clears = 0;
+unsigned image_clears = 0, attachment_clears = 0, load_op_clears = 0;
 VkFormat requested_view_format = VK_FORMAT_UNDEFINED;
 VkImageSubresourceRange requested_view_range{};
 VkClearColorValue captured_color{};
 VkClearRect captured_rect{};
 VkRect2D captured_render_area{};
 std::uint32_t captured_render_layers = 0;
+VkAttachmentLoadOp captured_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 
 void reset_texture_capture() {
-    image_clears = attachment_clears = 0;
+    image_clears = attachment_clears = load_op_clears = 0;
     requested_view_format = VK_FORMAT_UNDEFINED;
     requested_view_range = {};
     captured_color = {};
     captured_rect = {};
     captured_render_area = {};
     captured_render_layers = 0;
+    captured_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 }
 
 VKAPI_ATTR void VKAPI_CALL barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
@@ -55,6 +57,13 @@ VKAPI_ATTR void VKAPI_CALL clear_image(VkCommandBuffer, VkImage, VkImageLayout, 
 VKAPI_ATTR void VKAPI_CALL begin_rendering(VkCommandBuffer, const VkRenderingInfo* info) {
     captured_render_area = info->renderArea;
     captured_render_layers = info->layerCount;
+    if (info->colorAttachmentCount == 1 && info->pColorAttachments) {
+        captured_load_op = info->pColorAttachments[0].loadOp;
+        if (info->pColorAttachments[0].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            captured_color = info->pColorAttachments[0].clearValue.color;
+            ++load_op_clears;
+        }
+    }
 }
 VKAPI_ATTR void VKAPI_CALL end_rendering(VkCommandBuffer) {}
 VKAPI_ATTR void VKAPI_CALL clear_attachments(VkCommandBuffer, std::uint32_t count, const VkClearAttachment* values,
@@ -211,12 +220,13 @@ int main() {
     tex.color_attachment = true;
 
     const auto fbits = [](float f) { return std::bit_cast<std::uint32_t>(f); };
-    // R16G16_TYPELESS (SFLOAT) cleared as R16G16_UNORM Float(1.0, 1.0): uses R16G16_UNORM view and float32 {1, 1}.
+    // R16G16_TYPELESS (SFLOAT) cleared as R16G16_UNORM Float(1.0, 1.0): uses R16G16_UNORM view and LOAD_OP_CLEAR.
     expect(run_tex(tex, {2, false, VK_FORMAT_R16G16_UNORM, 0, 0, 0, 0, 1, 2}, true, {fbits(1.0f), fbits(1.0f), 0, 0}) ==
                ReplayResult::success,
            "R16G16_TYPELESS -> R16G16_UNORM whole-view clear replays");
-    expect(image_clears == 0 && attachment_clears == 1,
-           "R16G16_TYPELESS -> R16G16_UNORM uses attachment clear, not vkCmdClearColorImage");
+    expect(image_clears == 0 && attachment_clears == 0 && load_op_clears == 1 &&
+               captured_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR,
+           "R16G16_TYPELESS -> R16G16_UNORM uses LOAD_OP_CLEAR, not vkCmdClearColorImage or vkCmdClearAttachments");
     expect(requested_view_format == VK_FORMAT_R16G16_UNORM,
            "R16G16_TYPELESS -> R16G16_UNORM creates image view with view_format");
     expect(requested_view_range.baseMipLevel == 0 && requested_view_range.baseArrayLayer == 1 &&
@@ -224,9 +234,9 @@ int main() {
            "reinterpreted UAV clear preserves mip and layer range");
     expect(captured_color.float32[0] == 1.0f && captured_color.float32[1] == 1.0f,
            "R16G16_UNORM clear value is decoded in view_format (not half-float NaN)");
-    expect(captured_rect.rect.offset.x == 0 && captured_rect.rect.offset.y == 0 &&
-               captured_rect.rect.extent.width == 8 && captured_rect.rect.extent.height == 6 &&
-               captured_rect.layerCount == 2,
+    expect(captured_render_area.offset.x == 0 && captured_render_area.offset.y == 0 &&
+               captured_render_area.extent.width == 8 && captured_render_area.extent.height == 6 &&
+               captured_render_layers == 2,
            "reinterpreted whole-view clear covers full mip extent and layers");
 
     // R16G16_TYPELESS (SFLOAT) cleared as R16G16_UINT with half-float NaN bit patterns 0xffff and 0x7fff.
@@ -234,19 +244,57 @@ int main() {
     expect(run_tex(tex, {2, false, VK_FORMAT_R16G16_UINT, 0, 0, 0, 1, 0, 1}, false, {0xffff, 0x7fff, 0, 0},
                    std::span<const Rect>(&sub_rect, 1)) == ReplayResult::success,
            "R16G16_TYPELESS -> R16G16_UINT rect clear replays");
-    expect(image_clears == 0 && attachment_clears == 1 && requested_view_format == VK_FORMAT_R16G16_UINT,
-           "R16G16_UINT rect clear uses R16G16_UINT view");
+    expect(image_clears == 0 && attachment_clears == 0 && load_op_clears == 1 &&
+               captured_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR && requested_view_format == VK_FORMAT_R16G16_UINT,
+           "R16G16_UINT rect clear uses R16G16_UINT view with LOAD_OP_CLEAR");
     expect(captured_color.uint32[0] == 0xffff && captured_color.uint32[1] == 0x7fff,
            "R16G16_UINT clear passes exact uint32 values");
-    expect(captured_render_area.extent.width == 4 && captured_render_area.extent.height == 3 &&
-               captured_rect.rect.extent.width == 3 && captured_rect.rect.extent.height == 2,
-           "R16G16_UINT rect clear clips to mip 1 extent");
+    expect(captured_render_area.offset.x == 1 && captured_render_area.offset.y == 1 &&
+               captured_render_area.extent.width == 3 && captured_render_area.extent.height == 2,
+           "R16G16_UINT rect clear clips renderArea to mip 1 extent");
 
-    // Same-format whole-view unpredicated clear stays on vkCmdClearColorImage.
+    // Same-format whole-view unpredicated clear stays on vkCmdClearColorImage; same-format rect uses vkCmdClearAttachments.
     expect(run_tex(tex, {2, false, VK_FORMAT_R16G16_SFLOAT, 0, 0, 0, 0, 0, 1}, true, {fbits(0.5f), fbits(-2.0f), 0, 0}) ==
                ReplayResult::success,
            "same-format R16G16_SFLOAT whole-view clear replays");
-    expect(image_clears == 1 && attachment_clears == 0, "same-format whole-view clear uses vkCmdClearColorImage");
+    expect(image_clears == 1 && attachment_clears == 0 && load_op_clears == 0,
+           "same-format whole-view clear uses vkCmdClearColorImage");
+    expect(run_tex(tex, {2, false, VK_FORMAT_R16G16_SFLOAT, 0, 0, 0, 1, 0, 1}, true, {fbits(0.5f), fbits(-2.0f), 0, 0},
+                   std::span<const Rect>(&sub_rect, 1)) == ReplayResult::success,
+           "same-format R16G16_SFLOAT rect clear replays");
+    expect(image_clears == 0 && attachment_clears == 1 && load_op_clears == 0 &&
+               captured_load_op == VK_ATTACHMENT_LOAD_OP_LOAD,
+           "same-format rect clear keeps vkCmdClearAttachments");
+
+    // Predicated reinterpreted UAV clear must keep vkCmdClearAttachments (LOAD_OP_CLEAR is not predicated).
+    {
+        ReplayFunctions cond_vk = tex_vk;
+        cond_vk.begin_conditional_rendering = +[](VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {};
+        cond_vk.end_conditional_rendering = end_rendering;
+        cond_vk.prepare_predicate = [](VkBuffer source, VkDeviceSize offset, PredicateCapture& out) {
+            out = {source, offset, reinterpret_cast<VkBuffer>(std::uintptr_t{0x4000}), 0, VK_NULL_HANDLE};
+            return true;
+        };
+        cond_vk.capture_predicate = [](VkCommandBuffer, const PredicateCapture&) {};
+        ResourceBinding pred{};
+        pred.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{0x5000});
+        pred.size = 8;
+        reset_texture_capture();
+        CommandList list;
+        list.set_predication({3, 0, d3d12_predication::equal_zero});
+        list.clear_unordered_access({2, false, VK_FORMAT_R16G16_UNORM, 0, 0, 0, 0, 0, 1}, true,
+                                    {fbits(1.0f), fbits(1.0f), 0, 0});
+        list.close();
+        expect(replay(list, VK_NULL_HANDLE,
+                      [&](ResourceId id) -> const ResourceBinding* {
+                          return id == 2 ? &tex : id == 3 ? &pred : nullptr;
+                      },
+                      cond_vk) == ReplayResult::success,
+               "predicated reinterpreted UAV clear replays");
+        expect(image_clears == 0 && attachment_clears == 1 && load_op_clears == 0 &&
+                   captured_load_op == VK_ATTACHMENT_LOAD_OP_LOAD && requested_view_format == VK_FORMAT_R16G16_UNORM,
+               "predicated reinterpreted UAV clear keeps vkCmdClearAttachments");
+    }
 
     // R32_TYPELESS (SFLOAT) cleared as R32_UINT with sNaN bit pattern 0x7f800001.
     ResourceBinding r32 = tex;
@@ -254,9 +302,9 @@ int main() {
     expect(run_tex(r32, {2, false, VK_FORMAT_R32_UINT, 0, 0, 0, 0, 0, 1}, false, {0x7f800001u, 0, 0, 0}) ==
                ReplayResult::success,
            "R32_TYPELESS -> R32_UINT sNaN clear replays");
-    expect(image_clears == 0 && attachment_clears == 1 && requested_view_format == VK_FORMAT_R32_UINT &&
-               captured_color.uint32[0] == 0x7f800001u,
-           "R32_UINT clear uses R32_UINT attachment view with exact sNaN bits");
+    expect(image_clears == 0 && attachment_clears == 0 && load_op_clears == 1 &&
+               requested_view_format == VK_FORMAT_R32_UINT && captured_color.uint32[0] == 0x7f800001u,
+           "R32_UINT clear uses R32_UINT LOAD_OP_CLEAR with exact sNaN bits");
 
     // R8G8B8A8_TYPELESS (UNORM) cleared as R8G8B8A8_UINT and R8G8B8A8_SINT uses view_format directly.
     ResourceBinding rgba8 = tex;
@@ -264,10 +312,11 @@ int main() {
     expect(run_tex(rgba8, {2, false, VK_FORMAT_R8G8B8A8_UINT, 0, 0, 0, 0, 0, 1}, false, {0xff, 0x80, 0x7f, 1}) ==
                ReplayResult::success,
            "R8G8B8A8_TYPELESS -> R8G8B8A8_UINT clear replays");
-    expect(image_clears == 0 && attachment_clears == 1 && requested_view_format == VK_FORMAT_R8G8B8A8_UINT &&
+    expect(image_clears == 0 && attachment_clears == 0 && load_op_clears == 1 &&
+               requested_view_format == VK_FORMAT_R8G8B8A8_UINT &&
                captured_color.uint32[0] == 0xff && captured_color.uint32[1] == 0x80 &&
                captured_color.uint32[2] == 0x7f && captured_color.uint32[3] == 1,
-           "R8G8B8A8_UINT clear uses R8G8B8A8_UINT attachment view");
+           "R8G8B8A8_UINT clear uses R8G8B8A8_UINT LOAD_OP_CLEAR");
 
     // Emulated R9G9B9E5_SHAREDEXP (backed by R32_UINT) must NOT request an E5B9G9R9 color attachment view.
     ResourceBinding r9e5 = tex;
@@ -275,14 +324,15 @@ int main() {
     expect(run_tex(r9e5, {2, false, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 0, 0, 0, 0, 0, 1}, true,
                    {fbits(1.0f), fbits(2.0f), fbits(4.0f), 0}) == ReplayResult::success,
            "emulated R9G9B9E5 whole-view clear replays");
-    expect(image_clears == 1 && attachment_clears == 0 && captured_color.uint32[0] == 0x94010040u,
+    expect(image_clears == 1 && attachment_clears == 0 && load_op_clears == 0 &&
+               captured_color.uint32[0] == 0x94010040u,
            "emulated R9G9B9E5 whole-view clear stays on R32_UINT vkCmdClearColorImage");
     expect(run_tex(r9e5, {2, false, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 0, 0, 0, 0, 0, 1}, true,
                    {fbits(1.0f), fbits(2.0f), fbits(4.0f), 0}, std::span<const Rect>(&sub_rect, 1)) ==
                ReplayResult::success,
            "emulated R9G9B9E5 rect clear replays");
-    expect(image_clears == 0 && attachment_clears == 1 && requested_view_format == VK_FORMAT_R32_UINT &&
-               captured_color.uint32[0] == 0x94010040u,
+    expect(image_clears == 0 && attachment_clears == 1 && load_op_clears == 0 &&
+               requested_view_format == VK_FORMAT_R32_UINT && captured_color.uint32[0] == 0x94010040u,
            "emulated R9G9B9E5 rect clear uses R32_UINT attachment view");
 
     // When dynamic rendering is unavailable, reinterpretation refuses instead of corrupting via vkCmdClearColorImage.

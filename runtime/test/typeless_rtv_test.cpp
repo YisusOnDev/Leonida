@@ -10,13 +10,14 @@
 } while (0)
 
 namespace {
-unsigned image_clears = 0, attachment_clears = 0;
+unsigned image_clears = 0, attachment_clears = 0, load_op_clears = 0;
 VkFormat requested_format = VK_FORMAT_UNDEFINED;
 VkClearColorValue captured{};
 VkClearRect captured_rect{};
 VkRect2D render_area{};
 VkImageSubresourceRange requested_range{};
 unsigned rendering_layers = 0;
+VkAttachmentLoadOp captured_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 VKAPI_ATTR void VKAPI_CALL barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
     std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
     std::uint32_t, const VkImageMemoryBarrier*) {}
@@ -25,6 +26,13 @@ VKAPI_ATTR void VKAPI_CALL clear(VkCommandBuffer, VkImage, VkImageLayout, const 
 VKAPI_ATTR void VKAPI_CALL begin(VkCommandBuffer, const VkRenderingInfo* info) {
     render_area = info->renderArea;
     rendering_layers = info->layerCount;
+    if (info->colorAttachmentCount == 1 && info->pColorAttachments) {
+        captured_load_op = info->pColorAttachments[0].loadOp;
+        if (info->pColorAttachments[0].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            captured = info->pColorAttachments[0].clearValue.color;
+            ++load_op_clears;
+        }
+    }
 }
 VKAPI_ATTR void VKAPI_CALL end(VkCommandBuffer) {}
 VKAPI_ATTR void VKAPI_CALL attachments(VkCommandBuffer, std::uint32_t n, const VkClearAttachment* values,
@@ -54,10 +62,11 @@ leonida::ResourceBinding resource() {
     return r;
 }
 void reset_counters() {
-    image_clears = attachment_clears = 0;
+    image_clears = attachment_clears = load_op_clears = 0;
     requested_format = VK_FORMAT_UNDEFINED;
     captured = {}; captured_rect = {}; render_area = {};
     requested_range = {}; rendering_layers = 0;
+    captured_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 }
 leonida::ReplayResult run(const leonida::CommandList& list, const leonida::ResourceBinding& resource,
                           const leonida::ReplayFunctions& vk) {
@@ -88,15 +97,24 @@ int main() {
             target.format = ColorViewFormat::resource; // Mutating the descriptor must not change the recorded format.
             EXPECT(list.close());
             EXPECT(run(list, binding, vk) == ReplayResult::success);
-            const bool attachment = rect || format != ColorViewFormat::rgba8_unorm;
-            EXPECT(image_clears == unsigned(!attachment) && attachment_clears == unsigned(attachment));
-            if (attachment) {
+            const bool reinterpret = format != ColorViewFormat::rgba8_unorm;
+            const bool attachment = rect && !reinterpret;
+            EXPECT(image_clears == unsigned(!reinterpret && !rect));
+            EXPECT(load_op_clears == unsigned(reinterpret));
+            EXPECT(attachment_clears == unsigned(attachment));
+            if (reinterpret) {
                 EXPECT(requested_format == expected);
+                EXPECT(captured_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
+                EXPECT(render_area.offset.x == (rect ? 1 : 0));
+                EXPECT(render_area.offset.y == (rect ? 1 : 0));
+                EXPECT(render_area.extent.width == (rect ? 3u : 5u));
+                EXPECT(render_area.extent.height == (rect ? 2u : 3u));
+            } else if (attachment) {
+                EXPECT(requested_format == expected);
+                EXPECT(captured_load_op == VK_ATTACHMENT_LOAD_OP_LOAD);
                 EXPECT(render_area.extent.width == 5 && render_area.extent.height == 3);
-                EXPECT(captured_rect.rect.offset.x == (rect ? 1 : 0));
-                EXPECT(captured_rect.rect.offset.y == (rect ? 1 : 0));
-                EXPECT(captured_rect.rect.extent.width == (rect ? 3u : 5u));
-                EXPECT(captured_rect.rect.extent.height == (rect ? 2u : 3u));
+                EXPECT(captured_rect.rect.offset.x == 1 && captured_rect.rect.offset.y == 1);
+                EXPECT(captured_rect.rect.extent.width == 3u && captured_rect.rect.extent.height == 2u);
             }
             if (format == ColorViewFormat::rgba8_uint) {
                 EXPECT(captured.uint32[0] == 1 && captured.uint32[1] == 2 && captured.uint32[2] == 255 && captured.uint32[3] == 0);
@@ -192,11 +210,17 @@ int main() {
             EXPECT(requested_format == expected);
             EXPECT(requested_range.baseMipLevel == mip && requested_range.levelCount == 1);
             EXPECT(requested_range.baseArrayLayer == 1 && requested_range.layerCount == 2);
-            EXPECT(rendering_layers == 2 && captured_rect.baseArrayLayer == 0 && captured_rect.layerCount == 2);
+            const bool reinterpret = format != ColorViewFormat::rgba8_unorm;
+            EXPECT(load_op_clears == unsigned(reinterpret) && attachment_clears == unsigned(!reinterpret));
+            EXPECT(rendering_layers == 2);
+            EXPECT(render_area.offset.x == 0 && render_area.offset.y == 0);
             EXPECT(render_area.extent.width == std::max(1u, 5u >> mip));
             EXPECT(render_area.extent.height == std::max(1u, 3u >> mip));
-            EXPECT(captured_rect.rect.extent.width == render_area.extent.width);
-            EXPECT(captured_rect.rect.extent.height == render_area.extent.height);
+            if (!reinterpret) {
+                EXPECT(captured_rect.baseArrayLayer == 0 && captured_rect.layerCount == 2);
+                EXPECT(captured_rect.rect.extent.width == render_area.extent.width);
+                EXPECT(captured_rect.rect.extent.height == render_area.extent.height);
+            }
             ++checks;
         }
     }
@@ -213,7 +237,8 @@ int main() {
                 const auto resolve = [&](ResourceId id) { return id == 2 ? &predicate : &layered; };
                 reset_counters();
                 EXPECT(replay(list, VK_NULL_HANDLE, resolve, conditional) == ReplayResult::success);
-                EXPECT(image_clears == 0 && attachment_clears == 1);
+                EXPECT(image_clears == 0 && attachment_clears == 1 && load_op_clears == 0);
+                EXPECT(captured_load_op == VK_ATTACHMENT_LOAD_OP_LOAD);
                 EXPECT(requested_format == expected && requested_range.baseMipLevel == mip);
                 EXPECT(requested_range.baseArrayLayer == 1 && requested_range.layerCount == 2);
                 EXPECT(render_area.extent.width == std::max(1u, 5u >> mip));
@@ -229,7 +254,7 @@ int main() {
     const auto rejects = [&](ResourceBinding r, TargetView view, ReplayResult expected = ReplayResult::invalid_clear) {
         CommandList list;
         if (!list.clear_render_target(view, color) || !list.close()) return false;
-        return run(list, r, vk) == expected && !image_clears && !attachment_clears;
+        return run(list, r, vk) == expected && !image_clears && !attachment_clears && !load_op_clears;
     };
     EXPECT(rejects(binding, {1, 0, 0, 1})); // A typeless resource has no default typed RTV format.
     EXPECT(rejects(binding, {1, 0, 0, 1, static_cast<ColorViewFormat>(99)}));
@@ -284,7 +309,7 @@ int main() {
             CommandList cross;
             EXPECT(cross.clear_render_target({1, 0, 0, 1, format}, color) && cross.close());
             EXPECT(run(cross, image, vk) == ReplayResult::success);
-            EXPECT(image_clears == 0 && attachment_clears == 1 && requested_format == expected);
+            EXPECT(image_clears == 0 && load_op_clears == 1 && attachment_clears == 0 && requested_format == expected);
             ++checks;
         }
         auto typed = castable; typed.castable_view_formats = false;
@@ -300,9 +325,10 @@ int main() {
             CommandList ms_list;
             EXPECT(ms_list.clear_render_target({1, 0, 0, 1, format}, color) && ms_list.close());
             EXPECT(run(ms_list, msaa, vk) == ReplayResult::success);
-            const bool attachment = format != ColorViewFormat::rgba8_unorm;
-            EXPECT(image_clears == (attachment ? 0u : 1u) && attachment_clears == (attachment ? 1u : 0u));
-            EXPECT(!attachment || (requested_format == expected && rendering_layers == 1));
+            const bool reinterpret = format != ColorViewFormat::rgba8_unorm;
+            EXPECT(image_clears == (reinterpret ? 0u : 1u) && load_op_clears == (reinterpret ? 1u : 0u) &&
+                   attachment_clears == 0u);
+            EXPECT(!reinterpret || (requested_format == expected && rendering_layers == 1));
             ++checks;
         }
         auto msaa_layered = layered; msaa_layered.mip_levels = 1; msaa_layered.samples = 4;
@@ -310,7 +336,7 @@ int main() {
         EXPECT(ms_layer_list.clear_render_target({1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, color) &&
                ms_layer_list.close());
         EXPECT(run(ms_layer_list, msaa_layered, vk) == ReplayResult::success);
-        EXPECT(attachment_clears == 1 && requested_format == VK_FORMAT_R8G8B8A8_SRGB);
+        EXPECT(load_op_clears == 1 && attachment_clears == 0 && requested_format == VK_FORMAT_R8G8B8A8_SRGB);
         EXPECT(requested_range.baseArrayLayer == 1 && requested_range.layerCount == 2 && rendering_layers == 2);
         ++checks;
     }
@@ -318,28 +344,28 @@ int main() {
     CommandList list;
     EXPECT(list.clear_render_target({1, 0, 0, 1, ColorViewFormat::rgba8_srgb}, color) && list.close());
     auto unavailable = vk; unavailable.begin_rendering = nullptr;
-    EXPECT(run(list, binding, unavailable) == ReplayResult::unsupported && !image_clears && !attachment_clears);
+    EXPECT(run(list, binding, unavailable) == ReplayResult::unsupported && !image_clears && !attachment_clears && !load_op_clears);
     CommandList same_format;
     EXPECT(same_format.clear_render_target({1, 0, 0, 1, ColorViewFormat::rgba8_unorm}, color) && same_format.close());
-    EXPECT(run(same_format, binding, unavailable) == ReplayResult::success && image_clears == 1 && !attachment_clears);
+    EXPECT(run(same_format, binding, unavailable) == ReplayResult::success && image_clears == 1 && !attachment_clears && !load_op_clears);
     ++checks;
     auto legacy = binding;
     legacy.typeless = false;
     legacy.format = VK_FORMAT_UNDEFINED; // Existing ownerless float-only replay clients omit this metadata.
     CommandList legacy_list;
     EXPECT(legacy_list.clear_render_target({1, 0, 0, 1}, color) && legacy_list.close());
-    EXPECT(run(legacy_list, legacy, unavailable) == ReplayResult::success && image_clears == 1 && !attachment_clears);
+    EXPECT(run(legacy_list, legacy, unavailable) == ReplayResult::success && image_clears == 1 && !attachment_clears && !load_op_clears);
     EXPECT(std::memcmp(captured.float32, color.data(), sizeof(captured)) == 0);
     ++checks;
     CommandList clipped;
     const Rect outside{20, 20, 30, 30};
     EXPECT(clipped.clear_render_target({1, 0, 0, 1, ColorViewFormat::rgba8_srgb}, color, {&outside, 1}) && clipped.close());
-    EXPECT(run(clipped, binding, vk) == ReplayResult::success && !image_clears && !attachment_clears);
+    EXPECT(run(clipped, binding, vk) == ReplayResult::success && !image_clears && !attachment_clears && !load_op_clears);
     EXPECT(requested_format == VK_FORMAT_UNDEFINED);
     CommandList invalid_batch;
     EXPECT(invalid_batch.clear_render_target({1, 0, 0, 1, ColorViewFormat::rgba8_srgb}, color));
     EXPECT(invalid_batch.clear_render_target({1, 0, 0, 1, static_cast<ColorViewFormat>(99)}, color) && invalid_batch.close());
-    EXPECT(run(invalid_batch, binding, vk) == ReplayResult::invalid_clear && !image_clears && !attachment_clears);
+    EXPECT(run(invalid_batch, binding, vk) == ReplayResult::invalid_clear && !image_clears && !attachment_clears && !load_op_clears);
     checks += 3;
     std::printf("typeless_rtv_test: %u format, snapshot, whole/rectangle and rejection scenarios passed\n", checks);
     return 0;
