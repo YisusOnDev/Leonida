@@ -8086,6 +8086,9 @@ private:
             log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")
                          .c_str(),
                      int(desc->Dimension));
+            log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), flags")
+                         .c_str(),
+                     int(desc->Flags));
             return finish(E_INVALIDARG);
         }
         // The sample quality is checked above as the host does it here: CreateCommittedResource accepts a quality on a

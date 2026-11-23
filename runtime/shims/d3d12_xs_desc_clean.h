@@ -36,9 +36,25 @@ inline std::uint32_t without_depth_stencil_uav(D3D12_RESOURCE_DIMENSION dimensio
     return flags;
 }
 
-// The PC flags of a console description: the PC bits only, without unordered access on a depth-stencil texture.
+// The texture flag combinations the PC refuses (the Vulkan layer's committed_resource_refusal mirrors the host:
+// RT+DS, DS+UAV, and DENY_SHADER_RESOURCE without DS), made acceptable. The console makes 3D textures with such a
+// combination (three refusals in a retail boot past 124,000 D3D12 calls, then a null-resource crash): DS+UAV loses the
+// UAV (without_depth_stencil_uav); DENY_SHADER_RESOURCE without DS is only a promise not to sample the resource, so
+// dropping it loses nothing; RT+DS keeps the depth-stencil and loses the render target, as the depth-stencil texture
+// is the one the PC knows how to size. Buffers are left alone: none of the three applies to them.
+inline std::uint32_t without_refused_combinations(D3D12_RESOURCE_DIMENSION dimension, std::uint32_t flags) {
+    if (dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return flags;
+    flags = without_depth_stencil_uav(dimension, flags);
+    if (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        flags &= ~static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    else
+        flags &= ~static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+    return flags;
+}
+
+// The PC flags of a console description: the PC bits only, in a combination the PC accepts.
 inline std::uint32_t pc_resource_flags(D3D12_RESOURCE_DIMENSION dimension, std::uint32_t xbox_flags) {
-    return without_depth_stencil_uav(dimension, xbox_flags & kPcResourceFlagsMask);
+    return without_refused_combinations(dimension, xbox_flags & kPcResourceFlagsMask);
 }
 
 // Strip Xbox-only flags and translate the Xbox tiled layout. Preserve all other layouts so the host can validate them.

@@ -1500,7 +1500,10 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 }
                 return hr_to_u64(S_OK);
             }
-            if (Slot == (newer ? 32u : 30u)) return queue_present_x(self, a1, a2, a3);  // PresentX
+            if (Slot == (newer ? 32u : 30u)) {  // PresentX
+                d3d12_trace::record(child_trace_name<K>(Slot));
+                return queue_present_x(self, a1, a2, a3);
+            }
             if (Slot >= self->slot_count || (newer && (Slot == 14 || Slot == 15))) {
                 d3d12_trace::record(child_trace_name<K>(Slot), "console-only");
                 return hr_to_u64(S_OK);  // unmodelled console queue methods: frame pacing flows through them
@@ -2994,6 +2997,19 @@ void lease_title_resource_memory(DeviceProxy* self, void* created, const D3D12_R
                      static_cast<unsigned long long>(size));
 }
 
+// A resource the PC device refused at one of the console creation slots (76, 127, 133), named a few times with the
+// description it was given and the title's own flags: the title gets a null resource and often crashes on it later.
+void log_refused_resource(unsigned slot, HRESULT hr, const D3D12_RESOURCE_DESC& pc, std::uint32_t xbox_flags) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 12) return;
+    std::fprintf(stderr,
+                 "[rt] d3d12_xs: slot %u resource refused (0x%08lx): dimension %d, format %d, %llux%ux%u, mips %u, "
+                 "samples %u, xbox flags 0x%x -> PC flags 0x%x\n",
+                 slot, static_cast<unsigned long>(hr), static_cast<int>(pc.Dimension), static_cast<int>(pc.Format),
+                 static_cast<unsigned long long>(pc.Width), pc.Height, pc.DepthOrArraySize, pc.MipLevels,
+                 pc.SampleDesc.Count, xbox_flags, static_cast<unsigned>(pc.Flags));
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -3014,7 +3030,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     // A console depth-stencil texture may allow unordered access; the PC one may not (without_depth_stencil_uav, the
     // slot 25 stand-in). Only that bit is dropped here: the other flag bits go on as they came.
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
-        without_depth_stencil_uav(pc_desc.Dimension, static_cast<std::uint32_t>(pc_desc.Flags)));
+        without_refused_combinations(pc_desc.Dimension, static_cast<std::uint32_t>(pc_desc.Flags)));
 
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -3025,6 +3041,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     const HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state,
                                                            clear_value, *riid, out);
     if (SUCCEEDED(hr)) lease_title_resource_memory(self, *out, pc_desc);
+    else log_refused_resource(76, hr, pc_desc, static_cast<std::uint32_t>(xbox_desc->Flags));
     return hr;
 }
 
@@ -3074,7 +3091,8 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlagsMask);
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        without_refused_combinations(pc_desc.Dimension, xbox_flags & kPcResourceFlagsMask));
 
     static std::atomic<bool> logged{false};
     if (first_call(logged))
@@ -3117,6 +3135,10 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
         plain.Layout = pc_desc.Layout;
         plain.Flags = pc_desc.Flags;
         lease_title_resource_memory(self, *out, plain);
+    } else {
+        D3D12_RESOURCE_DESC plain{};
+        std::memcpy(&plain, &pc_desc, sizeof(plain));  // DESC1 begins with the DESC fields
+        log_refused_resource(kCreateCommittedResource3X, hr, plain, xbox_flags);
     }
     return hr;
 }
@@ -3176,7 +3198,8 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
 
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        without_refused_combinations(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     const bool clearable =
@@ -3208,11 +3231,15 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
         const HRESULT hr = create(device10, &heap, D3D12_HEAP_FLAG_NONE, &desc1, layout, clear, nullptr, 0, nullptr,
                                   riid, out);
         static_cast<IUnknown*>(device10)->Release();
+        if (FAILED(hr)) log_refused_resource(133, hr, pc_desc, xbox_flags);
         return hr;
     }
 #endif
-    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc,
-                                               legacy_state_for_layout(initial_state, buffer), clear, *riid, out);
+    const HRESULT hr = self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc,
+                                                           legacy_state_for_layout(initial_state, buffer), clear,
+                                                           *riid, out);
+    if (FAILED(hr)) log_refused_resource(133, hr, pc_desc, xbox_flags);
+    return hr;
 }
 
 // The Xbox routes at their configured indices. Returns false when `slot` is none of them. Slot 70 asks too, because an
@@ -3333,7 +3360,8 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
                                                                           : D3D12_TEXTURE_LAYOUT_UNKNOWN;
             }
             constexpr std::uint32_t kPcResourceFlagsMask = 0x1FFu;
-            d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(d.Flags) & kPcResourceFlagsMask);
+            d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+                without_refused_combinations(d.Dimension, static_cast<std::uint32_t>(d.Flags) & kPcResourceFlagsMask));
             cleaned[i] = d;
         }
         descs_to_pass = cleaned.data();

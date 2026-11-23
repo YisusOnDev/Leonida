@@ -2411,8 +2411,7 @@ int check_queue_slot35() {
 
     EXPECT(release(lists[0]) == 0 && release(lists[1]) == 0 && release(allocator) == 0);
     EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
-    std::printf("%s: queue slot 35 hands PC slot 10 the real lists behind the list proxies
-", g_label);
+    std::printf("%s: queue slot 35 hands PC slot 10 the real lists behind the list proxies\n", g_label);
     return 0;
 }
 
@@ -2737,6 +2736,42 @@ int check_committed_resource3_x() {
     EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
     EXPECT(g_committed3.calls == 2 && g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
     EXPECT(release(resource) == 0);
+
+    // Console 3D textures with a flag combination the PC refuses: DENY_SHADER_RESOURCE without DS goes (UAV stays),
+    // DS+UAV keeps DS, RT+DS keeps DS (+ DENY with DS stays).
+    {
+        D3D12_RESOURCE_DESC1 volume = texture;
+        volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        volume.Width = volume.Height = volume.DepthOrArraySize = 32;
+        volume.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        std::uint64_t vwords[10];
+        std::memcpy(vwords, words, sizeof(vwords));
+        vwords[2] = word(&volume);
+        vwords[6] = 0;
+        vwords[7] = 0;
+        const struct {
+            std::uint32_t in, out;
+        } cases[] = {
+            {D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE | kXboxFlagBit,
+             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS},
+            {D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL},
+            {D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                 D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE},
+        };
+        for (const auto& c : cases) {
+            volume.Flags = static_cast<D3D12_RESOURCE_FLAGS>(c.in);
+            resource = nullptr;
+            EXPECT(hr_of(raw10(device, 127, vwords)) == S_OK && resource);
+            EXPECT(static_cast<std::uint32_t>(g_committed3.desc.Flags) == c.out);
+            EXPECT(static_cast<std::uint32_t>(volume.Flags) == c.in);  // the title's description is read only
+            EXPECT(release(resource) == 0);
+        }
+        // The buffer kept its flags above; one more call per case was made.
+        EXPECT(g_committed3.calls == 2 + std::size(cases));
+        g_committed3.calls = 2;
+    }
 
     // The PC device's own refusal reaches the title with a null object.
     mock->create_result = E_OUTOFMEMORY;
