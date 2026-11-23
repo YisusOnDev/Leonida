@@ -1,0 +1,56 @@
+#version 460
+// Minimal compute shader for d3d12_volume_srv_test: looks up a 3D T# in the bindless descriptor
+// hash table (set 0, binding 2) and fetches texel (pc.x, pc.y, pc.z) at mip 0 from binding 6
+// as float, uint, or sint, writing the 4 raw 32-bit components to set 1 binding 0.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform Params {
+    uint tsharp[8];
+    uint out_index;
+    uint mode;  // 0: float (texture3D), 1: uint (utexture3D), 2: sint (itexture3D)
+    uint x;
+    uint y;
+    uint z;
+} pc;
+
+layout(set = 0, binding = 6) uniform texture3D vol_f[];
+layout(set = 0, binding = 6) uniform utexture3D vol_u[];
+layout(set = 0, binding = 6) uniform itexture3D vol_i[];
+
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
+    uint map[];
+};
+
+layout(set = 1, binding = 0, std430) writeonly buffer Output {
+    uvec4 result[];
+};
+
+uint lookup(uint key[8]) {
+    uint h = 2166136261u;
+    for (int i = 0; i < 8; ++i) h = (h ^ key[i]) * 16777619u;
+    const uint mask = map[0];
+    for (uint k = 0; k < 8; ++k) {
+        const uint slot = 1 + ((h + k) & mask) * 10;
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && map[slot + i] == key[i];
+        if (same) return map[slot + 8];
+    }
+    return 0;
+}
+
+void main() {
+    uint key[8];
+    for (int i = 0; i < 8; ++i) key[i] = pc.tsharp[i];
+    const uint idx = lookup(key);
+    const ivec3 coord = ivec3(pc.x, pc.y, pc.z);
+    if (pc.mode == 1u) {
+        result[pc.out_index] = texelFetch(vol_u[idx], coord, 0);
+    } else if (pc.mode == 2u) {
+        result[pc.out_index] = uvec4(texelFetch(vol_i[idx], coord, 0));
+    } else {
+        result[pc.out_index] = floatBitsToUint(texelFetch(vol_f[idx], coord, 0));
+    }
+}

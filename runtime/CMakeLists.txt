@@ -2110,6 +2110,28 @@ if(TARGET Vulkan::Headers)
       message(STATUS "glslangValidator not found: d3d12_descriptor_test skips its shader")
     endif()
 
+    # Typeless and castable 3D volume SRVs (descriptor encoding, negative controls, and GPU texelFetch readbacks).
+    add_executable(d3d12_volume_srv_test test/d3d12_volume_srv_test.cpp)
+    target_link_libraries(d3d12_volume_srv_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_volume_srv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_volume_srv_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_volume_srv COMMAND d3d12_volume_srv_test)
+    set_tests_properties(d3d12_volume_srv PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(_volume_srv_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_volume_srv.spv)
+      add_custom_command(OUTPUT ${_volume_srv_spv}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3
+          -o ${_volume_srv_spv} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_volume_srv.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_volume_srv.comp
+        COMMENT "Compiling volume SRV test shader cs_volume_srv.comp" VERBATIM)
+      target_sources(d3d12_volume_srv_test PRIVATE ${_volume_srv_spv})
+      target_compile_definitions(d3d12_volume_srv_test PRIVATE LEONIDA_TEST_CS_VOLUME_SRV_SPV="${_volume_srv_spv}")
+    else()
+      message(STATUS "glslangValidator not found: d3d12_volume_srv_test skips its GPU readback shader")
+    endif()
+
     add_executable(d3d12_predicated_copy_test test/d3d12_predicated_copy_test.cpp)
     target_link_libraries(d3d12_predicated_copy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_predicated_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

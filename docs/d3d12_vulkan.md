@@ -715,18 +715,21 @@ side inwards:
   while it is also bound read-only (`DEPTH_READ` with a shader-resource state) is in
   `DEPTH_STENCIL_READ_ONLY_OPTIMAL` and is not handled.
 
-A typed single-sampled 3D texture can use a default SRV or an explicit `TEXTURE3D` SRV of the same format.
-An `R8G8B8A8_TYPELESS` volume supports explicit `R8G8B8A8_UNORM` and `R8G8B8A8_UNORM_SRGB` SRVs.
-The sRGB view decodes RGB and preserves linear alpha. A typeless volume requires an explicit typed view.
+A typed single-sampled 3D texture can use a default SRV or an explicit `TEXTURE3D` SRV of the same format (or
+any format listed in its castable-format list via `CreateCommittedResource3`). A typeless 3D volume supports
+explicit typed `TEXTURE3D` SRVs across its typeless family (as well as relaxed castable-format lists), while
+rejecting `DXGI_FORMAT_UNKNOWN`, typeless view formats, and unlisted cross-family casts as null descriptors.
+The sRGB view decodes RGB and preserves linear alpha.
 The T# records the base depth, the view's mip range and `ResourceMinLODClamp`. Binding 6 holds the 3D Vulkan view,
 which has one array layer. `d3d12_descriptor_test` checks samples at four W coordinates through two views of the same
 volume, plus minimum-LOD clamped views (inside the mip range via `VK_EXT_image_view_min_lod`, at or below
-`MostDetailedMip`, and above the last mip).
+`MostDetailedMip`, and above the last mip), and `d3d12_volume_srv_test` checks typeless families, castable-format
+lists, and negative controls.
 
 Known gaps in the descriptor path: buffer shader-resource views and constant-buffer views (the V# a shader would
 load for them; the structure is in `gfx10_descriptors.h`, the views are not written; buffer UAVs of every kind are,
 section 3.4 "Buffer UAVs", `d3d12_m4_compute_test` and `d3d12_buffer_uav_test`);
-1D-array SRVs, 1D and 3D storage views, other typeless volume formats, multisampled depth/stencil and typeless
+1D-array SRVs, 1D and 3D storage views, multisampled depth/stencil and typeless
 color SRVs, and shader-translator lowering for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect (the texture's backing format, so X24_8_32_FLOAT for a D24 texture where the layer stores it as
