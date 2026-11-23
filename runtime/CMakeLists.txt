@@ -674,6 +674,13 @@ if(BUILD_TESTING)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
     )
+    # A stand-in that crashes with its own top-level filter or terminate handler installed (run_tiny_crash_*).
+    add_executable(tiny_crash test/fixtures/tiny_crash.cpp)
+    target_compile_definitions(tiny_crash PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_crash PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    set_target_properties(tiny_crash PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_executable(tiny_bundled_load test/fixtures/tiny_bundled_load.cpp)
     target_compile_definitions(tiny_bundled_load PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_bundled_load PRIVATE /W4 /permissive- /utf-8)
@@ -1302,6 +1309,15 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_atexit COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_atexit>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_atexit.cmake")
+
+    add_test(NAME run_tiny_crash_filter COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_crash>" -DMODE=filter -DEXPECT=10
+      "-DLINE=tiny_crash: the top-level filter ran (access violation)"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_crash.cmake")
+    add_test(NAME run_tiny_crash_terminate COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_crash>" -DMODE=terminate -DEXPECT=12
+      "-DLINE=tiny_crash: the terminate handler ran"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_crash.cmake")
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_console_paths COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"

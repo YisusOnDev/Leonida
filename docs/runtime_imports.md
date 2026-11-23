@@ -77,6 +77,8 @@ changing the host CRT's argument globals. This does not add console-path wildcar
 natively and through the loader; `run_startup_cmdline` also checks native preconfiguration and command-line
 identity through attach and entry.
 
+The same shim serves `SetUnhandledExceptionFilter` (`kernel32`, `kernelbase`, `api-ms-win-core-errorhandling-l1-1-0` to `-3`). Bound to the host, a filter inside a mapped image is accepted and never run: a fault ends the process with the exception code, and an uncaught C++ exception never reaches `std::terminate`, because the filter the MSVC start-up code installs is lost the same way. The shim keeps the title's filter, installs one host filter inside `gta6rt.exe` that calls it, and returns the previous title filter as Windows does. `run_tiny_crash_filter` and `run_tiny_crash_terminate` check both paths with a stand-in under `gta6rt --run`. Those imports were bound to the host before, so each image that imports the function now has one more shim and one fewer host import than the table shows.
+
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
 

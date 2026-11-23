@@ -14,6 +14,8 @@
 //     CRT's exit lock. at_quick_exit() registrations have a separate table, run only by quick_exit(), newest first.
 //     Not covered yet: the thread-local destructor callback (_register_thread_local_exe_atexit_callback), which
 //     still reaches the host CRT.
+//   - SetUnhandledExceptionFilter from the game keeps the game's filter here and installs one host filter that calls
+//     it (see game_set_unhandled_exception_filter).
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 // The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
@@ -363,6 +365,38 @@ DWORD WINAPI game_thread(void* p) {
     end_run(static_cast<int>(code));  // returning from the entry point is an exit too
 }
 
+// The title's top-level exception filter. Bound to the host, SetUnhandledExceptionFilter takes a filter inside a
+// mapped image and then never runs it (measured on Windows 11 26200 with tiny_crash: the fault ends the process with
+// the exception code, and a second call does not return the filter just set). The likely reason is that the host
+// only keeps a filter inside an image it loaded itself; that was not looked into. Two things were lost that way: the title's own crash handler, and the filter the MSVC start-up code
+// installs, which is what turns an uncaught C++ exception into std::terminate. So the title's filter is kept here,
+// and the host gets one filter of the runtime's own, in gta6rt.exe, that calls it. With no title filter set, that
+// one passes the exception to whatever filter the host had before (the runtime's own CRT filter).
+// The host filter is installed once. If something in the host process calls the real SetUnhandledExceptionFilter
+// after that (a driver's DLL, SDL, a CRT initialised later), it replaces this one and the title's filter is lost
+// without a sign: nothing here installs it again.
+// One more window, during the title's first call only: host_top_level_filter is live from the moment
+// SetUnhandledExceptionFilter installs it, and g_host_filter_before is stored right after. A fault on another
+// thread in between, with no title filter set yet, finds both empty and returns EXCEPTION_CONTINUE_SEARCH, the
+// default handling, instead of passing through the filter the host had before.
+std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_game_filter{nullptr};
+std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_host_filter_before{nullptr};
+std::atomic<bool> g_host_filter_installed{false};
+
+LONG WINAPI host_top_level_filter(EXCEPTION_POINTERS* info) {
+    if (const auto game = g_game_filter.load()) return game(info);
+    if (const auto before = g_host_filter_before.load()) return before(info);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(filter): returns the filter it replaces, as Windows does;
+// NULL clears it.
+LPTOP_LEVEL_EXCEPTION_FILTER __stdcall game_set_unhandled_exception_filter(LPTOP_LEVEL_EXCEPTION_FILTER filter) {
+    if (!g_host_filter_installed.exchange(true))
+        g_host_filter_before = ::SetUnhandledExceptionFilter(&host_top_level_filter);
+    return g_game_filter.exchange(filter);
+}
+
 }  // namespace
 
 void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args) {
@@ -449,6 +483,8 @@ using namespace rt::process;
     {dll, "_get_narrow_winmain_command_line", reinterpret_cast<void*>(&game_get_narrow_winmain_command_line)}, \
     {dll, "_get_wide_winmain_command_line", reinterpret_cast<void*>(&game_get_wide_winmain_command_line)}
 #define EXIT_PROCESS(dll) {dll, "ExitProcess", reinterpret_cast<void*>(&game_exit_process)}
+#define EXCEPTION_FILTER(dll) \
+    {dll, "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&game_set_unhandled_exception_filter)}
 #define COMMAND_LINE(dll) \
     {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
@@ -470,6 +506,12 @@ SHIM_TABLE(process,
     EXIT_PROCESS("kernel32.dll"),
     EXIT_PROCESS("kernelbase.dll"),
     EXIT_PROCESS("api-ms-win-core-processthreads-l1-1-0.dll"),
+    EXCEPTION_FILTER("kernel32.dll"),
+    EXCEPTION_FILTER("kernelbase.dll"),
+    EXCEPTION_FILTER("api-ms-win-core-errorhandling-l1-1-0.dll"),
+    EXCEPTION_FILTER("api-ms-win-core-errorhandling-l1-1-1.dll"),
+    EXCEPTION_FILTER("api-ms-win-core-errorhandling-l1-1-2.dll"),
+    EXCEPTION_FILTER("api-ms-win-core-errorhandling-l1-1-3.dll"),
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
