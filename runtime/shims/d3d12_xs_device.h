@@ -208,7 +208,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 // 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 74 and 76. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 76, 86, 101 and 108. Slot 10 is intentionally
+// 78/79/80 (the Xbox slots above, at their configured indices), 55, 62, 67, 76, 86, 101 and 108. Slot 10 is intentionally
 // false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which
 // the proxy handles for the allocator proxy.
 // proxies), 9 (allocator proxies), 12 (command list proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor
