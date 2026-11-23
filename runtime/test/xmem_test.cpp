@@ -407,6 +407,40 @@ void test_two_page_placeholder(const PhysicalApi& api) {
     VirtualFree(window, 0, MEM_RELEASE);
 }
 
+// The retail title maps a page table one page at a time, not in address order (+0x2474660, from +0x2474074). The last
+// page of an unsplit placeholder looks isolated to VirtualQuery (base == address, one page), so it has to be split all
+// the same before a view can replace it.
+void test_last_page_first(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 3;
+    auto* window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    const bool allocated = api.allocate(0x280, &count, pages) && count == kPages;
+    check(window && allocated, "last-page-first setup succeeds");
+    if (!window || !allocated) return;
+    bool ok = true;
+    for (uint64_t i = kPages; i-- > 0;) {
+        SetLastError(ERROR_SUCCESS);
+        uint8_t* const at = window + i * kPage64k;
+        ok &= api.map(at, 1, &pages[i]) == at;
+        if (ok) at[0] = static_cast<uint8_t>(0x30 + i);
+    }
+    check(ok, "pages map one at a time from the last page of the window down");
+    bool contents = ok;
+    for (uint64_t i = 0; contents && i < kPages; ++i) contents &= window[i * kPage64k] == 0x30 + i;
+    check(contents, "each page written after a last-page-first map keeps its own contents");
+    // The middle page of a fresh three-page window first, then its neighbours.
+    api.map(window, kPages, nullptr);
+    const uint64_t order[kPages] = {1, 2, 0};
+    ok = true;
+    for (uint64_t i : order) ok &= api.map(window + i * kPage64k, 1, &pages[i]) == window + i * kPage64k;
+    check(ok, "pages map one at a time in the order middle, last, first after an unmap");
+    api.map(window, kPages, nullptr);
+    api.free_pages(kPages, pages);
+    VirtualFree(window, 0, MEM_RELEASE);
+}
+
 // Physical pages in a 64 KiB-page window, as the measured callers use them: reserve a window, allocate pages, map them,
 // remap them elsewhere and in another order, unmap, free.
 void test_physical_pages(const PhysicalApi& api) {
@@ -965,7 +999,9 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 6, "every event names its caller");
+    check(count("\"kind\":\"xmem_virtual_alloc\"") == 1 && count("\"type\":\"0x3000\",\"attributes\":\"0x183\"") == 1,
+          "the XMemVirtualAlloc call is traced with its request and result");
+    check(count("\"caller\":\"") == 7, "every event names its caller");
     DeleteFileW(path.c_str());
 }
 
@@ -1166,6 +1202,7 @@ int main() {
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_two_page_placeholder(physical);
+        test_last_page_first(physical);
         test_physical_pages(physical);
         test_physical_pages_commit_on_touch(physical);
         test_commit_physical_pages(physical);
