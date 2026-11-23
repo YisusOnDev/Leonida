@@ -3656,6 +3656,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     // Normalize console descriptors in a copy. PC calls can also pass the Xbox tiled layout explicitly. Otherwise
     // their flags and layout reach the host unchanged so the host can validate them.
     const UINT desc_count = static_cast<UINT>(count);
+    const D3D12_RESOURCE_DESC* const title_descs = descs;
     std::unique_ptr<D3D12_RESOURCE_DESC[]> clean;
     if (descs && desc_count) {
         clean.reset(new (std::nothrow) D3D12_RESOURCE_DESC[desc_count]);
@@ -3681,6 +3682,22 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    // The retail title asserts (int3) when the upper half of the size is set, which is what the refusal (UINT64_MAX)
+    // looks like to it: name the refused descriptions, a few of them.
+    static std::atomic<int> refused_logged{0};
+    if (info.SizeInBytes == UINT64_MAX && descs && title_descs && refused_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+        for (UINT i = 0; i < desc_count; ++i) {
+            const D3D12_RESOURCE_DESC& d = descs[i];
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 25 refused: dim %d align %llu %llux%ux%u mips %u format %d samples %u/%u "
+                         "layout 0x%x flags 0x%x (title flags 0x%x)\n",
+                         static_cast<int>(d.Dimension), static_cast<unsigned long long>(d.Alignment),
+                         static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize, d.MipLevels,
+                         static_cast<int>(d.Format), d.SampleDesc.Count, d.SampleDesc.Quality,
+                         static_cast<unsigned>(d.Layout), static_cast<unsigned>(d.Flags),
+                         static_cast<unsigned>(title_descs[i].Layout), static_cast<unsigned>(title_descs[i].Flags));
+        }
+    }
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }
