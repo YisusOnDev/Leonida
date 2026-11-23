@@ -3733,7 +3733,11 @@ public:
                 code_stage = &stage;
             }
             stage.words = library->spirv(*stage.entry);
-            if (stage.words.empty()) return E_FAIL;
+            if (stage.words.empty()) {
+                // Name the file, as the compute path does: a stale or partial shader folder must not fail silently.
+                std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", stage.entry->name.c_str());
+                return E_FAIL;
+            }
             const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
             if (!inner.valid) return E_INVALIDARG;
             if (inner.fully_covered &&
