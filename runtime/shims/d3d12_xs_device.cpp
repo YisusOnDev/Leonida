@@ -3392,9 +3392,10 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
                 d.Layout = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                           : D3D12_TEXTURE_LAYOUT_UNKNOWN;
             }
-            constexpr std::uint32_t kPcResourceFlagsMask = 0x1FFu;
+            // PC bits only, and a depth-stencil texture sized without unordered access, which the PC refuses with
+            // it (d3d12_xs_desc_clean.h; the title sizes a 768x768x6 R16_TYPELESS depth array with both here).
             d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
-                without_refused_combinations(d.Dimension, static_cast<std::uint32_t>(d.Flags) & kPcResourceFlagsMask));
+                pc_resource_flags(d.Dimension, static_cast<std::uint32_t>(d.Flags)));
             cleaned[i] = d;
         }
         descs_to_pass = cleaned.data();
@@ -3404,6 +3405,23 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
         D3D12_RESOURCE_ALLOCATION_INFO1*);
     reinterpret_cast<Fn>(proxy->real_vtable[68])(proxy->real, ret, visible_mask, count, descs_to_pass, info1);
+    // The retail title asserts on a refusal (game_scarlett_master.exe+0xabfe1b, after a 4 KiB then a default
+    // alignment try): name the first refused descriptions as the console sent them. A refused 4 KiB try is expected
+    // (the title then asks again with the default alignment), so a single-description 4 KiB query is not logged.
+    static std::atomic<int> refusals_logged{0};
+    const bool small_try = count == 1 && raw_descs && raw_descs[0].Alignment == D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+    if (ret->SizeInBytes == UINT64_MAX && raw_descs && !small_try && refusals_logged.fetch_add(1) < 16) {
+        for (UINT i = 0; i < count; ++i) {
+            const D3D12_RESOURCE_DESC& d = raw_descs[i];
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 108 refused [%u/%u]: dimension %d alignment 0x%llx %llux%ux%u mips %u "
+                         "format %d samples %u layout 0x%x flags 0x%x\n",
+                         i, count, int(d.Dimension), static_cast<unsigned long long>(d.Alignment),
+                         static_cast<unsigned long long>(d.Width), d.Height, unsigned(d.DepthOrArraySize),
+                         unsigned(d.MipLevels), int(d.Format), d.SampleDesc.Count, unsigned(d.Layout),
+                         unsigned(d.Flags));
+        }
+    }
     return reinterpret_cast<std::uint64_t>(ret);
 }
 
