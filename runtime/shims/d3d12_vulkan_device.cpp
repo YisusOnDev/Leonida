@@ -607,22 +607,9 @@ struct TextureCreateInfo {
     TextureCreateInfo& operator=(const TextureCreateInfo&) = delete;
 };
 
-std::filesystem::path configured_shader_directory() {
-    constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
-    if (const DWORD size = ::GetEnvironmentVariableW(env_name, nullptr, 0)) {
-        std::wstring value(size, L'\0');
-        const DWORD length = ::GetEnvironmentVariableW(env_name, value.data(), size);
-        if (length && length < size) {
-            value.resize(length);
-            return std::filesystem::path(value);
-        }
-    }
-
-    std::wstring exe(32768, L'\0');
-    const DWORD length = ::GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
-    if (!length || length >= exe.size()) return {};
-    exe.resize(length);
-    const auto config = std::filesystem::path(exe).parent_path() / L"shader_path.txt";
+// The folder make_game recorded in shader_path.txt at `config`, or empty without one. Throws when the path cannot be
+// converted: MSVC's STL reports a Windows path that is not UTF-8 as std::system_error, libstdc++ as filesystem_error.
+std::filesystem::path shader_directory_from_file(const std::filesystem::path& config) {
     std::ifstream file(config, std::ios::binary);
     if (!file) return {};
     const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
@@ -938,22 +925,26 @@ struct DeviceState {
         std::lock_guard lock(library_mutex);
         if (!library_tried) {
             library_tried = true;
-            std::filesystem::path dir;
+            // Nothing may leave here into Create*PipelineState: a path the STL cannot convert throws std::system_error
+            // under MSVC, which is not a filesystem_error, so every std::exception gives the message.
             try {
-                dir = info.shader_dir.empty() ? configured_shader_directory() : std::filesystem::path(info.shader_dir);
-            } catch (const std::filesystem::filesystem_error& e) {
+                std::string error;
+                const std::filesystem::path dir = info.shader_dir.empty() ? configured_shader_directory(&error)
+                                                                          : std::filesystem::path(info.shader_dir);
+                if (!error.empty())
+                    std::fprintf(stderr, "[rt] d3d12: invalid translated shader path: %s\n", error.c_str());
+                else if (dir.empty())
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
+                else if (!shader_library.load(dir, &error))
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
+                else {
+                    const auto path = shader_library.directory().u8string();
+                    std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
+                                 shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
+                }
+            } catch (const std::exception& e) {
                 std::fprintf(stderr, "[rt] d3d12: invalid translated shader path: %s\n", e.what());
-                return nullptr;
-            }
-            std::string error;
-            if (dir.empty())
-                std::fprintf(stderr, "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
-            else if (!shader_library.load(dir, &error))
-                std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
-            else {
-                const auto path = dir.u8string();
-                std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
-                             shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
             }
         }
         return shader_library.loaded() ? &shader_library : nullptr;
@@ -2379,8 +2370,9 @@ public:
     // Placing writes nothing: the heap was zeroed when it was made (Heap), and a buffer placed over bytes another
     // resource holds reads them, while that resource keeps them (buffers inherit data in any state, "Memory
     // Aliasing and Data Inheritance"; d3d12_placed_inherit_test).
-    HRESULT create_placed_buffer() {
+    HRESULT create_placed_buffer(std::shared_ptr<const leonida::TileHeapAllocation> heap_range) {
         if (!device_.arena.mapped) return E_OUTOFMEMORY;
+        heap_range_ = std::move(heap_range);
         if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
         leonida::ResourceBinding binding{};
         binding.size = desc_.Width;
@@ -2912,6 +2904,9 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    // A placed buffer's heap range, held as a D3D12 placed resource holds its heap: the app may release the heap
+    // first, and the range must not go to another allocation while this buffer lives.
+    std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
 };
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -3125,6 +3120,7 @@ public:
     bool reserved() const { return bool(allocation_); }
     // An existing heap: the caller's memory, not an arena range, so offset() is not a place in the arena.
     const void* host_address() const { return host_address_; }
+    const std::shared_ptr<const leonida::TileHeapAllocation>& arena_range() const { return allocation_; }
     VkDeviceSize offset() const { return allocation_->offset; }
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
@@ -7254,7 +7250,8 @@ public:
     // (docs/d3d12_vulkan.md section 3.5). So each gets a sampler in set 0 and a key in the hash table here, as
     // CreateSampler gives a heap slot's S#; without them the shader's lookup misses and it samples through the
     // fallback sampler. A static sampler is a D3D12_SAMPLER_DESC2 whose border colour is one of five named ones
-    // (D3D12_STATIC_BORDER_COLOR; the two UINT ones can be in a blob of any version, the flags only in 1.2).
+    // (D3D12_STATIC_BORDER_COLOR; the two UINT ones can be in a blob of any version, the flags only in 1.2), or
+    // transparent black with the UINT flag.
     void register_static_samplers(const rt::rootsig::RootSignature& signature) {
         for (const rt::rootsig::StaticSampler& s : signature.static_samplers) {
             D3D12_SAMPLER_DESC2 desc{};
@@ -7275,9 +7272,14 @@ public:
                 desc.Flags |= D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
                 desc.UintBorderColor[0] = desc.UintBorderColor[1] = desc.UintBorderColor[2] = white ? 1u : 0u;
                 desc.UintBorderColor[3] = 1;
+            } else if (s.border_color == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK &&
+                       (desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) {
+                // The integer border the enum has no value for: the 1.2 flag on transparent black is UINT (0,0,0,0),
+                // which D3D12 serializes and creates. UintBorderColor is already zero.
             } else if (s.border_color > D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT ||
                        (desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) {
-                // A value past the enum, or the UINT flag with a float border: not a sampler D3D12 defines.
+                // A value past the enum, or the UINT flag with the float opaque black or white (D3D12 refuses to
+                // serialize that pair): not a sampler D3D12 defines.
                 log_once("static sampler not registered: border colour and flags do not go together; border colour",
                          int(s.border_color));
                 continue;
@@ -7831,7 +7833,7 @@ public:
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
-            hr = resource->create_placed_buffer();
+            hr = resource->create_placed_buffer(heap->arena_range());
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
@@ -10529,5 +10531,28 @@ void set_global_realtime_privilege_override_for_test(int state) {
     g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
 }
 
+
+std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
+    try {
+        constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
+        if (const DWORD size = ::GetEnvironmentVariableW(env_name, nullptr, 0)) {
+            std::wstring value(size, L'\0');
+            const DWORD length = ::GetEnvironmentVariableW(env_name, value.data(), size);
+            if (length && length < size) {
+                value.resize(length);
+                return std::filesystem::path(value);
+            }
+        }
+        if (!config.empty()) return shader_directory_from_file(config);
+        std::wstring exe(32768, L'\0');
+        const DWORD length = ::GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+        if (!length || length >= exe.size()) return {};
+        exe.resize(length);
+        return shader_directory_from_file(std::filesystem::path(exe).parent_path() / L"shader_path.txt");
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return {};
+    }
+}
 
 }  // namespace rt::d3d12

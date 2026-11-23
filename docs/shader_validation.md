@@ -1169,6 +1169,20 @@ Results (`--max-ops 16`, half wave32, half wave64, nothing skipped): it found `s
 wave32 and `s_ff0_i32_b64` of a negative constant (#1409), both fixed on `main` since; on `main` 7b7d73f8, 600 of
 600 match (seeds 401 to 403).
 
+For one case from a default wave32 run, `tools/wave_trace.py` writes a self-contained HTML report. Use the seed,
+zero-based case index, and `--max-ops` from `wave_diff.py --wave 32`. The report compares all 32 lanes after
+initialization and after each subsequent instruction. Select a register or jump to the first observed mismatch.
+
+```powershell
+python -I tools/wave_trace.py --seed 1 --case 0 --max-ops 12 --out wave.html
+```
+
+Each checkpoint re-translates a shorter program with the same observation epilogue, so liveness and lowering can
+change between checkpoints. The first mismatch identifies an observed prefix. The final checkpoint runs the full
+original case. The tool uses synthetic programs and the CPU interpreters above. It writes a report for mismatches
+and unavailable checkpoints as well. Exit 1 means a mismatch was observed, 2 means the comparison was incomplete
+or the command failed, and 0 means all checkpoints matched.
+
 ### 32-bit float VALU on the GPU (`tools/f32_fuzz.py`, FUZZ-3)
 
 `--oracle hw` (or `translator,hw`) runs the same seeded VOP1/VOP2/VOP3 f32 programs natively on the AMD GPU and judges
@@ -2291,9 +2305,27 @@ used the first flag without the second, and its generated vertex shader wrote th
 both GPUs, with both flags and by default they are within 2e-3 on both, and `ps_interp_f32_mods` / `ps_interp_mov_mods`
 (plain f32 and mov reads) are exact with `--bary-fallback`. `ps_sweep.py` now builds the vertex shader of a pixel
 shader with `f16_halves` in its index entry so that the halves are decoded from the same words a default translation
-reads per vertex. Not shown: the 61 individually (a 12-shader subset of the 190 agreed between the two translations on
-the RTX 4080 SUPER; draws of these shaders take about 20 s each). Only 9 of the 480 read raw
-barycentrics and need the geometry shader; all 9 agree on both GPUs.
+reads per vertex. An exhaustive follow-up on all `480` sampled shaders (`--seed 20261122`, `main` at `dde82f27e`)
+and all `12,101` PS confirmed this on an AMD Radeon RX 6650 XT (RDNA2, Windows 11 driver `32.0.21045.29003`,
+`vk_ps_sweep` variant `z`, `--timeout 30`): `29` of `12,101` PS use `MinLod` (`image_sample_d_cl`, `273` occurrences;
+`10` also have `v_interp_*_f16`, `0` read raw barycentrics), and `0` of the `480` sampled PS declare `MinLod`, so
+the MinLod fallback plays no part in this `480`-shader difference. Across the `480` shaders, `272` modules are
+byte-identical across all three translations, `10` are refused (`computed I/J pair under --bary-fallback`), and
+`198` differ (`186` reading `v_interp_*_f16` — all `186` using `high` — `12` reading raw barycentrics with
+`.bary_gs.spv`, `0` combining both in the sample; across all `12,101` PS, `5` combine both, of which `3` translate
+under `--bary-fallback --f16-interp-fallback` + `.bary_gs.spv` and `2` hit `computed I/J pair under --bary-fallback`).
+On the `198` differing shaders on the RX 6650 XT, `default` vs `--bary-fallback` alone gave `90` OK on both (all `12`
+raw-bary GS draws plus `78` `v_interp_*_f16`), `54` differing beyond tolerance (`53` gross `>0.1`, `1` moderate
+`>1e-2`), `9` NaN or zero on one side (`8` NaN on `default` only with `371`/`507`/`960` NaNs, `1` zero on `default`
+only), `12` driver crashes on both (`0xC0000005`, unchanged with an 8 MiB stack), and `33` timeouts; all `63`
+differing/NaN/zero draws are `v_interp_*_f16` shaders where the default sweep vertex shader without `f16_halves` wrote
+smooth `[0, 1]` `f32` bits that `PerVertexKHR` `UnpackHalf2x16` interpreted as negative or large `f16` values (feeding
+`sqrt`/`log`/`pow`), whereas `--bary-fallback` alone read the positive smooth `f32` values directly. Re-running the
+same `198` shaders with `--bary-fallback --f16-interp-fallback` gave `153` OK on both (`141` `v_interp_*_f16` + all
+`12` raw-bary GS), `0` differing, `0` NaN/zero mismatch, `12` failures on both, and `33` timeouts, with `153/153`
+completing draws (`89` non-clear exact + `64` clear-only exact across `573/573` targets) bit-for-bit identical under
+`ps_sweep.py compare --exact`. All `3` whole-corpus shaders combining raw barycentrics and `v_interp_*_f16` also draw
+bit-for-bit identically (`3/3` draws, `11/11` targets) against `default` on the RX 6650 XT.
 
 ## Coverage plan and cost
 

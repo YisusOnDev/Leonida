@@ -101,6 +101,28 @@ The thunk keeps the Win64 argument registers and the return address intact (it i
 reaches a shared stub that saves them, so a floating-point caller still reads 0.0 from xmm0 and a debugger can unwind
 through it.
 
+### Compat modules: `LEONIDA_COMPAT_DIR`
+
+Opt-in. When `LEONIDA_COMPAT_DIR` names a folder, an import whose DLL is a file in that folder (matched by file name,
+any case) is served by that DLL: Windows loads it from the full path with `LoadLibraryExW`
+(`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`, never the game folder), so its CRT, TLS and SEH
+work as for any host DLL and it takes no slot of the mapper's static TLS. This step comes before the shims, the
+bundled package DLLs and the host, and the DLL owns all of its module's imports: a symbol it does not export binds to
+the unimplemented thunk, not to a shim, so one console DLL is never served by two implementations that do not share
+state. The binding is reported as `host`, and `[rt] compat: <dll> -> <path>` is printed once per DLL. A file in the
+folder that Windows refuses to load stops the run with the error code. Unset or empty: no change. The DLLs stay
+loaded for the process lifetime. Only static imports go through this step; a run-time `LoadLibrary` of the same name
+does not yet.
+
+It exists for drop-in implementations of console DLLs that have no shim here, such as the `AcpHal`, `chad`, `xapu`
+and `XCRDAPI` crates of [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later).
+Measured on the 1.0.2.1 executable at `867d922`: without the folder, `--dry-run` leaves 20 imports unimplemented
+(AcpHal 9, chad 5, xapu 5, XCRDAPI 1); with those four DLLs built from `f89e410`, it leaves 0, with the four
+package DLLs still mapped (`module=72`). Those DLLs run static initializers when Windows loads them, and with the
+defaults one of them hooks the process: the package DLLs mapped after it then fail to map. With
+`TOMBOX_GDK_EARLY=0 TOMBOX_GDK_RUNTIME=0 TOMBOX_OSHOST=0 TOMBOX_PAD=0 TOMBOX_TIMER_1MS=0` they map; their network
+guard stays on and denies all traffic. `loader_test` covers the step with a synthetic DLL (no game data).
+
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
@@ -649,7 +671,13 @@ python -I scripts/run_guest_scene.py --loader path/to/gta6rt.exe --guest path/to
     --shaders path/to/m15_shaders --out new-scene-run --negative-controls
 ```
 
-For Wine, add `--wine path/to/wine`. The runner launches the mapped guest for an
+For Wine, add `--wine path/to/wine`. With a Linux cross-build, CTest also registers
+`d3d12_guest_scene` when CMake finds the shader tools and has a Wine command in
+`CMAKE_CROSSCOMPILING_EMULATOR`. Build the `tiny_guest_draw` target, then run
+`ctest --test-dir <build> -R '^d3d12_guest_scene$' --output-on-failure`.
+On a headless host, prefix that CTest command with `xvfb-run -a` so the scene runner
+keeps guest stdout and stderr separate while checking the frame-count marker.
+The runner launches the mapped guest for an
 uninterrupted 600-frame run, a 300-frame save, and a fresh process that restores the
 checkpoint. This opt-in build links a fixture input source into the loader. Scripted keyboard changes feed the SDL virtual pad. GameInput readings
 drive the position of one quad. The guest streams ten 16-byte synthetic palette pages from
