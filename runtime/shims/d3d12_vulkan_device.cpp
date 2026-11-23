@@ -1423,7 +1423,8 @@ struct DeviceState {
             allocate.allocationSize = requirements.size;
             allocate.memoryTypeIndex = i;
             VkDeviceMemory out = VK_NULL_HANDLE;
-            if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
+            const VkResult alloc_result = context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out);
+            if (alloc_result == VK_SUCCESS) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
                 if (chosen_type) *chosen_type = i;
                 if (leonida::spilled_to_host(required, preferred, memory.memoryTypes[i].propertyFlags))
@@ -1436,6 +1437,10 @@ struct DeviceState {
                                      static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20));
                     });
                 return out;
+            }
+            if (alloc_result == VK_ERROR_DEVICE_LOST) {
+                context->mark_device_lost("DeviceState::allocate (vkAllocateMemory)", alloc_result);
+                return VK_NULL_HANDLE;
             }
         }
         return VK_NULL_HANDLE;
@@ -4051,9 +4056,14 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
+        const VkResult pipe_res =
+            vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline);
+        if (pipe_res != VK_SUCCESS) {
+            if (pipe_res == VK_ERROR_DEVICE_LOST)
+                device_.context->mark_device_lost("PipelineState::create_compute (vkCreateComputePipelines)",
+                                                  pipe_res);
             return E_FAIL;
+        }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -4168,9 +4178,13 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
+        const VkResult pipe_res = device_.context->vk.vkCreateGraphicsPipelines(
+            device_.info.device, device_.pipeline_cache(), 1, &info, nullptr, &pipeline);
+        if (pipe_res != VK_SUCCESS) {
+            if (pipe_res == VK_ERROR_DEVICE_LOST)
+                device_.context->mark_device_lost("PipelineState::build (vkCreateGraphicsPipelines)", pipe_res);
             return VK_NULL_HANDLE;
+        }
         return pipeline;
     }
 
@@ -5100,7 +5114,8 @@ public:
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
-                                                                      info.buffer_device_address);
+                                                                      info.buffer_device_address,
+                                                                  info.device_fault);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -5457,7 +5472,9 @@ public:
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
-                state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+                const VkResult idle_res = state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+                if (idle_res == VK_ERROR_DEVICE_LOST)
+                    state_.context->mark_device_lost("Device::~Device (vkDeviceWaitIdle)", idle_res);
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_bindless_release(nullptr, nullptr);
@@ -5569,8 +5586,21 @@ public:
         return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
     }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
-        if (removed_.load(std::memory_order_acquire)) return DXGI_ERROR_DEVICE_REMOVED;
-        return (state_.context && state_.context->is_device_lost()) ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
+        const bool host_removed = removed_.load(std::memory_order_acquire);
+        const bool context_lost = state_.context && state_.context->is_device_lost();
+        if (!host_removed && !context_lost) return S_OK;
+        std::call_once(removed_logged_, [&] {
+            if (context_lost) {
+                const std::string cause = state_.context->device_lost_summary();
+                std::fprintf(stderr, "[rt] d3d12: GetDeviceRemovedReason -> DXGI_ERROR_DEVICE_REMOVED (%s)\n",
+                             cause.empty() ? "context lost" : cause.c_str());
+            } else {
+                std::fprintf(stderr,
+                             "[rt] d3d12: GetDeviceRemovedReason -> DXGI_ERROR_DEVICE_REMOVED "
+                             "(site=ID3D12Device5::RemoveDevice, reason=host-triggered)\n");
+            }
+        });
+        return DXGI_ERROR_DEVICE_REMOVED;
     }
 
     // Residency and power (D3D-33, docs/d3d12_vulkan.md section 4.1). Vulkan has no residency API: memory from
@@ -5660,7 +5690,11 @@ public:
     }
 
     // STUB
-    void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
+    void STDMETHODCALLTYPE RemoveDevice() override {
+        if (!removed_.exchange(true, std::memory_order_acq_rel)) {
+            std::fprintf(stderr, "[rt] d3d12: device removed via ID3D12Device5::RemoveDevice\n");
+        }
+    }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
@@ -8599,6 +8633,7 @@ private:
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
     std::atomic<bool> removed_{false};
+    mutable std::once_flag removed_logged_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
@@ -8881,10 +8916,14 @@ WindowPresenter::~WindowPresenter() {
 }
 
 namespace {
-HRESULT present_result(VkResult result) {
+HRESULT present_result(VkResult result, std::atomic<bool>& logged_device_lost) {
     if (result == VK_SUCCESS) return S_OK;
+    if (result == VK_ERROR_DEVICE_LOST) {
+        if (!logged_device_lost.exchange(true, std::memory_order_acq_rel))
+            std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
+        return DXGI_ERROR_DEVICE_REMOVED;
+    }
     std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
-    if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
     if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return DXGI_ERROR_UNSUPPORTED;
     return E_FAIL;
 }
@@ -8897,7 +8936,8 @@ HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval
                                                                        src_rect->bottom}
                                                : leonida::PresentRect{};
     return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr,
-                                              tear));
+                                              tear),
+                          logged_device_lost_);
 }
 
 bool WindowPresenter::tear_supported() const { return presenter_->tear_supported(); }
@@ -8905,11 +8945,11 @@ bool WindowPresenter::last_present_tore() const { return presenter_->last_presen
 std::uint64_t WindowPresenter::tear_presents() const { return presenter_->tear_presents(); }
 
 HRESULT WindowPresenter::present_blank(UINT sync_interval) {
-    return present_result(presenter_->present_blank(sync_interval > 0));
+    return present_result(presenter_->present_blank(sync_interval > 0), logged_device_lost_);
 }
 
 HRESULT WindowPresenter::present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear) {
-    return present_result(presenter_->present_planes(planes, sync_interval > 0, tear));
+    return present_result(presenter_->present_planes(planes, sync_interval > 0, tear), logged_device_lost_);
 }
 
 bool WindowPresenter::hdr_active() const { return presenter_->hdr_active(); }
@@ -9707,6 +9747,22 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+    // Optional: VK_EXT_device_fault reports driver fault descriptions, address faults, and vendor codes after
+    // VK_ERROR_DEVICE_LOST. Keep deviceFaultVendorBinary disabled because binary dumps are not requested or parsed.
+    VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (has_device_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fault_features};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.device_fault = fault_features.deviceFault == VK_TRUE;
+        if (info.device_fault) {
+            fault_features.deviceFaultVendorBinary = VK_FALSE;
+            fault_features.pNext = *v13.next();
+            *v13.next() = &fault_features;
+        }
+    }
+#endif
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
     device_info.pQueueCreateInfos = queue_infos.data();
@@ -9745,6 +9801,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.presentation = has_swapchain && instance_has_surface;
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+    if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+#endif
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

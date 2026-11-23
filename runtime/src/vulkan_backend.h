@@ -67,6 +67,99 @@ struct DebugLabelFunctions {
     bool complete() const { return cmd_insert && cmd_begin && cmd_end && queue_insert && queue_begin && queue_end; }
 };
 
+namespace detail {
+
+inline const char* vk_result_name(VkResult result) noexcept {
+    switch (result) {
+    case VK_SUCCESS: return "VK_SUCCESS";
+    case VK_NOT_READY: return "VK_NOT_READY";
+    case VK_TIMEOUT: return "VK_TIMEOUT";
+    case VK_INCOMPLETE: return "VK_INCOMPLETE";
+    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+    case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+    case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+    case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+    case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+    default: return nullptr;
+    }
+}
+
+inline std::string format_vk_result(VkResult result) {
+    char buffer[64];
+    if (const char* name = vk_result_name(result)) {
+        std::snprintf(buffer, sizeof(buffer), "%s (%d)", name, static_cast<int>(result));
+    } else {
+        std::snprintf(buffer, sizeof(buffer), "VkResult(%d)", static_cast<int>(result));
+    }
+    return std::string(buffer);
+}
+
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+inline const char* vk_fault_address_type_name(std::uint32_t address_type) noexcept {
+    switch (static_cast<VkDeviceFaultAddressTypeEXT>(address_type)) {
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "NONE";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "READ_INVALID";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "WRITE_INVALID";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "EXECUTE_INVALID";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "INSTRUCTION_POINTER_UNKNOWN";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "INSTRUCTION_POINTER_INVALID";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "INSTRUCTION_POINTER_FAULT";
+    default: return "UNKNOWN";
+    }
+}
+
+inline std::string sanitize_fault_text(const char* raw, std::size_t max_len) {
+    if (!raw || !max_len) return {};
+    const std::size_t len = ::strnlen(raw, max_len);
+    std::string out;
+    out.reserve(len);
+    for (std::size_t i = 0; i < len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(raw[i]);
+        if (c == '\r' || c == '\n' || c == '\t') {
+            out.push_back(' ');
+        } else if (c >= 0x20 && c != 0x7f) {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+#endif
+
+}  // namespace detail
+
+// First-observed host cause and optional VK_EXT_device_fault snapshot captured when a VulkanContext enters device lost.
+struct DeviceLostDiagnostics {
+    static constexpr std::uint32_t kMaxFaultEntries = 16;
+
+    struct AddressInfo {
+        std::uint32_t address_type = 0;
+        std::uint64_t address = 0;
+        std::uint64_t precision = 0;
+    };
+
+    struct VendorInfo {
+        std::string description;
+        std::uint64_t code = 0;
+        std::uint64_t data = 0;
+    };
+
+    bool lost = false;
+    const char* site = nullptr;
+    VkResult result = VK_SUCCESS;
+    bool fault_queried = false;
+    VkResult fault_query_result = VK_SUCCESS;
+    std::string fault_description;
+    std::uint32_t total_address_infos = 0;
+    std::uint32_t total_vendor_infos = 0;
+    std::uint64_t vendor_binary_size = 0;
+    std::vector<AddressInfo> address_infos;
+    std::vector<VendorInfo> vendor_infos;
+    std::string summary;
+};
+
 struct VulkanDeviceFunctions {
 #define LEONIDA_VK_DEVICE_FUNCTIONS(X)                                                                         \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer)         \
@@ -554,12 +647,14 @@ public:
     };
 
     using SignalEventFn = void (*)(void* event_handle);
+    using DeviceLostFn = std::function<void(const char* site, VkResult result)>;
 
     // Longest single vkWaitSemaphores call in run(): bounds how long the thread can sit in an uninterruptible wait.
     static constexpr std::uint64_t kWaitSliceNs = 100'000'000;  // 100 ms
 
-    FenceWaitDispatcher(VkDevice device, const VulkanDeviceFunctions& vk, std::atomic<bool>& device_lost)
-        : device_(device), vk_(vk), device_lost_(device_lost) {
+    FenceWaitDispatcher(VkDevice device, const VulkanDeviceFunctions& vk, std::atomic<bool>& device_lost,
+                        DeviceLostFn on_device_lost = {})
+        : device_(device), vk_(vk), device_lost_(device_lost), on_device_lost_(std::move(on_device_lost)) {
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         type.initialValue = 0;
@@ -799,7 +894,11 @@ private:
             epoch_cv_.notify_all();
 
             if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
-                device_lost_.store(true, std::memory_order_release);
+                if (res == VK_ERROR_DEVICE_LOST && on_device_lost_) {
+                    on_device_lost_("FenceWaitDispatcher::run (vkWaitSemaphores)", res);
+                } else {
+                    device_lost_.store(true, std::memory_order_release);
+                }
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
                 dispatch_outside_lock(lock, drained, signal_event_);
@@ -809,12 +908,14 @@ private:
 
             std::vector<Entry> ready;
             bool lost = false;
+            VkResult lost_result = VK_SUCCESS;
             std::size_t write = 0;
             for (std::size_t i = 0; i < pending_.size(); ++i) {
                 std::uint64_t done = 0;
                 const VkResult cr = vk_.vkGetSemaphoreCounterValue(device_, pending_[i].semaphore, &done);
                 if (cr == VK_ERROR_DEVICE_LOST) {
                     lost = true;
+                    lost_result = cr;
                     for (std::size_t j = i; j < pending_.size(); ++j) ready.push_back(std::move(pending_[j]));
                     break;
                 }
@@ -829,7 +930,11 @@ private:
                 pending_.resize(write);
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
-                device_lost_.store(true, std::memory_order_release);
+                if (on_device_lost_) {
+                    on_device_lost_("FenceWaitDispatcher::run (vkGetSemaphoreCounterValue)", lost_result);
+                } else {
+                    device_lost_.store(true, std::memory_order_release);
+                }
                 dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
@@ -844,6 +949,7 @@ private:
     VkDevice device_;
     const VulkanDeviceFunctions& vk_;
     std::atomic<bool>& device_lost_;
+    DeviceLostFn on_device_lost_;
     SignalEventFn signal_event_ = nullptr;
     VkSemaphore wakeup_sem_ = VK_NULL_HANDLE;
     std::uint64_t wakeup_val_ = 0;
@@ -917,10 +1023,20 @@ public:
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
+    // device_fault: VK_EXT_device_fault is enabled on `device` (vkGetDeviceFaultInfoEXT on VK_ERROR_DEVICE_LOST).
     VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
-                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false)
+                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false,
+                  bool device_fault = false)
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+        if (device_fault && loaded_ && get) {
+            get_device_fault_info_ =
+                reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(get(device_, "vkGetDeviceFaultInfoEXT"));
+        }
+#else
+        (void)device_fault;
+#endif
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
         replay_.clear_color_image = vk.vkCmdClearColorImage;
         replay_.clear_depth_stencil_image = vk.vkCmdClearDepthStencilImage;
@@ -1070,7 +1186,9 @@ public:
         };
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
         if (loaded_) {
-            fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
+            fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(
+                device_, vk, device_lost_,
+                [this](const char* site, VkResult result) { record_device_lost(site, result); });
         }
     }
 
@@ -1468,7 +1586,9 @@ public:
             wait.semaphoreCount = std::uint32_t(semaphores.size());
             wait.pSemaphores = semaphores.data();
             wait.pValues = values.data();
-            vk.vkWaitSemaphores(device_, &wait, UINT64_MAX);  // outside submit_mutex_: a signal may need it
+            const VkResult wait_result = vk.vkWaitSemaphores(device_, &wait, UINT64_MAX);  // outside submit_mutex_: a signal may need it
+            if (wait_result == VK_ERROR_DEVICE_LOST)
+                mark_device_lost("VulkanContext::wait_retire_ticket (vkWaitSemaphores)", wait_result);
         }
         return completed_retire_ticket();
     }
@@ -1483,7 +1603,12 @@ public:
         if (is_device_lost()) return 0;
         return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
             std::uint64_t done = 0;
-            return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
+            const VkResult res = vk.vkGetSemaphoreCounterValue(device_, semaphore, &done);
+            if (res == VK_ERROR_DEVICE_LOST) {
+                mark_device_lost("VulkanContext::completed_retire_ticket (vkGetSemaphoreCounterValue)", res);
+                return false;
+            }
+            return res == VK_SUCCESS && done >= value;
         });
     }
 
@@ -1523,8 +1648,8 @@ public:
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
 
-    void mark_device_lost() noexcept {
-        device_lost_.store(true, std::memory_order_release);
+    void mark_device_lost(const char* site = nullptr, VkResult result = VK_SUCCESS) noexcept {
+        record_device_lost(site ? site : "mark_device_lost", result);
         if (fence_dispatcher_) {
             try {
                 fence_dispatcher_->notify_device_lost();
@@ -1533,6 +1658,21 @@ public:
         }
     }
     bool is_device_lost() const noexcept { return device_lost_.load(std::memory_order_acquire); }
+    bool device_fault_enabled() const noexcept {
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+        return get_device_fault_info_ != nullptr;
+#else
+        return false;
+#endif
+    }
+    DeviceLostDiagnostics device_lost_diagnostics() const {
+        std::lock_guard lock(device_lost_mutex_);
+        return device_lost_diagnostics_;
+    }
+    std::string device_lost_summary() const {
+        std::lock_guard lock(device_lost_mutex_);
+        return device_lost_diagnostics_.summary;
+    }
 
     void set_signal_event_fn(FenceWaitDispatcher::SignalEventFn fn) {
         if (fence_dispatcher_) fence_dispatcher_->set_signal_event_fn(fn);
@@ -1661,11 +1801,168 @@ private:
         return framebuffer;
     }
 
+    void record_device_lost(const char* site, VkResult result) noexcept {
+        std::string log_summary;
+        const char* safe_site = (site && *site) ? site : "unspecified";
+        {
+            std::lock_guard lock(device_lost_mutex_);
+            device_lost_.store(true, std::memory_order_release);
+            if (device_lost_recorded_) return;
+            device_lost_recorded_ = true;
+            device_lost_diagnostics_.lost = true;
+            device_lost_diagnostics_.site = safe_site;
+            device_lost_diagnostics_.result = result;
+            try {
+                if (result == VK_ERROR_DEVICE_LOST) query_device_fault_locked(device_lost_diagnostics_);
+                device_lost_diagnostics_.summary = format_device_lost_summary(device_lost_diagnostics_);
+                log_summary = device_lost_diagnostics_.summary;
+            } catch (...) {
+            }
+        }
+        if (!log_summary.empty()) {
+            std::fprintf(stderr, "[rt] d3d12: device lost (%s)\n", log_summary.c_str());
+        } else {
+            std::fprintf(stderr, "[rt] d3d12: device lost (site=%s, VkResult=%d)\n", safe_site,
+                         static_cast<int>(result));
+        }
+    }
+
+    void query_device_fault_locked(DeviceLostDiagnostics& diag) {
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+        if (!get_device_fault_info_) return;
+        diag.fault_queried = true;
+        VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        VkResult qres = get_device_fault_info_(device_, &counts, nullptr);
+        diag.fault_query_result = qres;
+        if (qres != VK_SUCCESS && qres != VK_INCOMPLETE) return;
+
+        diag.total_address_infos = counts.addressInfoCount;
+        diag.total_vendor_infos = counts.vendorInfoCount;
+        diag.vendor_binary_size = counts.vendorBinarySize;
+
+        counts.addressInfoCount = std::min(counts.addressInfoCount, DeviceLostDiagnostics::kMaxFaultEntries);
+        counts.vendorInfoCount = std::min(counts.vendorInfoCount, DeviceLostDiagnostics::kMaxFaultEntries);
+        counts.vendorBinarySize = 0;  // vendor binary dumps are not requested or allocated
+
+        std::vector<VkDeviceFaultAddressInfoEXT> addrs(counts.addressInfoCount);
+        std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+        VkDeviceFaultInfoEXT fault_info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+        fault_info.pAddressInfos = addrs.empty() ? nullptr : addrs.data();
+        fault_info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+        fault_info.pVendorBinaryData = nullptr;
+
+        qres = get_device_fault_info_(device_, &counts, &fault_info);
+        diag.fault_query_result = qres;
+        if (qres != VK_SUCCESS && qres != VK_INCOMPLETE) return;
+
+        fault_info.description[VK_MAX_DESCRIPTION_SIZE - 1] = '\0';
+        diag.fault_description = detail::sanitize_fault_text(fault_info.description, VK_MAX_DESCRIPTION_SIZE);
+
+        const std::uint32_t addr_count =
+            std::min<std::uint32_t>(counts.addressInfoCount, static_cast<std::uint32_t>(addrs.size()));
+        diag.address_infos.reserve(addr_count);
+        for (std::uint32_t i = 0; i < addr_count; ++i) {
+            diag.address_infos.push_back({static_cast<std::uint32_t>(addrs[i].addressType),
+                                          static_cast<std::uint64_t>(addrs[i].reportedAddress),
+                                          static_cast<std::uint64_t>(addrs[i].addressPrecision)});
+        }
+
+        const std::uint32_t vendor_count =
+            std::min<std::uint32_t>(counts.vendorInfoCount, static_cast<std::uint32_t>(vendors.size()));
+        diag.vendor_infos.reserve(vendor_count);
+        for (std::uint32_t i = 0; i < vendor_count; ++i) {
+            vendors[i].description[VK_MAX_DESCRIPTION_SIZE - 1] = '\0';
+            diag.vendor_infos.push_back(
+                {detail::sanitize_fault_text(vendors[i].description, VK_MAX_DESCRIPTION_SIZE),
+                 vendors[i].vendorFaultCode, vendors[i].vendorFaultData});
+        }
+#else
+        (void)diag;
+#endif
+    }
+
+    static std::string format_device_lost_summary(const DeviceLostDiagnostics& diag) {
+        std::string out = "site=";
+        out += diag.site ? diag.site : "unspecified";
+        if (diag.result != VK_SUCCESS) {
+            out += ", result=";
+            out += detail::format_vk_result(diag.result);
+        } else {
+            out += ", reason=host-triggered";
+        }
+        if (diag.result != VK_ERROR_DEVICE_LOST) return out;
+        if (!diag.fault_queried) {
+            out += "; VK_EXT_device_fault unavailable";
+            return out;
+        }
+        if (diag.fault_query_result != VK_SUCCESS && diag.fault_query_result != VK_INCOMPLETE) {
+            out += "; VK_EXT_device_fault query failed: ";
+            out += detail::format_vk_result(diag.fault_query_result);
+            return out;
+        }
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+        if (!diag.fault_description.empty()) {
+            out += "; VK_EXT_device_fault: \"";
+            out += diag.fault_description;
+            out += "\"";
+        } else if (diag.address_infos.empty() && diag.vendor_infos.empty() && diag.total_address_infos == 0 &&
+                   diag.total_vendor_infos == 0 && diag.vendor_binary_size == 0) {
+            out += "; VK_EXT_device_fault: no details reported";
+        } else {
+            out += "; VK_EXT_device_fault:";
+        }
+        char buf[160];
+        if (diag.total_address_infos > 0 || !diag.address_infos.empty()) {
+            std::snprintf(buf, sizeof(buf), " addresses=%zu/%u [", diag.address_infos.size(),
+                          diag.total_address_infos);
+            out += buf;
+            for (std::size_t i = 0; i < diag.address_infos.size(); ++i) {
+                if (i) out += ", ";
+                const auto& a = diag.address_infos[i];
+                std::snprintf(buf, sizeof(buf), "%s(%u) addr=0x%llx precision=0x%llx",
+                              detail::vk_fault_address_type_name(a.address_type), a.address_type,
+                              static_cast<unsigned long long>(a.address),
+                              static_cast<unsigned long long>(a.precision));
+                out += buf;
+            }
+            out += "]";
+        }
+        if (diag.total_vendor_infos > 0 || !diag.vendor_infos.empty()) {
+            std::snprintf(buf, sizeof(buf), " vendor=%zu/%u [", diag.vendor_infos.size(), diag.total_vendor_infos);
+            out += buf;
+            for (std::size_t i = 0; i < diag.vendor_infos.size(); ++i) {
+                if (i) out += ", ";
+                const auto& v = diag.vendor_infos[i];
+                out += "\"";
+                out += v.description;
+                std::snprintf(buf, sizeof(buf), "\" code=0x%llx data=0x%llx",
+                              static_cast<unsigned long long>(v.code), static_cast<unsigned long long>(v.data));
+                out += buf;
+            }
+            out += "]";
+        }
+        if (diag.vendor_binary_size > 0) {
+            std::snprintf(buf, sizeof(buf), " vendor_binary=%lluB(omitted)",
+                          static_cast<unsigned long long>(diag.vendor_binary_size));
+            out += buf;
+        }
+        if (diag.fault_query_result == VK_INCOMPLETE) out += " (VK_INCOMPLETE)";
+#endif
+        return out;
+    }
+
     VkDevice device_;
     bool loaded_ = false;
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
+    // Pure leaf lock: never acquires any other context or dispatcher lock.
+    mutable std::mutex device_lost_mutex_;
+    bool device_lost_recorded_ = false;
+    DeviceLostDiagnostics device_lost_diagnostics_;
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+    PFN_vkGetDeviceFaultInfoEXT get_device_fault_info_ = nullptr;
+#endif
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
@@ -1754,7 +2051,7 @@ public:
         std::uint64_t value = 0;
         const VkResult result = context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore_, &value);
         if (result == VK_ERROR_DEVICE_LOST) {
-            context_.mark_device_lost();
+            context_.mark_device_lost("VulkanFence::completed (vkGetSemaphoreCounterValue)", result);
             return UINT64_MAX;
         }
         if (result != VK_SUCCESS) return 0;
@@ -1775,7 +2072,7 @@ public:
         info.semaphore = semaphore_;
         info.value = value;
         const VkResult result = context_.vk.vkSignalSemaphore(context_.device(), &info);
-        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost("VulkanFence::signal (vkSignalSemaphore)", result);
         if (result != VK_SUCCESS) return false;
         context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
         context_.holds().pump_ready();
@@ -1789,7 +2086,7 @@ public:
         info.pSemaphores = &semaphore_;
         info.pValues = &value;
         const VkResult result = context_.vk.vkWaitSemaphores(context_.device(), &info, timeout_ns);
-        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost("VulkanFence::wait (vkWaitSemaphores)", result);
         return result == VK_SUCCESS;
     }
 
@@ -1858,7 +2155,7 @@ public:
             if (idle_result == VK_SUCCESS) {
                 if (progress_) context_.retire_queue_idle_locked(progress_);
             } else {
-                context_.mark_device_lost();
+                context_.mark_device_lost("VulkanQueue::~VulkanQueue (vkQueueWaitIdle)", idle_result);
             }
         }
         if (progress_) {
@@ -2067,7 +2364,9 @@ public:
 
     bool idle() {
         std::lock_guard lock(context_.submit_mutex());
-        return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+        const VkResult result = context_.vk.vkQueueWaitIdle(queue_);
+        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost("VulkanQueue::idle (vkQueueWaitIdle)", result);
+        return result == VK_SUCCESS;
     }
 
 private:
@@ -2442,13 +2741,19 @@ private:
         };
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (context_.vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
+        const VkResult begin_result = context_.vk.vkBeginCommandBuffer(command_buffer, &begin);
+        if (begin_result != VK_SUCCESS) {
+            if (begin_result == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanQueue::execute_now (vkBeginCommandBuffer)", begin_result);
             discard();
             return ReplayResult::unsupported;
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
-            const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
+            const VkResult end_result = context_.vk.vkEndCommandBuffer(command_buffer);
+            if (end_result == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanQueue::execute_now (vkEndCommandBuffer)", end_result);
+            const bool ended = end_result == VK_SUCCESS;
             resource_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
             if (!submitted) discard();
@@ -2554,7 +2859,10 @@ private:
                                                  0, 1, &host, 0, nullptr, 0, nullptr);
             }
         }
-        const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
+        const VkResult end_result = context_.vk.vkEndCommandBuffer(command_buffer);
+        if (end_result == VK_ERROR_DEVICE_LOST)
+            context_.mark_device_lost("VulkanQueue::execute_now (vkEndCommandBuffer)", end_result);
+        const bool ended = end_result == VK_SUCCESS;
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
         const bool wait_previous = ordered_timestamps && submitted_;
         if (wait_previous) {
@@ -2861,7 +3169,11 @@ private:
         auto& vk = context_.vk;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
+        const VkResult begin_result = vk.vkBeginCommandBuffer(command_buffer, &begin);
+        if (begin_result != VK_SUCCESS) {
+            if (begin_result == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanQueue::initialize_sparse_image_layout (vkBeginCommandBuffer)",
+                                          begin_result);
             slot->ticket = 0;
             return false;
         }
@@ -2872,7 +3184,15 @@ private:
                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        if (vk.vkEndCommandBuffer(command_buffer) != VK_SUCCESS || !submit(command_buffer, VK_NULL_HANDLE, 0)) {
+        const VkResult end_result = vk.vkEndCommandBuffer(command_buffer);
+        if (end_result != VK_SUCCESS) {
+            if (end_result == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanQueue::initialize_sparse_image_layout (vkEndCommandBuffer)",
+                                          end_result);
+            slot->ticket = 0;
+            return false;
+        }
+        if (!submit(command_buffer, VK_NULL_HANDLE, 0)) {
             slot->ticket = 0;
             return false;
         }
@@ -2958,7 +3278,8 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             const auto result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
             if (result != VK_SUCCESS) {
-                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+                if (result == VK_ERROR_DEVICE_LOST)
+                    context_.mark_device_lost("VulkanQueue::bind_tiles (vkQueueBindSparse)", result);
                 pending_bindings_.pop_back();
                 return false;
             }
@@ -2979,7 +3300,8 @@ private:
         if (context_.is_device_lost()) return 0;
         std::uint64_t done = 0;
         const VkResult result = context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
-        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        if (result == VK_ERROR_DEVICE_LOST)
+            context_.mark_device_lost("VulkanQueue::completed (vkGetSemaphoreCounterValue)", result);
         // A failed timeline query cannot be used as a resource-retirement or command-buffer reuse ticket.
         return result == VK_SUCCESS ? done : 0;
     }
@@ -3027,7 +3349,7 @@ private:
             case VK_TIMEOUT:
                 continue;
             case VK_ERROR_DEVICE_LOST:
-                context_.mark_device_lost();
+                context_.mark_device_lost("VulkanQueue::wait_for_room (vkWaitSemaphores)", VK_ERROR_DEVICE_LOST);
                 return false;
             default:
                 return true;  // nothing submitted to wait for (or a host error): no wait can make room, allocate
@@ -3053,7 +3375,12 @@ private:
         context_.drain_deleted_resources(context_.completed_retire_ticket());
         CommandSlot* reuse = recycle_finished();
         if (reuse) {
-            if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
+            const VkResult reset_result = context_.vk.vkResetCommandBuffer(reuse->buffer, 0);
+            if (reset_result != VK_SUCCESS) {
+                if (reset_result == VK_ERROR_DEVICE_LOST)
+                    context_.mark_device_lost("VulkanQueue::acquire (vkResetCommandBuffer)", reset_result);
+                return nullptr;
+            }
             reuse->predicate.reset();
             reuse->predicated_copy.reset();
             reuse->counted_dispatch.reset();
@@ -3065,8 +3392,12 @@ private:
         info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         info.commandBufferCount = 1;
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-        if (context_.vk.vkAllocateCommandBuffers(context_.device(), &info, &command_buffer) != VK_SUCCESS)
+        const VkResult alloc_result = context_.vk.vkAllocateCommandBuffers(context_.device(), &info, &command_buffer);
+        if (alloc_result != VK_SUCCESS) {
+            if (alloc_result == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanQueue::acquire (vkAllocateCommandBuffers)", alloc_result);
             return nullptr;
+        }
         buffers_.push_back({command_buffer, UINT64_MAX});
         return &buffers_.back();
     }
@@ -3141,7 +3472,7 @@ private:
             }
         }
         if (res == VK_ERROR_DEVICE_LOST) {
-            context_.mark_device_lost();
+            context_.mark_device_lost("VulkanQueue::submit (vkQueueSubmit)", res);
             clear_waits();
             return false;
         }

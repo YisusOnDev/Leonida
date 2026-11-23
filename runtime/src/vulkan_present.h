@@ -182,7 +182,9 @@ public:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
-            vk.vkQueueWaitIdle(queue_);
+            const VkResult idle = vk.vkQueueWaitIdle(queue_);
+            if (idle == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::~VulkanPresenter (vkQueueWaitIdle)", idle);
             // A WSI layer may perform a device-wide idle while destroying the swapchain.
             // Keep that implicit idle serialized with submits from every context queue.
             release(swapchain_);
@@ -432,6 +434,7 @@ private:
                         bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
         last_tore_ = false;
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
+        if (context_.is_device_lost()) return VK_ERROR_DEVICE_LOST;
         if (surface_lost_) {  // the window's display went away under a presented swapchain
             // Try to make a new surface for the same window (the hwnd is retained by the factory's callback).
             // Until that succeeds, vkd3d's precedent keeps rendering to nothing: the frame is not shown, but
@@ -469,8 +472,11 @@ private:
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         Frame& frame = frames_[frame_index_ % frames_.size()];
-        if (const VkResult waited = vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX); waited != VK_SUCCESS)
+        if (const VkResult waited = vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX); waited != VK_SUCCESS) {
+            if (waited == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::submit_now (vkWaitForFences)", waited);
             return stop(waited);
+        }
 
         std::uint32_t image = 0;
         VkResult acquired = acquire(frame.acquired, &image);
@@ -486,6 +492,10 @@ private:
             captured_ = false;  // nothing was acquired, nothing was shown
             mark_surface_lost();
             return VK_SUCCESS;
+        }
+        if (acquired == VK_ERROR_DEVICE_LOST) {
+            context_.mark_device_lost("VulkanPresenter::submit_now (vkAcquireNextImageKHR)", acquired);
+            return acquired;
         }
         if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
@@ -547,6 +557,8 @@ private:
         };
         if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
         if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
+            if (reset == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::submit_now (vkResetFences)", reset);
             rollback();
             return stop(reset);
         }
@@ -588,7 +600,13 @@ private:
             if (tracker_lock.owns_lock()) tracker_lock.unlock();
             if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
         }
-        if (submitted != VK_SUCCESS) return give_back(frame, submitted);
+        if (submitted != VK_SUCCESS) {
+            if (submitted == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::submit_now (vkQueueSubmit)", submitted);
+            return give_back(frame, submitted);
+        }
+        if (result == VK_ERROR_DEVICE_LOST)
+            context_.mark_device_lost("VulkanPresenter::submit_now (vkQueuePresentKHR)", result);
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
@@ -653,7 +671,11 @@ private:
     // present, which gives back the image that was never presented. Returns `failure`, the error to report.
     VkResult give_back(Frame& frame, VkResult failure) {
         const VkDevice device = context_.device();
-        if (vkResetFences_(device, 1, &frame.done) != VK_SUCCESS) return stop(failure);
+        if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
+            if (reset == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::give_back (vkResetFences)", reset);
+            return stop(failure);
+        }
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit_info.waitSemaphoreCount = 1;
@@ -664,7 +686,11 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             submitted = context_.vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
         }
-        if (submitted != VK_SUCCESS) return stop(failure);
+        if (submitted != VK_SUCCESS) {
+            if (submitted == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::give_back (vkQueueSubmit)", submitted);
+            return stop(failure);
+        }
         stale_ = true;
         return failure;
     }
@@ -693,7 +719,9 @@ private:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
-            vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+            const VkResult idle = vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+            if (idle == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::mark_surface_lost (vkQueueWaitIdle)", idle);
             release(swapchain_);
         }
         swapchain_ = VK_NULL_HANDLE;
@@ -782,7 +810,9 @@ private:
             return true;
         {
             std::lock_guard lock(context_.submit_mutex());
-            context_.vk.vkQueueWaitIdle(queue_);  // the old target may still be in use
+            const VkResult idle = context_.vk.vkQueueWaitIdle(queue_);  // the old target may still be in use
+            if (idle == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::prepare_compose (vkQueueWaitIdle)", idle);
         }
         bool changed = false;
         return composer_->ensure_target(extent_, changed);
@@ -1033,7 +1063,9 @@ private:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
-            vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+            const VkResult idle = vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+            if (idle == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("VulkanPresenter::recreate (vkQueueWaitIdle)", idle);
         }
         stale_ = true;  // until this succeeds
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
