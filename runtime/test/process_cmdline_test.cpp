@@ -121,7 +121,8 @@ void check_import_names() {
         }
     }
     for (const char* dll : {"api-ms-win-crt-runtime-l1-1-0.dll", "ucrtbase.dll", "ucrtbased.dll"})
-        for (const char* name : {"_get_narrow_winmain_command_line", "_get_wide_winmain_command_line"})
+        for (const char* name : {"_get_narrow_winmain_command_line", "_get_wide_winmain_command_line",
+                                 "_crt_at_quick_exit", "quick_exit"})
             if (!rt::shims::find(dll, name)) {
                 std::fprintf(stderr, "FAIL %s!%s is not shimmed\n", dll, name);
                 ++failures;
@@ -215,6 +216,12 @@ void check_getmainargs_environment() {
         ++failures;
     }
 }
+// A quick-exit handler from an earlier run must never reach a later one. ExitProcess makes this fail even when
+// end_run's parked game thread wins the race to shut down this test process after the last run.
+void stale_quick_exit_handler() {
+    std::fprintf(stderr, "FAIL quick_exit ran a handler registered in an earlier run\n");
+    ExitProcess(1);
+}
 }  // namespace
 
 int main() {
@@ -240,7 +247,12 @@ int main() {
     // If the entry thread exits via ExitThread() without going through end_run(), run_entry() must preserve its exit
     // code (and claim g_exited before closing g_done).
     {
-        auto exit_thread_entry = +[](void*) -> DWORD { ExitThread(42); };
+        auto exit_thread_entry = +[](void*) -> DWORD {
+            using Register = int(__cdecl*)(void(__cdecl*)());
+            const auto reg = reinterpret_cast<Register>(rt::shims::find("ucrtbase.dll", "_crt_at_quick_exit"));
+            if (!reg || reg(stale_quick_exit_handler) != 0) ExitThread(1);
+            ExitThread(42);
+        };
         const int code = rt::process::run_entry(reinterpret_cast<void*>(exit_thread_entry), 0);
         if (code != 42) {
             std::fprintf(stderr, "FAIL run_entry with ExitThread(42) returned %d, want 42\n", code);
@@ -273,5 +285,12 @@ int main() {
     std::printf("process_cmdline: GetCommandLineW parses back to __wargv, non-ASCII arguments intact (code page %u); "
                 "the WinMain line and the kernelbase/API-set names are the game's\n",
                 GetACP());
-    return 0;
+    std::fflush(stdout);
+    // Last: quick_exit parks its thread until the host process exits, just as it does under gta6rt --run.
+    auto quick_exit_entry = +[](void*) -> DWORD {
+        using Exit = void(__cdecl*)(int);
+        reinterpret_cast<Exit>(rt::shims::find("ucrtbase.dll", "quick_exit"))(0);
+        return 1;
+    };
+    return rt::process::run_entry(reinterpret_cast<void*>(quick_exit_entry), 0);
 }

@@ -11,8 +11,9 @@
 //     shares with gta6rt. exit() runs it newest first, as the CRT does, before the run ends; _exit(), _Exit(),
 //     quick_exit(), ExitProcess() and abort() do not. _cexit() runs it and returns, _c_exit() returns. A second
 //     thread that calls exit(), _exit(), _Exit() or quick_exit() while the first is leaving waits, as with the
-//     CRT's exit lock. Not covered yet: at_quick_exit() handlers (quick_exit() runs none) and the thread-local
-//     destructor callback (_register_thread_local_exe_atexit_callback); both still reach the host CRT.
+//     CRT's exit lock. at_quick_exit() registrations have a separate table, run only by quick_exit(), newest first.
+//     Not covered yet: the thread-local destructor callback (_register_thread_local_exe_atexit_callback), which
+//     still reaches the host CRT.
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 // The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
@@ -100,17 +101,18 @@ std::string narrow(const std::wstring& w) {
     ExitProcess(static_cast<UINT>(g_exit_code.load()));
 }
 
-// ---- the game's atexit table
+// ---- the game's normal and quick-exit tables
 using AtexitFn = void(__cdecl*)();
 using OnexitFn = int(__cdecl*)();
 std::mutex g_atexit_lock;
 std::vector<AtexitFn> g_atexit;
+std::vector<AtexitFn> g_at_quick_exit;
 std::atomic<DWORD> g_exiting_thread{0};
 
-bool register_atexit(AtexitFn fn) {
+bool register_exit_handler(std::vector<AtexitFn>& handlers, AtexitFn fn) {
     std::lock_guard<std::mutex> lock(g_atexit_lock);
     try {
-        g_atexit.push_back(fn);
+        handlers.push_back(fn);
     } catch (const std::bad_alloc&) {
         return false;  // the CRT reports a full table as a failed registration
     }
@@ -118,14 +120,14 @@ bool register_atexit(AtexitFn fn) {
 }
 
 // Newest first. A handler registered while the handlers run goes on the end and so runs next, as in the UCRT.
-void run_atexit_handlers() {
+void run_exit_handlers(std::vector<AtexitFn>& handlers) {
     for (;;) {
         AtexitFn fn;
         {
             std::lock_guard<std::mutex> lock(g_atexit_lock);
-            if (g_atexit.empty()) return;
-            fn = g_atexit.back();
-            g_atexit.pop_back();
+            if (handlers.empty()) return;
+            fn = handlers.back();
+            handlers.pop_back();
         }
         fn();
     }
@@ -133,13 +135,17 @@ void run_atexit_handlers() {
 
 // UCRT: int _crt_atexit(_PVFV), 0 on success. MSVC's atexit() and the static destructors of an EXE reach it.
 int __cdecl game_crt_atexit(AtexitFn fn) {
-    return fn && register_atexit(fn) ? 0 : -1;
+    return fn && register_exit_handler(g_atexit, fn) ? 0 : -1;
+}
+// MSVC's at_quick_exit() reaches this separate UCRT registration function.
+int __cdecl game_crt_at_quick_exit(AtexitFn fn) {
+    return fn && register_exit_handler(g_at_quick_exit, fn) ? 0 : -1;
 }
 // msvcrt.dll (MinGW): int atexit(void (*)(void)) and _onexit_t _onexit(_onexit_t).
 int __cdecl game_msvcrt_atexit(AtexitFn fn) { return game_crt_atexit(fn); }
 OnexitFn __cdecl game_onexit(OnexitFn fn) {
     // its int result is ignored, as the CRT ignores it
-    return fn && register_atexit(reinterpret_cast<AtexitFn>(fn)) ? fn : nullptr;
+    return fn && register_exit_handler(g_atexit, reinterpret_cast<AtexitFn>(fn)) ? fn : nullptr;
 }
 
 // ---- the way out
@@ -157,17 +163,22 @@ bool take_exit_lock() {
 }
 // exit(): the game's handlers and static destructors, then the end of the run.
 void __cdecl game_exit(int code) {
-    if (take_exit_lock()) run_atexit_handlers();
+    if (take_exit_lock()) run_exit_handlers(g_atexit);
     end_run(code);
 }
-// _exit(), _Exit(), quick_exit(): the end of the run without the atexit handlers.
+// quick_exit(): only the quick-exit table, without static destructors or the normal atexit table.
 void __cdecl game_quick_exit(int code) {
+    if (take_exit_lock()) run_exit_handlers(g_at_quick_exit);
+    end_run(code);
+}
+// _exit(), _Exit(): the end of the run without either handler table.
+void __cdecl game_immediate_exit(int code) {
     take_exit_lock();
     end_run(code);
 }
 // _cexit() runs the handlers and flushes the streams, then returns; _c_exit() only returns.
 void __cdecl game_cexit() {
-    run_atexit_handlers();
+    run_exit_handlers(g_atexit);
     std::fflush(nullptr);
 }
 void __cdecl game_c_exit() {}
@@ -380,6 +391,7 @@ int run_entry(void* entry, size_t stack_bytes) {
     {
         std::lock_guard<std::mutex> lock(g_atexit_lock);
         g_atexit.clear();  // a run never sees the handlers of an earlier one
+        g_at_quick_exit.clear();
     }
     g_exiting_thread = 0;
     g_exited = false;
@@ -421,10 +433,11 @@ int run_entry(void* entry, size_t stack_bytes) {
 namespace {
 using namespace rt::process;
 #define UCRT(dll) \
-    {dll, "exit", reinterpret_cast<void*>(&game_exit)}, {dll, "_exit", reinterpret_cast<void*>(&game_quick_exit)}, \
-    {dll, "_Exit", reinterpret_cast<void*>(&game_quick_exit)}, \
+    {dll, "exit", reinterpret_cast<void*>(&game_exit)}, {dll, "_exit", reinterpret_cast<void*>(&game_immediate_exit)}, \
+    {dll, "_Exit", reinterpret_cast<void*>(&game_immediate_exit)}, \
     {dll, "quick_exit", reinterpret_cast<void*>(&game_quick_exit)}, \
     {dll, "_crt_atexit", reinterpret_cast<void*>(&game_crt_atexit)}, \
+    {dll, "_crt_at_quick_exit", reinterpret_cast<void*>(&game_crt_at_quick_exit)}, \
     {dll, "_cexit", reinterpret_cast<void*>(&game_cexit)}, {dll, "_c_exit", reinterpret_cast<void*>(&game_c_exit)}, \
     {dll, "abort", reinterpret_cast<void*>(&game_abort)}, {dll, "__p___argc", reinterpret_cast<void*>(&game_p_argc)}, \
     {dll, "__p___argv", reinterpret_cast<void*>(&game_p_argv)}, \
@@ -446,7 +459,7 @@ SHIM_TABLE(process,
     UCRT("ucrtbase.dll"),
     UCRT("ucrtbased.dll"),  // the Debug UCRT: a Debug build of the stand-in game (run_tiny_game) links it
     {"msvcrt.dll", "exit", reinterpret_cast<void*>(&game_exit)},
-    {"msvcrt.dll", "_exit", reinterpret_cast<void*>(&game_quick_exit)},
+    {"msvcrt.dll", "_exit", reinterpret_cast<void*>(&game_immediate_exit)},
     {"msvcrt.dll", "atexit", reinterpret_cast<void*>(&game_msvcrt_atexit)},
     {"msvcrt.dll", "_onexit", reinterpret_cast<void*>(&game_onexit)},
     {"msvcrt.dll", "_cexit", reinterpret_cast<void*>(&game_cexit)},

@@ -4,10 +4,12 @@
 //   return        main returns: handlers and static destructors run, in reverse order of registration
 //   exit          exit(7): the same
 //   _exit         _exit(8): no handlers, no destructors
-//   quick_exit    quick_exit(9): no atexit handlers, no destructors
+//   _Exit         _Exit(8): no handlers, no destructors
+//   quick_exit    quick_exit(9): only at_quick_exit handlers, in reverse order
 //   ExitProcess   ExitProcess(10): no handlers, no destructors
 //   cexit         _cexit() runs every handler and returns; main then returns 11
 //   c_exit        _c_exit() runs none and returns; main then returns 12, and exit runs them all
+//   cexit_quick_exit  _cexit() runs atexit handlers, then quick_exit(13) runs the separate quick-exit table
 //   concurrent_exit  a second thread calls _exit(7) while exit(7) runs a handler: it waits for them all
 // One handler registers another while the handlers run: it must still run, next.
 #include <windows.h>
@@ -46,6 +48,14 @@ void handler_registers() {
     std::atexit(handler_late);
 }
 
+void quick_handler_one() { say("at_quick_exit one"); }
+void quick_handler_two() { say("at_quick_exit two"); }
+void quick_handler_late() { say("at_quick_exit late"); }
+void quick_handler_registers() {
+    say("at_quick_exit registers late");
+    std::at_quick_exit(quick_handler_late);
+}
+
 // concurrent_exit: while exit() runs this handler on the main thread, a second thread calls _exit(). The CRT lets
 // it go once the handlers are done, so either call may set the exit code: both use 7.
 HANDLE g_slow_started = nullptr;
@@ -67,6 +77,11 @@ int main(int argc, char** argv) {
     std::atexit(handler_one);
     std::atexit(handler_registers);
     std::atexit(handler_two);
+    if (std::at_quick_exit(quick_handler_one) != 0 || std::at_quick_exit(quick_handler_registers) != 0 ||
+        std::at_quick_exit(quick_handler_two) != 0) {
+        say("at_quick_exit registration failed");
+        return 1;
+    }
     say("main");
     if (!std::strcmp(mode, "concurrent_exit")) {
         g_slow_started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -76,12 +91,18 @@ int main(int argc, char** argv) {
     }
     if (!std::strcmp(mode, "exit")) std::exit(7);
     if (!std::strcmp(mode, "_exit")) _exit(8);
+    if (!std::strcmp(mode, "_Exit")) std::_Exit(8);
     if (!std::strcmp(mode, "quick_exit")) std::quick_exit(9);
     if (!std::strcmp(mode, "ExitProcess")) ExitProcess(10);
     if (!std::strcmp(mode, "cexit")) {
         _cexit();
         say("after _cexit");
         return 11;
+    }
+    if (!std::strcmp(mode, "cexit_quick_exit")) {
+        _cexit();
+        say("after _cexit");
+        std::quick_exit(13);
     }
     if (!std::strcmp(mode, "c_exit")) {
         _c_exit();

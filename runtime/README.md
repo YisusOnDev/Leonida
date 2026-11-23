@@ -345,11 +345,13 @@ It prints counts only; on the 1.0.2.1 corpus all 26,503 containers resolve.
 own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
 The game's `atexit` handlers and static destructors go to a table of the run's own (the CRT's process-wide one is
 shared with gta6rt): `exit` and a return from `main` run them newest first before the run ends, `_cexit` runs them and
-returns, and `_exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. `run_tiny_atexit` runs a stand-in
+returns, and `_exit`, `_Exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. `at_quick_exit` handlers
+have a separate table, run only by `quick_exit`, newest first; both tables are cleared at the start of each run.
+`run_tiny_atexit` runs a stand-in
 program natively and through `--run` for each of those paths (and for `_exit` from a second thread during `exit`) and
-holds both to the Windows sequence (under Wine, whose CRT differs, a native difference is only reported). Not covered
-yet: `at_quick_exit` handlers (`quick_exit` runs none) and the thread-local destructor callback
-(`_register_thread_local_exe_atexit_callback`); both still reach the host CRT.
+holds both to the Windows sequence, including quick-exit handlers and `_cexit` followed by `quick_exit` (under Wine,
+whose CRT differs, a native difference is only reported). Not covered yet: the thread-local destructor callback
+(`_register_thread_local_exe_atexit_callback`), which still reaches the host CRT.
 `run_tiny_frame` does it with a stand-in that imports `d3d12_xs.dll!D3D12XboxCreateDevice` and, with
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks
