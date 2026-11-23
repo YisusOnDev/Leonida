@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <future>
 #include <limits>
 #include <memory>
@@ -19,15 +20,25 @@ namespace {
 
 constexpr std::uint32_t period = 16000;  // us; round numbers keep the arithmetic readable
 
+// Every wait oversleeps: it wakes `oversleep_us` after the deadline it was given. `on_wake` (when set) runs at the
+// wake with the pacer's mutex released, like another thread that gets the mutex before the waiter takes it back.
 class DelayedWakeClock final : public FrameClock {
 public:
+    explicit DelayedWakeClock(std::uint64_t oversleep_us = period) : oversleep_us_(oversleep_us) {}
     std::uint64_t now_us() override { return now_; }
-    void wait(std::unique_lock<std::mutex>&, std::condition_variable&, std::uint64_t deadline_us) override {
-        now_ = deadline_us + period;
+    void wait(std::unique_lock<std::mutex>& lock, std::condition_variable&, std::uint64_t deadline_us) override {
+        now_ = deadline_us + oversleep_us_;
+        if (!on_wake) return;
+        lock.unlock();
+        on_wake();
+        lock.lock();
     }
+    void set_now_us(std::uint64_t now) { now_ = now; }
+    std::function<void()> on_wake;
 
 private:
     std::uint64_t now_ = 0;
+    std::uint64_t oversleep_us_;
 };
 
 struct Result {
@@ -69,6 +80,45 @@ std::uint64_t display_time(FramePacer& pacer, std::uint64_t token) {
 bool setup(FramePacer& pacer, std::uint32_t latency, std::uint32_t offset = 0) {
     return pacer.set_frame_interval(period, latency, 0) == pacer_hr::ok &&
            pacer.schedule_frame_event(frame_event_origin, offset, 0) == pacer_hr::ok;
+}
+
+// Latency 1 with a 10 ms period: token 1 at origin 1 (10 ms), presented late at 21 ms so it shows at 30 ms. A wait
+// from 22 ms with `timeout_ms` finds origin 2 (20 ms) due but the slot taken, and its clock wakes 35 ms in. It may
+// only succeed when the slot was free by its deadline (22 ms + timeout); otherwise it times out with the token
+// untouched, and a poll at 35 ms gets token 2. With `stats_on_wake`, a GetFrameStatisticsX call runs at the wake
+// before the waiter has its mutex back, and retires frame 1 first: the wait must still judge the slot by the time
+// the frame showed (30 ms), not by finding the slot free.
+int late_slot_wait(std::uint32_t timeout_ms, std::uint64_t oversleep_us, std::int32_t expected,
+                   bool stats_on_wake = false) {
+    DelayedWakeClock clock(oversleep_us);
+    FramePacer pacer(clock);
+    FrameStatistic display;
+    std::int32_t stats_hr = pacer_hr::false_;
+    if (stats_on_wake) clock.on_wake = [&] {
+        std::uint32_t count = 1;
+        stats_hr = pacer.get_frame_statistics(1, stat_display, &count, &display);
+    };
+    EXPECT(pacer.set_frame_interval(10000, 1, 0) == pacer_hr::ok);
+    EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+    clock.set_now_us(10000);
+    std::uint64_t token = 0;
+    EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
+    clock.set_now_us(21000);
+    EXPECT(pacer.check_present_token(1) == pacer_hr::ok);
+    pacer.commit_present_token(1, 1);
+    EXPECT(pacer.frames_in_flight() == 1);
+    clock.set_now_us(22000);
+    token = 99;
+    const std::int32_t hr = pacer.wait_frame_event(frame_event_origin, timeout_ms, 0, &token);
+    EXPECT(clock.now_us() == 35000);  // the wait slept, and woke late
+    if (stats_on_wake) EXPECT(stats_hr == pacer_hr::ok && display.time_us == 30000);
+    EXPECT(hr == expected);
+    if (expected == pacer_hr::timeout) {
+        EXPECT(token == 99 && pacer.tokens_issued() == 1);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+    }
+    EXPECT(token == 2 && pacer.tokens_issued() == 2 && pacer.frames_in_flight() == 0);
+    return 0;
 }
 
 }  // namespace
@@ -218,6 +268,15 @@ int main() {
         EXPECT(token == 99 && pacer.tokens_issued() == 0);
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
     }
+
+    // A delayed wake cannot let a slot that frees after the deadline satisfy the wait (late_slot_wait above).
+    EXPECT(late_slot_wait(5, 8000, pacer_hr::timeout) == 0);  // deadline 27 ms, slot free at 30 ms, wake at 35 ms
+    EXPECT(late_slot_wait(8, 5000, pacer_hr::ok) == 0);       // slot free exactly at the deadline (30 ms)
+    EXPECT(late_slot_wait(10, 5000, pacer_hr::ok) == 0);      // free at 30 ms, deadline 32 ms; the late wake is fine
+    // The same, with another call retiring frame 1 between the wake and the waiter taking its mutex back.
+    EXPECT(late_slot_wait(5, 8000, pacer_hr::timeout, true) == 0);
+    EXPECT(late_slot_wait(8, 5000, pacer_hr::ok, true) == 0);
+    EXPECT(late_slot_wait(10, 5000, pacer_hr::ok, true) == 0);
 
     // Latency 1: a frame presented late is still in flight at the next origin, so the wait holds until it is shown.
     {

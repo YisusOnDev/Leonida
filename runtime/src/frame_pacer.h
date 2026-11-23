@@ -359,6 +359,7 @@ public:
         suspended_ = true;
         interval_set_ = armed_ = false;
         pending_.clear();
+        shown_us_.clear();
         cv_.notify_all();
     }
     // ResumeX: presents work again, but the interval and the origin event must be set up again.
@@ -428,6 +429,8 @@ private:
                     r.display_us = pending_.front().flip_us;
                     r.percent_scanned = pending_.front().percent_scanned;
                 }
+            shown_us_.push_back(pending_.front().flip_us);
+            if (shown_us_.size() > latency_) shown_us_.pop_front();
             pending_.pop_front();
         }
     }
@@ -450,12 +453,18 @@ private:
                 if (records_.size() > 64) records_.pop_front();
                 return pacer_hr::ok;
             }
+            // The wait is judged as of `at`: after a late wake, an origin or a free latency slot that came after the
+            // deadline does not count. Frames in flight then are the queued ones and those shown after `at`, which
+            // this call or another one (GetFrameStatisticsX, a present) may already have retired.
+            const std::uint64_t at = std::min(now, give_up);
+            auto in_flight = pending_.size();
+            for (auto it = shown_us_.rbegin(); it != shown_us_.rend() && *it > at; ++it) ++in_flight;
             const std::uint64_t first = epoch_us_ + offset_us_;  // origin 0
             const std::int64_t next = last_origin_ + 1;
             const std::uint64_t next_us = first + std::uint64_t(next) * period_us_;
             std::uint64_t wake = next_us;
-            if (now >= next_us && next_us <= give_up) {
-                if (pending_.size() < latency_) {
+            if (next_us <= at) {
+                if (in_flight < latency_) {
                     const std::int64_t newest = std::int64_t((now - first) / period_us_);
                     const std::int64_t origin = std::max(next, newest);
                     last_origin_ = origin;
@@ -468,7 +477,9 @@ private:
                     if (records_.size() > 64) records_.pop_front();
                     return pacer_hr::ok;
                 }
-                wake = pending_.front().flip_us;  // blocked by the latency: until the oldest frame is shown
+                // Blocked by the latency: until the oldest frame is shown. With none queued, the slot freed after
+                // the deadline, which has passed.
+                if (!pending_.empty()) wake = pending_.front().flip_us;
             }
             if (give_up != no_deadline && now >= give_up) return pacer_hr::timeout;
             clock_.wait(lock, cv_, give_up == no_deadline ? wake : std::min(wake, give_up));
@@ -494,6 +505,7 @@ private:
     std::uint64_t last_presented_ = 0;
     std::uint64_t immediate_presents_ = 0;
     std::deque<Pending> pending_;
+    std::deque<std::uint64_t> shown_us_;  // when the last `latency_` frames were shown (flip_us), oldest first
     std::deque<Record> records_;
 };
 
