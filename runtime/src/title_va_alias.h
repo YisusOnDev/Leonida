@@ -1,19 +1,22 @@
 #pragma once
-// Title-chosen buffer VAs (Xbox device slot 133) and the console VA a translated shader reaches them by
-// (docs/d3d12_vulkan.md section 3.3, "Title-placed buffers").
+// Buffer addresses in the title's own memory and the console VA a translated shader reaches them by
+// (docs/d3d12_vulkan.md section 3.3, "Title-chosen addresses").
 //
 // A translated shader computes heap_base + console_va, with heap_base the GPU address arena's device address. The
-// layer chooses every console VA it hands out, so they all land in the arena, but slot 133 places a buffer at a VA
-// the title chose: the CPU address of its own pages (about 1.5 TiB on Windows), far past the arena. A shader that
-// adds heap_base to that VA reads nothing the layer made. So where the layer itself writes an address a shader will
-// dereference (a root CBV/SRV/UAV, and the V# of a CBV or a buffer SRV/UAV), an address inside a title-placed
-// buffer is replaced by the console VA of the buffer's GPU copy: its arena offset when the copy is an arena range
-// (the slot-133 shadow), or its device address minus heap_base (mod 2^64) when it has its own memory (an imported
-// buffer). Everything else is passed through unchanged. Addresses the title writes into memory itself (a V# it
-// builds in its own constant data) are not seen by the layer and keep the title's VA.
+// layer chooses every console VA it hands out, so they all land in the arena. The title does not always use them:
+//   - device slot 133 places a buffer at the CPU address of the title's own pages (about 1.5 TiB on Windows);
+//   - the title points V#s and root views at its own memory (a per-frame constant ring, #8862 section 3.5).
+// Both are far past the arena, so heap_base + VA reads nothing the layer made. An address inside such a range is
+// therefore replaced, wherever the layer can see it, by the console VA of a GPU copy of that range: its arena offset
+// when the copy is an arena range (a slot-133 shadow, or a window of the title's pages copied before every
+// submission), or its device address minus heap_base (mod 2^64) when it has its own memory (an imported slot-133
+// buffer). Addresses that are not in the title's memory are passed through unchanged.
 //
-// The table is process-wide, like the title's address space: a title VA names one buffer at a time. It depends only
-// on the standard library, so it is tested without a GPU (title_va_alias_test).
+// The table is process-wide, like the title's address space. The device behind it registers two hooks: a resolver
+// that makes a GPU copy for an address in the title's memory that has none yet, and a scanner that rewrites the
+// buffer V#s of a bound descriptor table before a submission. Without hooks the table only translates what was
+// added to it, so it is tested without a GPU (title_va_alias_test).
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +29,16 @@ namespace leonida {
 
 class TitleVaAliases {
 public:
+    // Where the layer saw the address, for the counters.
+    enum Kind : unsigned { root_view, created_view, table_view, vertex_view, index_view, kind_count };
+    static constexpr const char* kKindNames[kind_count] = {"root view", "created view", "table V#", "vertex view",
+                                                           "index view"};
+
+    // An address in the title's memory: true, with `shader_va` what a shader must be given (the address itself when
+    // no copy could be made). False: not the title's memory (an arena VA, a buffer of the layer's).
+    using Resolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, std::uint64_t& shader_va);
+    using TableScanner = void (*)(void* context, std::uint64_t table_va);
+
     // [title_va, title_va + bytes) is reached as [shader_va, shader_va + bytes). A range that overlaps a live one
     // replaces it (the title has placed a new buffer over pages it released). False for an empty or wrapping range.
     bool add(std::uint64_t title_va, std::uint64_t bytes, std::uint64_t shader_va) {
@@ -37,7 +50,7 @@ public:
         return true;
     }
 
-    // Forgets the range that starts at title_va, if it still maps to shader_va (a newer buffer at the same VA keeps
+    // Forgets the range that starts at title_va, if it still maps to shader_va (a newer range at the same VA keeps
     // its own entry).
     void remove(std::uint64_t title_va, std::uint64_t shader_va) {
         std::unique_lock lock(mutex_);
@@ -46,9 +59,10 @@ public:
         count_.store(ranges_.size(), std::memory_order_release);
     }
 
-    // The address a shader must be given for `va`: translated inside a title-placed buffer, unchanged elsewhere.
+    // The address a shader must be given for `va` from the ranges added so far: translated inside one, unchanged
+    // elsewhere. No copy is made here.
     std::uint64_t shader_va(std::uint64_t va) const {
-        if (!count_.load(std::memory_order_acquire)) return va;  // the common case: no title-placed buffer
+        if (!count_.load(std::memory_order_acquire)) return va;  // the common case: no title range at all
         std::shared_lock lock(mutex_);
         auto it = ranges_.upper_bound(va);
         if (it == ranges_.begin()) return va;
@@ -57,12 +71,81 @@ public:
         return it->second.shader_va + (va - it->first);
     }
 
+    // The free span around `va` (not in any range): [lo, hi). A copy made for `va` must stay inside it, so it never
+    // replaces a range another buffer still uses.
+    void gap(std::uint64_t va, std::uint64_t& lo, std::uint64_t& hi) const {
+        std::shared_lock lock(mutex_);
+        lo = 0;
+        hi = UINT64_MAX;
+        auto it = ranges_.upper_bound(va);
+        if (it != ranges_.end()) hi = it->first;
+        if (it != ranges_.begin()) lo = std::prev(it)->second.end;
+    }
+
+    // shader_va, and when `va` is in the title's memory with no copy yet, a copy made by the device's resolver.
+    // Counted by kind: translated, or in the title's memory and left as it was.
+    std::uint64_t resolve(std::uint64_t va, std::uint64_t bytes, Kind kind) {
+        if (!va) return va;
+        std::uint64_t to = shader_va(va);
+        if (to != va) {
+            translated_[kind].fetch_add(1, std::memory_order_relaxed);
+            return to;
+        }
+        Resolver resolver;
+        void* context;
+        {
+            std::lock_guard lock(hook_mutex_);
+            resolver = resolver_;
+            context = hook_context_;
+        }
+        if (!resolver || !resolver(context, va, bytes, to)) return va;
+        (to != va ? translated_ : untranslated_)[kind].fetch_add(1, std::memory_order_relaxed);
+        return to;
+    }
+
+    // Counts an address that the layer resolves through its buffer index instead (vertex and index views): only
+    // whether it is in a title range.
+    void note(std::uint64_t va, Kind kind) {
+        if (va && shader_va(va) != va) untranslated_[kind].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Before a submission: the device rewrites the buffer V#s of the table at `table_va` (a console VA in one of its
+    // shader-visible CBV/SRV/UAV heaps).
+    void scan_table(std::uint64_t table_va) {
+        TableScanner scanner;
+        void* context;
+        {
+            std::lock_guard lock(hook_mutex_);
+            scanner = scanner_;
+            context = hook_context_;
+        }
+        if (scanner) scanner(context, table_va);
+    }
+
+    // The first device to register keeps the hooks until it clears them.
+    void set_hooks(void* context, Resolver resolver, TableScanner scanner) {
+        std::lock_guard lock(hook_mutex_);
+        if (hook_context_) return;
+        hook_context_ = context;
+        resolver_ = resolver;
+        scanner_ = scanner;
+    }
+    void clear_hooks(void* context) {
+        std::lock_guard lock(hook_mutex_);
+        if (hook_context_ != context) return;
+        hook_context_ = nullptr;
+        resolver_ = nullptr;
+        scanner_ = nullptr;
+    }
+
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
+    std::uint64_t translated(Kind kind) const { return translated_[kind].load(std::memory_order_relaxed); }
+    std::uint64_t untranslated(Kind kind) const { return untranslated_[kind].load(std::memory_order_relaxed); }
 
 private:
     struct Range {
         std::uint64_t end;        // exclusive
-        std::uint64_t shader_va;  // what title_va becomes
+        std::uint64_t shader_va;  // what the range's first byte becomes
     };
 
     void erase_overlapping(std::uint64_t begin, std::uint64_t end) {
@@ -77,10 +160,15 @@ private:
     mutable std::shared_mutex mutex_;
     std::map<std::uint64_t, Range> ranges_;  // by title VA
     std::atomic<std::size_t> count_{0};
+    std::mutex hook_mutex_;
+    void* hook_context_ = nullptr;
+    Resolver resolver_ = nullptr;
+    TableScanner scanner_ = nullptr;
+    std::array<std::atomic<std::uint64_t>, kind_count> translated_{};
+    std::array<std::atomic<std::uint64_t>, kind_count> untranslated_{};
 };
 
-// The process's table: the slot-133 buffers add and remove their ranges, the command lists and descriptor writers
-// read it.
+// The process's table: the device's title ranges and hooks, read by the command lists and descriptor writers.
 inline TitleVaAliases& title_va_aliases() {
     static TitleVaAliases aliases;
     return aliases;

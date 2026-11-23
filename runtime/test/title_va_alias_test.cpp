@@ -27,6 +27,19 @@ int main() {
     EXPECT(a.shader_va(title - 1) == title - 1);
     EXPECT(a.shader_va(title + size) == title + size);
     EXPECT(a.shader_va(arena) == arena);
+    // The free span around an address: between the ranges, so a window made for it never covers one.
+    std::uint64_t lo = 1, hi = 1;
+    a.gap(title + size + 5, lo, hi);
+    EXPECT(lo == title + size && hi == UINT64_MAX);
+    a.gap(title - 5, lo, hi);
+    EXPECT(lo == 0 && hi == title);
+    // Without a device's resolver, resolve only translates what was added, and counts it.
+    EXPECT(a.resolve(title + 4, 4, leonida::TitleVaAliases::root_view) == arena + 4);
+    EXPECT(a.resolve(title - 4, 4, leonida::TitleVaAliases::root_view) == title - 4);
+    EXPECT(a.translated(leonida::TitleVaAliases::root_view) == 1);
+    a.note(title + 8, leonida::TitleVaAliases::vertex_view);
+    a.note(title - 8, leonida::TitleVaAliases::vertex_view);
+    EXPECT(a.untranslated(leonida::TitleVaAliases::vertex_view) == 1);
     // A wrapping target (an import below heap_base) is kept as is: modular arithmetic.
     constexpr std::uint64_t below = 0xFFFFFFFFFFF00000ull;
     EXPECT(a.add(title + 0x100000, size, below) && a.shader_va(title + 0x100010) == below + 0x10);
