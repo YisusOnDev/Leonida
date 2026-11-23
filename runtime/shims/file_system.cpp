@@ -280,8 +280,8 @@ Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& 
     return Parsed::Console;
 }
 
-Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
-    return parse_console_parts(path, parts);
+Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts, bool create_scratch = true) {
+    return parse_console_parts(path, parts, nullptr, create_scratch);
 }
 
 std::filesystem::path join(const std::filesystem::path& root, const std::vector<std::wstring>& parts) {
@@ -2336,6 +2336,97 @@ UINT WINAPI get_drive_type_a(LPCSTR root_path) {
     return get_drive_type_w(wide.c_str());
 }
 
+// Resolve the backing volume without exposing its host root to the title.
+bool volume_host_root(const std::wstring& name, std::wstring& result) {
+    const Roots r = roots();
+    size_t prefix = 0;
+    const Drive drive = console_drive(name, prefix);
+    const bool package_volume = drive == Drive::Game && prefix == 2;
+    auto dir = package_volume ? r.game : r.overlay;
+    const DWORD attributes = dir.empty() ? INVALID_FILE_ATTRIBUTES : ::GetFileAttributesW(dir.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (package_volume || r.game.empty() || ::GetFileAttributesW(r.game.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        if (dir.empty()) dir = r.game;
+        while (!dir.empty() && ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            const auto parent = dir.parent_path();
+            if (parent == dir) break;
+            dir = parent;
+        }
+    }
+    if (dir.empty() || ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return fail_bool(ERROR_PATH_NOT_FOUND);
+    wchar_t root[MAX_PATH]{};
+    if (!::GetVolumePathNameW(dir.c_str(), root, MAX_PATH)) return false;
+    result = root;
+    return true;
+}
+
+BOOL WINAPI get_volume_information_w(LPCWSTR name, LPWSTR label, DWORD label_size, LPDWORD serial,
+                                     LPDWORD max_component, LPDWORD flags, LPWSTR filesystem, DWORD filesystem_size) {
+    if (!name) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts, false);
+    if (parsed == Parsed::Host) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Refused || !drive_root(name, parts)) return fail_bool(ERROR_INVALID_NAME);
+    std::wstring root;
+    if (!volume_host_root(name, root)) return FALSE;
+    return ::GetVolumeInformationW(root.c_str(), label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+}
+
+BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size, LPDWORD serial,
+                                     LPDWORD max_component, LPDWORD flags, LPSTR filesystem, DWORD filesystem_size) {
+    if (!name) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts, false);
+    if (parsed == Parsed::Host) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Refused || !drive_root(wide, parts)) return fail_bool(ERROR_INVALID_NAME);
+    std::wstring root;
+    if (!volume_host_root(wide, root)) return FALSE;
+    // Keep the mount path Unicode; only the two returned strings use the caller's ANSI code page.
+    wchar_t wide_label[MAX_PATH]{}, wide_filesystem[MAX_PATH]{};
+    if (!::GetVolumeInformationW(root.c_str(), label && label_size ? wide_label : nullptr,
+                                 label && label_size ? MAX_PATH : 0, serial, max_component, flags,
+                                 filesystem && filesystem_size ? wide_filesystem : nullptr,
+                                 filesystem && filesystem_size ? MAX_PATH : 0)) return FALSE;
+    if (label && label_size && !::WideCharToMultiByte(CP_ACP, 0, wide_label, -1, label,
+                                                       static_cast<int>(label_size > 0x7fffffffU ? 0x7fffffffU : label_size), nullptr, nullptr)) return FALSE;
+    if (filesystem && filesystem_size && !::WideCharToMultiByte(CP_ACP, 0, wide_filesystem, -1, filesystem,
+                                                                static_cast<int>(filesystem_size > 0x7fffffffU ? 0x7fffffffU : filesystem_size), nullptr, nullptr)) return FALSE;
+    return TRUE;
+}
+
+BOOL WINAPI get_volume_path_name_w(LPCWSTR name, LPWSTR output, DWORD size) {
+    if (!name) return ::GetVolumePathNameW(name, output, size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts, false);
+    if (parsed == Parsed::Host) return ::GetVolumePathNameW(name, output, size);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    size_t prefix = 0;
+    console_drive(name, prefix);
+    const std::wstring root = std::wstring(name, prefix) + L"\\";
+    if (!output || size <= root.size()) return fail_bool(ERROR_FILENAME_EXCED_RANGE);
+    std::wmemcpy(output, root.c_str(), root.size() + 1);
+    return TRUE;
+}
+
+BOOL WINAPI get_volume_path_name_a(LPCSTR name, LPSTR output, DWORD size) {
+    if (!name) return ::GetVolumePathNameA(name, output, size);
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts, false);
+    if (parsed == Parsed::Host) return ::GetVolumePathNameA(name, output, size);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    size_t prefix = 0;
+    console_drive(wide, prefix);
+    if (!output || size <= prefix + 1) return fail_bool(ERROR_FILENAME_EXCED_RANGE);
+    std::memcpy(output, name, prefix);
+    output[prefix] = '\\';
+    output[prefix + 1] = '\0';
+    return TRUE;
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -2371,6 +2462,10 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
 // file-l1-2-0 and file-l2-1-0 for CreateFile; ReadFile and its variants are in file-l1-1-0).
 #define FILE_API(dll)                                                                                    \
+    {dll, "GetVolumeInformationA", reinterpret_cast<void*>(&get_volume_information_a)},                   \
+        {dll, "GetVolumeInformationW", reinterpret_cast<void*>(&get_volume_information_w)},             \
+        {dll, "GetVolumePathNameA", reinterpret_cast<void*>(&get_volume_path_name_a)},                   \
+        {dll, "GetVolumePathNameW", reinterpret_cast<void*>(&get_volume_path_name_w)},                   \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \

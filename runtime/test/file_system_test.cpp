@@ -253,6 +253,103 @@ void run_checks(const std::filesystem::path& root) {
     check(rt::fs::game_dir() == package, "configure() sets the game folder");
     check(rt::fs::overlay_dir() == overlay, "configure() sets the overlay folder");
 
+    {
+        const auto info = resolve<decltype(&::GetVolumeInformationW)>("kernel32.dll", "GetVolumeInformationW");
+        const auto missing_overlay = root / "missing-overlay" / "child";
+        rt::fs::configure(package, missing_overlay);
+        check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()),
+              "volume query succeeds without creating the overlay");
+        const auto info_a_missing = resolve<decltype(&::GetVolumeInformationA)>("kernel32.dll", "GetVolumeInformationA");
+        const auto path_w_missing = resolve<decltype(&::GetVolumePathNameW)>("kernel32.dll", "GetVolumePathNameW");
+        const auto path_a_missing = resolve<decltype(&::GetVolumePathNameA)>("kernel32.dll", "GetVolumePathNameA");
+        wchar_t package_root[MAX_PATH]{}, overlay_root[MAX_PATH]{};
+        DWORD package_serial{}, package_flags{}, overlay_serial{}, overlay_flags{};
+        wchar_t package_fs[MAX_PATH]{}, overlay_fs[MAX_PATH]{};
+        const bool host_volumes = ::GetVolumePathNameW(package.c_str(), package_root, MAX_PATH) &&
+            ::GetVolumePathNameW(root.c_str(), overlay_root, MAX_PATH) &&
+            ::GetVolumeInformationW(package_root, nullptr, 0, &package_serial, nullptr, &package_flags, package_fs, MAX_PATH) &&
+            ::GetVolumeInformationW(overlay_root, nullptr, 0, &overlay_serial, nullptr, &overlay_flags, overlay_fs, MAX_PATH);
+        auto matches_volume = [&](const wchar_t* virtual_root, DWORD serial, DWORD flags, const wchar_t* fs) {
+            DWORD actual_serial{}, actual_flags{};
+            wchar_t actual_fs[MAX_PATH]{};
+            return info && info(virtual_root, nullptr, 0, &actual_serial, nullptr, &actual_flags, actual_fs, MAX_PATH) &&
+                actual_serial == serial && actual_flags == flags && std::wstring(actual_fs) == fs;
+        };
+        check(host_volumes && matches_volume(L"G:\\", package_serial, package_flags, package_fs),
+              "G: volume identity matches the host package volume");
+        check(host_volumes && matches_volume(L"T:\\", overlay_serial, overlay_flags, overlay_fs),
+              "T: volume identity matches the host overlay ancestor volume");
+        wchar_t root_w[MAX_PATH]{};
+        char root_a[MAX_PATH]{};
+        check(info && !info(L"T:\\..\\bad", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume information W leaves overlay absent");
+        check(info_a_missing && !info_a_missing("T:\\..\\bad", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume information A leaves overlay absent");
+        check(path_w_missing && !path_w_missing(L"T:\\..\\bad", root_w, MAX_PATH) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume path W leaves overlay absent");
+        check(path_a_missing && !path_a_missing("T:\\..\\bad", root_a, MAX_PATH) &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "rejected T: volume path A leaves overlay absent");
+        check(info && info(L"T:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              info_a_missing && info_a_missing("T:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              path_w_missing && path_w_missing(L"T:\\file", root_w, MAX_PATH) && std::wstring(root_w) == L"T:\\" &&
+              path_a_missing && path_a_missing("T:\\file", root_a, MAX_PATH) && std::string(root_a) == "T:\\" &&
+              !std::filesystem::exists(missing_overlay.parent_path()), "valid T: volume queries succeed without creating overlay");
+        DWORD serial_before{}, flags_before{}, serial_after{}, flags_after{};
+        DWORD serial_a_before{}, flags_a_before{}, serial_a_after{}, flags_a_after{};
+        wchar_t fs_before[MAX_PATH]{}, fs_after[MAX_PATH]{};
+        char fs_a_before[MAX_PATH]{}, fs_a_after[MAX_PATH]{};
+        const bool before = info && info(L"T:\\", nullptr, 0, &serial_before, nullptr, &flags_before, fs_before, MAX_PATH) &&
+            info_a_missing && info_a_missing("T:\\", nullptr, 0, &serial_a_before, nullptr, &flags_a_before, fs_a_before, MAX_PATH);
+        std::filesystem::create_directories(missing_overlay);
+        check(host_volumes && matches_volume(L"G:\\", package_serial, package_flags, package_fs) &&
+              matches_volume(L"T:\\", overlay_serial, overlay_flags, overlay_fs),
+              "G: and T: retain their host volume identities after overlay creation");
+        const bool after = info && info(L"T:\\", nullptr, 0, &serial_after, nullptr, &flags_after, fs_after, MAX_PATH) &&
+            info_a_missing && info_a_missing("T:\\", nullptr, 0, &serial_a_after, nullptr, &flags_a_after, fs_a_after, MAX_PATH);
+        check(before && after && serial_before == serial_after && flags_before == flags_after &&
+              std::wstring(fs_before) == fs_after && serial_a_before == serial_a_after &&
+              flags_a_before == flags_a_after && std::string(fs_a_before) == fs_a_after,
+              "T: volume identity stays stable when the overlay is created (W and A)");
+        std::filesystem::remove_all(missing_overlay.parent_path());
+        const auto missing_game = root / "missing-game";
+        rt::fs::configure(missing_game, missing_overlay);
+        check(info && !info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0) &&
+              !std::filesystem::exists(missing_game) && !std::filesystem::exists(missing_overlay.parent_path()),
+              "volume query does not recreate a missing game or overlay");
+        rt::fs::configure(package, overlay);
+        const auto path = resolve<decltype(&::GetVolumePathNameW)>("kernel32.dll", "GetVolumePathNameW");
+        wchar_t fs[MAX_PATH]{}, actual[MAX_PATH]{}, expected[MAX_PATH]{};
+        check(info && info(L"GAME:\\", nullptr, 0, nullptr, nullptr, nullptr, fs, MAX_PATH) && fs[0],
+              "GetVolumeInformationW returns the GAME filesystem");
+        check(path && path(L"GAME:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"GAME:\\",
+              "GetVolumePathNameW returns the virtual root");
+        const BOOL host_ok = ::GetVolumePathNameW(package.c_str(), expected, MAX_PATH);
+        check(path && host_ok && path(package.c_str(), actual, MAX_PATH) && std::wstring(actual) == expected,
+              "GetVolumePathNameW preserves host paths");
+        const auto info_a = resolve<decltype(&::GetVolumeInformationA)>("kernelbase.dll", "GetVolumeInformationA");
+        char ansi_label[MAX_PATH]{}, ansi_fs[MAX_PATH]{};
+        wchar_t wide_label[MAX_PATH]{}, wide_fs[MAX_PATH]{};
+        check(info && info_a && info(L"GAME:\\", wide_label, MAX_PATH, nullptr, nullptr, nullptr, wide_fs, MAX_PATH) &&
+              info_a("GAME:\\", ansi_label, MAX_PATH, nullptr, nullptr, nullptr, ansi_fs, MAX_PATH),
+              "both volume query variants return strings");
+        char expected_fs[MAX_PATH]{};
+        check(::WideCharToMultiByte(CP_ACP, 0, wide_fs, -1, expected_fs, MAX_PATH, nullptr, nullptr) &&
+              std::string(ansi_fs) == expected_fs, "ANSI volume filesystem matches the converted wide result");
+        const auto path_a = resolve<decltype(&::GetVolumePathNameA)>("kernelbase.dll", "GetVolumePathNameA");
+        char fs_a[MAX_PATH]{}, actual_a[MAX_PATH]{};
+        for (const char* drive : {"GAME:\\", "G:\\", "T:\\"}) {
+            check(info_a && info_a(drive, nullptr, 0, nullptr, nullptr, nullptr, fs_a, MAX_PATH) && fs_a[0],
+                  "GetVolumeInformationA returns the virtual drive filesystem");
+            check(path_a && path_a(drive, actual_a, MAX_PATH) && std::string(actual_a) == drive,
+                  "GetVolumePathNameA returns the virtual drive root");
+        }
+        check(path && path(L"G:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"G:\\" &&
+              path(L"T:\\sub\\f.bin", actual, MAX_PATH) && std::wstring(actual) == L"T:\\",
+              "GetVolumePathNameW returns G and T roots");
+        check(path && !path(L"GAME:\\sub", actual, 2), "GetVolumePathNameW rejects a short buffer");
+    }
+
     // The table the runtime installs: kernel32 and the api sets a GDK title links against.
     const auto create_w = resolve<CreateFileWFn>("kernel32.dll", "CreateFileW");
     const auto create_a = resolve<CreateFileAFn>("kernelbase.dll", "CreateFileA");
