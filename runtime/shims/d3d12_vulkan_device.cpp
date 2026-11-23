@@ -6662,6 +6662,12 @@ public:
             log_once("unordered-access view of a B8G8R8X8 format; format", int(view.format));
             return;
         }
+        // Nor do typed sRGB and depth formats (D3D-466): their images have no storage usage.
+        const DXGI_FORMAT named = view.format != DXGI_FORMAT_UNKNOWN ? view.format : r->desc().Format;
+        if (typed_without_uav(named)) {
+            log_once("unordered-access view in a format without typed UAV; format", int(named));
+            return;
+        }
         write_image_descriptor(*r, view, destination, true);
         state_.context->note_shader_image(r->id());
     }
@@ -8075,9 +8081,11 @@ private:
                             (desc.Flags & attachment) == attachment ||
                             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
-        // The PC runtime: simultaneous access only single-sampled and without depth-stencil, and no volume depth.
+        // The PC runtime: simultaneous access only single-sampled and without depth-stencil, no volume depth, and no
+        // depth-stencil with unordered access (as committed_resource_refusal).
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
-            (volume && depth_stencil))
+            (volume && depth_stencil) ||
+            (depth_stencil && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
         const bool tiled = is_tiled_layout(desc.Layout);
         if (tiled) {

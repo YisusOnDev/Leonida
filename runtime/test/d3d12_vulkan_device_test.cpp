@@ -5579,7 +5579,8 @@ int main() {
                                       DXGI_FORMAT_D32_FLOAT_S8X24_UINT}) {
                     for (auto dim : {D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                                      D3D12_RESOURCE_DIMENSION_TEXTURE3D})
-                    for (auto flags : {D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+                    for (auto flags : {D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                       D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
                         D3D12_RESOURCE_DESC desc = texture_desc(64, 1, f, flags, 1);
                         desc.Dimension = dim;
                         if (dim != D3D12_RESOURCE_DIMENSION_TEXTURE1D) desc.Height = 64;
@@ -5604,6 +5605,32 @@ int main() {
             } else {
                 std::printf("sRGB/depth with unordered access: no host D3D12 device to compare with, skipped\n");
             }
+            // Without a host (Linux, Wine) the layer still gives the answers the host gave above.
+            const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+            auto creates = [&](const D3D12_RESOURCE_DESC& desc) {
+                Ref<ID3D12Resource> resource;
+                return SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&resource.p)));
+            };
+            auto sized = [&](const D3D12_RESOURCE_DESC& desc) {
+                return device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX;
+            };
+            constexpr auto uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            for (DXGI_FORMAT f : {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                                  DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D16_UNORM}) {
+                D3D12_RESOURCE_DESC desc = texture_desc(64, 64, f, uav, 1);
+                EXPECT(creates(desc) && sized(desc));
+            }
+            for (DXGI_FORMAT f : {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT}) {
+                D3D12_RESOURCE_DESC desc = texture_desc(64, 64, f, uav, 1);
+                EXPECT(!creates(desc) && !sized(desc));
+            }
+            D3D12_RESOURCE_DESC depth = texture_desc(64, 64, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_NONE, 1);
+            depth.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            EXPECT(!creates(depth) && !sized(depth));
+            depth = texture_desc(64, 64, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | uav, 1);
+            EXPECT(!creates(depth) && !sized(depth));
         }
 
         const int options_mismatches = compare_feature_options(device.p, info);
