@@ -2341,6 +2341,16 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_subresource_copy COMMAND d3d12_subresource_copy_test)
     set_tests_properties(d3d12_subresource_copy PROPERTIES SKIP_RETURN_CODE 77)
 
+    # WriteToSubresource/ReadFromSubresource staged_copy() restores prior Vulkan layouts and leaves fresh COMMON
+    # textures in GENERAL, matching VK_EXT_host_image_copy across NVIDIA and AMD GPUs.
+    add_executable(d3d12_subresource_copy_layout_test test/d3d12_subresource_copy_layout_test.cpp)
+    target_link_libraries(d3d12_subresource_copy_layout_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_subresource_copy_layout_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_subresource_copy_layout_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_subresource_copy_layout COMMAND d3d12_subresource_copy_layout_test)
+    set_tests_properties(d3d12_subresource_copy_layout PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # MakeResident, Evict, SetResidencyPriority and EnqueueMakeResident, compared with the host runtime.
     add_executable(d3d12_residency_test test/d3d12_residency_test.cpp)
     target_link_libraries(d3d12_residency_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

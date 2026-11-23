@@ -2490,9 +2490,28 @@ private:
         return true;
     }
 
+    // Maps a tracked Vulkan layout back to the D3D12 enhanced-barrier layout that replays to it.
+    static std::uint32_t d3d12_layout_for_vk(VkImageLayout layout, bool presentable) {
+        namespace l = leonida::d3d12_layout;
+        switch (layout) {
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return l::render_target;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return l::depth_stencil_write;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return l::depth_stencil_read;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return l::shader_resource;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return l::copy_source;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return l::copy_dest;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: return presentable ? l::common : l::generic_read;
+        case VK_IMAGE_LAYOUT_GENERAL:
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+        case VK_IMAGE_LAYOUT_PREINITIALIZED:
+        default: return l::generic_read;  // always replays to VK_IMAGE_LAYOUT_GENERAL
+        }
+    }
+
     // A host-visible buffer at D3D12's footprint pitch, copied to or from the subresource by a CopyTextureRegion
     // replayed on the device's queue, then waited for. The replay handles the layout (and a first use's zero fill)
-    // exactly as it does for the application's own copies.
+    // exactly as it does for the application's own copies, then restores the subresource's prior Vulkan layout (or
+    // GENERAL for an untouched COMMON subresource) so CPU copies do not alter D3D12 resource state.
     template<class Pack, class Unpack>
     HRESULT staged_copy(bool write, UINT subresource, const Region& r, const Pack& pack, const Unpack& unpack) {
         auto& vk = device_.context->vk;
@@ -2536,24 +2555,49 @@ private:
             copy = {placed, 0, 0, 0, texture, true,
                     {r.box.left, r.box.top, r.box.front, r.box.right, r.box.bottom, r.box.back}};
         }
-        leonida::CommandList list;
-        if (!list.copy_texture(copy) || !list.close()) return release(E_INVALIDARG);
         device_.context->add_resource(staging_id, staging);
         leonida::ReplayResult result = leonida::ReplayResult::unsupported;
+        bool build_ok = true;
         {
             std::lock_guard lock(device_.staging_mutex);
-            if (!device_.staging_queue) {
-                device_.staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, device_.info.queue,
-                                                                               device_.info.queue_family);
+            const VkImageLayout prior_layout = device_.context->layout(id(), subresource);
+            const VkImageLayout restore_layout =
+                (prior_layout == VK_IMAGE_LAYOUT_UNDEFINED || prior_layout == VK_IMAGE_LAYOUT_PREINITIALIZED)
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : prior_layout;
+            const VkImageLayout copy_layout = leonida::image_layout(
+                binding_, write ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            leonida::CommandList list;
+            build_ok = list.copy_texture(copy);
+            if (build_ok && prior_layout != VK_IMAGE_LAYOUT_GENERAL &&
+                leonida::image_layout(binding_, restore_layout) != copy_layout) {
+                leonida::TextureBarrier restore{};
+                restore.sync_before = leonida::d3d12_sync::copy;
+                restore.sync_after = leonida::d3d12_sync::all;
+                restore.access_before = write ? leonida::d3d12_access::copy_dest : leonida::d3d12_access::copy_source;
+                restore.access_after = leonida::d3d12_access::common;
+                restore.layout_before = write ? leonida::d3d12_layout::copy_dest : leonida::d3d12_layout::copy_source;
+                restore.layout_after = d3d12_layout_for_vk(restore_layout, binding_.presentable);
+                restore.resource = id();
+                restore.range = {subresource, 0, 0, 0, 0, 0};
+                build_ok = list.barrier(restore);
             }
-            if (device_.staging_queue->ok()) {
-                const leonida::CommandList* lists[] = {&list};
-                result = device_.staging_queue->execute(lists);
-                if (result == leonida::ReplayResult::success && !device_.staging_queue->idle())
-                    result = leonida::ReplayResult::unsupported;
+            build_ok = build_ok && list.close();
+            if (build_ok) {
+                if (!device_.staging_queue) {
+                    device_.staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, device_.info.queue,
+                                                                                   device_.info.queue_family);
+                }
+                if (device_.staging_queue->ok()) {
+                    const leonida::CommandList* lists[] = {&list};
+                    result = device_.staging_queue->execute(lists);
+                    if (result == leonida::ReplayResult::success && !device_.staging_queue->idle())
+                        result = leonida::ReplayResult::unsupported;
+                }
             }
         }
         device_.context->remove_resource(staging_id);
+        if (!build_ok) return release(E_INVALIDARG);
         if (result != leonida::ReplayResult::success) {
             log_once("WriteToSubresource/ReadFromSubresource staging copy failed; replay result", int(result));
             return release(E_FAIL);
