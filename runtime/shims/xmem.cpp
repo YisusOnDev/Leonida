@@ -221,8 +221,16 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
 // CPU mapping, so only the CPU protection is applied. The retail executable passes 0x801 and 0x22004.
 constexpr DWORD kPageGraphicsMask = 0x0007F800;
 
+// The cache modifiers go too. PAGE_WRITECOMBINE (0x400) and PAGE_NOCACHE (0x200) are how the console marks memory the
+// GPU shares: measured locally at a title's call sites, a committed 2 GiB XMemVirtualAlloc with protect 0x404 holds
+// buffers the title then places for the GPU. On the PC the D3D12 layer imports such memory as a GPU buffer
+// (VK_EXT_external_memory_host, #7218), and it does not import write-combined or uncached pages: an import of
+// write-combined pages read back wrong bytes on an RTX 5090. Write-back pages import, and the GPU then reads what the
+// title wrote with no copy. A physical-page view drops them for the same reason (#7492).
+constexpr DWORD kPageCacheModifiers = PAGE_WRITECOMBINE | PAGE_NOCACHE;
+
 DWORD host_protect(DWORD p) {
-    const DWORD cpu = p & ~kPageGraphicsMask;
+    const DWORD cpu = p & ~(kPageGraphicsMask | kPageCacheModifiers);
     return cpu ? cpu : PAGE_NOACCESS;
 }
 

@@ -319,6 +319,23 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(VirtualFree(gpu, 0, MEM_RELEASE), "release the 0x183 allocation");
     }
 
+    // The console's cache modifiers on GPU-shared memory (protect 0x404 measured locally on a committed pool): the
+    // host commits write-back pages, which the D3D12 layer can import as a GPU buffer.
+    for (const DWORD protect : {DWORD{PAGE_READWRITE | PAGE_WRITECOMBINE}, DWORD{PAGE_READWRITE | PAGE_NOCACHE},
+                                DWORD{PAGE_READWRITE | PAGE_WRITECOMBINE | PAGE_GRAPHICS_READWRITE}}) {
+        char what[160];
+        void* const shared = virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x283, protect);
+        std::snprintf(what, sizeof what, "attributes 0x283 with protect %#lx succeeds", static_cast<unsigned long>(protect));
+        check(shared != nullptr, what);
+        if (!shared) continue;
+        std::snprintf(what, sizeof what, "protect %#lx commits plain PAGE_READWRITE (no cache modifier)",
+                      static_cast<unsigned long>(protect));
+        check(VirtualQuery(shared, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE, what);
+        static_cast<volatile uint8_t*>(shared)[0] = 0x5a;
+        check(static_cast<volatile uint8_t*>(shared)[0] == 0x5a, "the write-back allocation is writable");
+        check(VirtualFree(shared, 0, MEM_RELEASE), "release the write-back allocation");
+    }
+
     SetLastError(ERROR_SUCCESS);
     void* const replace_without_address =
         virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0, PAGE_READWRITE);
@@ -1109,6 +1126,14 @@ void test_title_virtual_alloc() {
             check(VirtualQuery(gfx, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE,
                   "protect 0x2004 commits PAGE_READWRITE");
             VirtualFree(gfx, 0, MEM_RELEASE);
+        }
+        void* const wc = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
+        check(wc != nullptr, "title VirtualAlloc with PAGE_READWRITE | PAGE_WRITECOMBINE succeeds");
+        if (wc) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            check(VirtualQuery(wc, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE,
+                  "PAGE_WRITECOMBINE is dropped: the title's VirtualAlloc commits PAGE_READWRITE");
+            VirtualFree(wc, 0, MEM_RELEASE);
         }
         for (const DWORD bits : {kMemGraphics, kMemTitle, kMemGraphics | kMemTitle, DWORD{0}}) {
             void* const p = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT | bits, PAGE_READWRITE);
