@@ -2377,13 +2377,18 @@ private:
         const std::uint32_t width = std::max(1u, binding_.width >> mip), height = std::max(1u, binding_.height >> mip);
         const std::uint32_t depth = binding_.volume ? std::max(1u, binding_.depth >> mip) : 1;
         out.box = box ? *box : D3D12_BOX{0, 0, 0, width, height, depth};
-        const D3D12_BOX& b = out.box;
-        if (b.right > width || b.bottom > height || b.back > depth) return false;
+        D3D12_BOX& b = out.box;
         out.block = leonida::copy_block_format(binding_, range.aspectMask);
         if (!out.block.bytes) return false;
         const std::uint32_t k = out.block.block;
-        if (b.left % k || b.top % k || (b.right % k && b.right != width) || (b.bottom % k && b.bottom != height))
-            return false;
+        // A block-compressed box is in whole blocks on every edge and may reach the block-padded edge of the mip;
+        // one that stops at an unpadded edge inside a block is refused (host runtime and WARP). The copy itself
+        // stops at the mip edge, as Vulkan wants.
+        const std::uint32_t padded_width = (width + k - 1) / k * k, padded_height = (height + k - 1) / k * k;
+        if (b.right > padded_width || b.bottom > padded_height || b.back > depth) return false;
+        if (box && (b.left % k || b.top % k || b.right % k || b.bottom % k)) return false;
+        b.right = std::min(b.right, width);
+        b.bottom = std::min(b.bottom, height);
         out.layers = {range.aspectMask, mip, range.baseArrayLayer, 1};
         if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back) {
             out.rows = 0;
