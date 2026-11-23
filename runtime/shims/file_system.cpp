@@ -3,7 +3,7 @@
 // A GDK title names its files on the console's drives, "GAME:\\data\\x.sps" being one in the installed game folder, so
 // the imports it makes of CreateFile*, FindFirstFile*/FindNextFile*/FindClose, GetFileAttributes*/GetFileAttributesEx*,
 // DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes*, and the
-// Universal CRT's fopen/_open families, are answered here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
+// Universal CRT's fopen/_open families and its remove/rename/_stat/_access/_mkdir/_rmdir, are answered here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
 //     the overlay (RT-218); any other path is a host path and goes to the host;
@@ -29,6 +29,7 @@
 
 #include <fcntl.h>
 #include <share.h>
+#include <sys/stat.h>
 
 #include <cerrno>
 #include <cstdio>
@@ -1377,13 +1378,16 @@ Fn ucrt(const char* name) {
     return reinterpret_cast<Fn>(::GetProcAddress(module, name));
 }
 
-// The errors open_target can give, mapped as the CRT maps them.
+// The errors the file shims give, mapped as the CRT's own table maps them (anything else is EINVAL there too).
 void set_crt_error(DWORD error) {
     int e = EINVAL;
     if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) e = ENOENT;
     if (error == ERROR_ACCESS_DENIED) e = EACCES;
+    if (error >= ERROR_WRITE_PROTECT && error <= ERROR_SHARING_BUFFER_EXCEEDED) e = EACCES;  // sharing, locks
     if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) e = EEXIST;
     if (error == ERROR_DISK_FULL) e = ENOSPC;
+    if (error == ERROR_DIR_NOT_EMPTY) e = ENOTEMPTY;
+    if (error == ERROR_NOT_SAME_DEVICE) e = EXDEV;
     ucrt<errno_t(__cdecl*)(unsigned long)>("_set_doserrno")(error);
     ucrt<errno_t(__cdecl*)(int)>("_set_errno")(e);
     ::SetLastError(error);
@@ -1454,6 +1458,52 @@ using WsopenDispatchFn = errno_t(__cdecl*)(const wchar_t*, int, int, int, int*, 
 
 // The errno set_crt_error left, as the _s functions return it.
 errno_t crt_errno() { return *ucrt<int*(__cdecl*)()>("_errno")(); }
+
+// ---- The CRT's other path calls (RT-359)
+//
+// remove, rename, _mkdir and _rmdir change names, which on GAME: can mean a marker over a package file rather than a
+// host call, so a console path goes to the Win32 shim the CRT function wraps (DeleteFileW, MoveFileExW with
+// MOVEFILE_COPY_ALLOWED, CreateDirectoryW, RemoveDirectoryW) and its error is mapped as the CRT maps it. _stat* and
+// _access* only read, so a console path is mapped with read_target and ucrtbase's wide function looks at the copy a
+// read would open. A host path, null included, goes to ucrtbase unchanged.
+
+bool is_console(const wchar_t* name) {
+    std::vector<std::wstring> parts;
+    return name && parse_console(name, parts) != Parsed::Host;
+}
+
+bool is_console_a(const char* name) { return name && is_console(widen_ansi(name).c_str()); }
+
+int crt_result(BOOL ok) {
+    if (ok) return 0;
+    set_crt_error(::GetLastError());
+    return -1;
+}
+
+// As map_open, for a call that only reads the name.
+bool map_read(const wchar_t* name, std::wstring& mapped) {
+    if (!name) return true;
+    const Target t = read_target(name);
+    if (t.error) {
+        set_crt_error(t.error);
+        return false;
+    }
+    if (t.path.native() != name) mapped = t.path.native();
+    return true;
+}
+
+template <typename Stat>
+int stat_w(const char* wide_fn, const wchar_t* name, Stat* out) {
+    std::wstring mapped;
+    if (!map_read(name, mapped)) return -1;
+    return ucrt<int(__cdecl*)(const wchar_t*, Stat*)>(wide_fn)(mapped.empty() ? name : mapped.c_str(), out);
+}
+
+template <typename Stat>
+int stat_a(const char* narrow_fn, const char* wide_fn, const char* name, Stat* out) {
+    if (!is_console_a(name)) return ucrt<int(__cdecl*)(const char*, Stat*)>(narrow_fn)(name, out);
+    return stat_w(wide_fn, widen_ansi(name).c_str(), out);
+}
 
 
 }  // namespace
@@ -1596,6 +1646,80 @@ errno_t __cdecl crt_sopen_s(int* fd, const char* name, int oflag, int share, int
     return crt_sopen_dispatch(name, oflag, share, pmode, fd, 1);
 }
 
+// remove and _unlink are the same call in the CRT (_wunlink calls _wremove).
+int __cdecl crt_wremove(const wchar_t* name) {
+    if (!is_console(name)) return ucrt<int(__cdecl*)(const wchar_t*)>("_wremove")(name);
+    return crt_result(delete_file_w(name));
+}
+
+int __cdecl crt_remove(const char* name) {
+    if (!is_console_a(name)) return ucrt<int(__cdecl*)(const char*)>("remove")(name);
+    return crt_result(delete_file_a(name));
+}
+
+int __cdecl crt_wrename(const wchar_t* from, const wchar_t* to) {
+    if (!is_console(from) && !is_console(to))
+        return ucrt<int(__cdecl*)(const wchar_t*, const wchar_t*)>("_wrename")(from, to);
+    return crt_result(move_file_ex_w(from, to, MOVEFILE_COPY_ALLOWED));
+}
+
+int __cdecl crt_rename(const char* from, const char* to) {
+    if (!is_console_a(from) && !is_console_a(to))
+        return ucrt<int(__cdecl*)(const char*, const char*)>("rename")(from, to);
+    return crt_result(move_file_ex_a(from, to, MOVEFILE_COPY_ALLOWED));
+}
+
+int __cdecl crt_wmkdir(const wchar_t* name) {
+    if (!is_console(name)) return ucrt<int(__cdecl*)(const wchar_t*)>("_wmkdir")(name);
+    return crt_result(create_directory_w(name, nullptr));
+}
+
+int __cdecl crt_mkdir(const char* name) {
+    if (!is_console_a(name)) return ucrt<int(__cdecl*)(const char*)>("_mkdir")(name);
+    return crt_result(create_directory_a(name, nullptr));
+}
+
+int __cdecl crt_wrmdir(const wchar_t* name) {
+    if (!is_console(name)) return ucrt<int(__cdecl*)(const wchar_t*)>("_wrmdir")(name);
+    return crt_result(remove_directory_w(name));
+}
+
+int __cdecl crt_rmdir(const char* name) {
+    if (!is_console_a(name)) return ucrt<int(__cdecl*)(const char*)>("_rmdir")(name);
+    return crt_result(remove_directory_a(name));
+}
+
+int __cdecl crt_waccess(const wchar_t* name, int mode) {
+    std::wstring mapped;
+    if (!map_read(name, mapped)) return -1;
+    return ucrt<int(__cdecl*)(const wchar_t*, int)>("_waccess")(mapped.empty() ? name : mapped.c_str(), mode);
+}
+
+int __cdecl crt_access(const char* name, int mode) {
+    if (!is_console_a(name)) return ucrt<int(__cdecl*)(const char*, int)>("_access")(name, mode);
+    return crt_waccess(widen_ansi(name).c_str(), mode);
+}
+
+errno_t __cdecl crt_waccess_s(const wchar_t* name, int mode) {
+    std::wstring mapped;
+    if (!map_read(name, mapped)) return crt_errno();
+    return ucrt<errno_t(__cdecl*)(const wchar_t*, int)>("_waccess_s")(mapped.empty() ? name : mapped.c_str(), mode);
+}
+
+errno_t __cdecl crt_access_s(const char* name, int mode) {
+    if (!is_console_a(name)) return ucrt<errno_t(__cdecl*)(const char*, int)>("_access_s")(name, mode);
+    return crt_waccess_s(widen_ansi(name).c_str(), mode);
+}
+
+int __cdecl crt_wstat32(const wchar_t* n, struct _stat32* s) { return stat_w("_wstat32", n, s); }
+int __cdecl crt_wstat32i64(const wchar_t* n, struct _stat32i64* s) { return stat_w("_wstat32i64", n, s); }
+int __cdecl crt_wstat64(const wchar_t* n, struct _stat64* s) { return stat_w("_wstat64", n, s); }
+int __cdecl crt_wstat64i32(const wchar_t* n, struct _stat64i32* s) { return stat_w("_wstat64i32", n, s); }
+int __cdecl crt_stat32(const char* n, struct _stat32* s) { return stat_a("_stat32", "_wstat32", n, s); }
+int __cdecl crt_stat32i64(const char* n, struct _stat32i64* s) { return stat_a("_stat32i64", "_wstat32i64", n, s); }
+int __cdecl crt_stat64(const char* n, struct _stat64* s) { return stat_a("_stat64", "_wstat64", n, s); }
+int __cdecl crt_stat64i32(const char* n, struct _stat64i32* s) { return stat_a("_stat64i32", "_wstat64i32", n, s); }
+
 }  // namespace rt::fs
 
 namespace {
@@ -1689,6 +1813,31 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
         {dll, "_wsopen_s", reinterpret_cast<void*>(&crt_wsopen_s)},                                      \
         {dll, "_sopen_dispatch", reinterpret_cast<void*>(&crt_sopen_dispatch)},                          \
         {dll, "_wsopen_dispatch", reinterpret_cast<void*>(&crt_wsopen_dispatch)}
+
+// The CRT's other path calls (RT-359), all exported by api-ms-win-crt-filesystem-l1-1-0 and ucrtbase.
+#define CRT_PATH_API(dll)                                                                                \
+    {dll, "remove", reinterpret_cast<void*>(&crt_remove)},                                               \
+        {dll, "_wremove", reinterpret_cast<void*>(&crt_wremove)},                                        \
+        {dll, "_unlink", reinterpret_cast<void*>(&crt_remove)},                                          \
+        {dll, "_wunlink", reinterpret_cast<void*>(&crt_wremove)},                                        \
+        {dll, "rename", reinterpret_cast<void*>(&crt_rename)},                                           \
+        {dll, "_wrename", reinterpret_cast<void*>(&crt_wrename)},                                        \
+        {dll, "_mkdir", reinterpret_cast<void*>(&crt_mkdir)},                                            \
+        {dll, "_wmkdir", reinterpret_cast<void*>(&crt_wmkdir)},                                          \
+        {dll, "_rmdir", reinterpret_cast<void*>(&crt_rmdir)},                                            \
+        {dll, "_wrmdir", reinterpret_cast<void*>(&crt_wrmdir)},                                          \
+        {dll, "_access", reinterpret_cast<void*>(&crt_access)},                                          \
+        {dll, "_waccess", reinterpret_cast<void*>(&crt_waccess)},                                        \
+        {dll, "_access_s", reinterpret_cast<void*>(&crt_access_s)},                                      \
+        {dll, "_waccess_s", reinterpret_cast<void*>(&crt_waccess_s)},                                    \
+        {dll, "_stat32", reinterpret_cast<void*>(&crt_stat32)},                                          \
+        {dll, "_stat32i64", reinterpret_cast<void*>(&crt_stat32i64)},                                    \
+        {dll, "_stat64", reinterpret_cast<void*>(&crt_stat64)},                                          \
+        {dll, "_stat64i32", reinterpret_cast<void*>(&crt_stat64i32)},                                    \
+        {dll, "_wstat32", reinterpret_cast<void*>(&crt_wstat32)},                                        \
+        {dll, "_wstat32i64", reinterpret_cast<void*>(&crt_wstat32i64)},                                  \
+        {dll, "_wstat64", reinterpret_cast<void*>(&crt_wstat64)},                                        \
+        {dll, "_wstat64i32", reinterpret_cast<void*>(&crt_wstat64i32)}
 }  // namespace
 
 SHIM_TABLE(file_system,
@@ -1699,4 +1848,6 @@ SHIM_TABLE(file_system,
     FILE_API("api-ms-win-core-file-l2-1-0.dll"),
     CRT_OPEN_API("api-ms-win-crt-stdio-l1-1-0.dll"),
     CRT_OPEN_API("ucrtbase.dll"),
+    CRT_PATH_API("api-ms-win-crt-filesystem-l1-1-0.dll"),
+    CRT_PATH_API("ucrtbase.dll"),
 );

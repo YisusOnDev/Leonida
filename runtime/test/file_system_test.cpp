@@ -1506,6 +1506,116 @@ void run_checks(const std::filesystem::path& root) {
         check(f && read_stream(f) == "package", "a host path goes to the CRT unchanged");
     }
 
+    // The CRT's other path calls (RT-359), under api-ms-win-crt-filesystem-l1-1-0. Where the host decides the errno
+    // (an existing destination, a folder that is not empty), ucrtbase's own answer for a host folder in the same
+    // state is the expected one.
+    {
+        write_path(package / "crtpath" / "keep.txt", "package");
+        write_path(package / "crtpath" / "gone.txt", "package");
+        write_path(package / "crtpath" / "moveme.txt", "package");
+        const HMODULE ucrtbase = ::LoadLibraryW(L"ucrtbase.dll");
+        const auto host_errno = reinterpret_cast<int*(__cdecl*)()>(::GetProcAddress(ucrtbase, "_errno"));
+        const auto host_rename =
+            reinterpret_cast<int(__cdecl*)(const char*, const char*)>(::GetProcAddress(ucrtbase, "rename"));
+        const auto host_rmdir = reinterpret_cast<int(__cdecl*)(const char*)>(::GetProcAddress(ucrtbase, "_rmdir"));
+        const auto host_errno_of = [&](auto call) {
+            *host_errno() = 0;
+            return call() == -1 ? *host_errno() : 0;
+        };
+
+        using NameFn = int(__cdecl*)(const char*);
+        using WNameFn = int(__cdecl*)(const wchar_t*);
+        const char* fsdll = "api-ms-win-crt-filesystem-l1-1-0.dll";
+        const auto crt_remove = resolve<NameFn>(fsdll, "remove");
+        const auto crt_wremove = resolve<WNameFn>(fsdll, "_wremove");
+        const auto crt_wunlink = resolve<WNameFn>("ucrtbase.dll", "_wunlink");
+        const auto crt_rename = resolve<int(__cdecl*)(const char*, const char*)>(fsdll, "rename");
+        const auto crt_wrename = resolve<int(__cdecl*)(const wchar_t*, const wchar_t*)>(fsdll, "_wrename");
+        const auto crt_mkdir = resolve<NameFn>(fsdll, "_mkdir");
+        const auto crt_wmkdir = resolve<WNameFn>(fsdll, "_wmkdir");
+        const auto crt_rmdir = resolve<NameFn>(fsdll, "_rmdir");
+        const auto crt_wrmdir = resolve<WNameFn>(fsdll, "_wrmdir");
+        const auto crt_access = resolve<int(__cdecl*)(const char*, int)>(fsdll, "_access");
+        const auto crt_waccess = resolve<int(__cdecl*)(const wchar_t*, int)>(fsdll, "_waccess");
+        const auto crt_access_s = resolve<errno_t(__cdecl*)(const char*, int)>(fsdll, "_access_s");
+        const auto crt_stat64 = resolve<int(__cdecl*)(const char*, struct _stat64*)>(fsdll, "_stat64");
+        const auto crt_wstat64 = resolve<int(__cdecl*)(const wchar_t*, struct _stat64*)>(fsdll, "_wstat64");
+        const auto crt_wstat32 = resolve<int(__cdecl*)(const wchar_t*, struct _stat32*)>("ucrtbase.dll", "_wstat32");
+        check(crt_remove && crt_wremove && crt_wunlink && crt_rename && crt_wrename && crt_mkdir && crt_wmkdir &&
+                  crt_rmdir && crt_wrmdir && crt_access && crt_waccess && crt_access_s && crt_stat64 && crt_wstat64 &&
+                  crt_wstat32 && resolve<void*>(fsdll, "_stat32i64") && resolve<void*>(fsdll, "_wstat64i32") &&
+                  resolve<void*>(fsdll, "_waccess_s") && resolve<void*>(fsdll, "_unlink"),
+              "the CRT path calls resolve under api-ms-win-crt-filesystem-l1-1-0 and ucrtbase");
+
+        struct _stat64 st{};
+        check(crt_wstat64(L"GAME:\\crtpath\\keep.txt", &st) == 0 && st.st_size == 7 && (st.st_mode & _S_IFREG),
+              "_wstat64 stats a package file through GAME:");
+        st = {};
+        check(crt_stat64("game:/crtpath/keep.txt", &st) == 0 && st.st_size == 7, "_stat64 takes a narrow console path");
+        struct _stat32 st32{};
+        check(crt_wstat32(L"GAME:\\crtpath", &st32) == 0 && (st32.st_mode & _S_IFDIR), "_wstat32 stats a package folder");
+        check(crt_access("GAME:\\crtpath\\keep.txt", 0) == 0 && crt_waccess(L"GAME:\\crtpath\\keep.txt", 4) == 0,
+              "_access and _waccess find a package file");
+        *host_errno() = 0;
+        check(crt_waccess(L"GAME:\\crtpath\\missing.txt", 0) == -1 && *host_errno() == ENOENT &&
+                  crt_access_s("GAME:\\crtpath\\missing.txt", 0) == ENOENT,
+              "a missing console name is ENOENT for _waccess and _access_s");
+
+        check(crt_remove("GAME:\\crtpath\\gone.txt") == 0 && std::filesystem::exists(package / "crtpath" / "gone.txt"),
+              "remove deletes a package file by marker and leaves the package as installed");
+        *host_errno() = 0;
+        check(crt_wstat64(L"GAME:\\crtpath\\gone.txt", &st) == -1 && *host_errno() == ENOENT,
+              "and _wstat64 no longer finds it");
+        *host_errno() = 0;
+        check(crt_wremove(L"GAME:\\crtpath\\gone.txt") == -1 && *host_errno() == ENOENT,
+              "_wremove of a deleted name fails with ENOENT");
+
+        check(crt_wrename(L"GAME:\\crtpath\\moveme.txt", L"GAME:\\crtpath\\moved.txt") == 0 &&
+                  read_path(overlay / "crtpath" / "moved.txt") == "package" &&
+                  std::filesystem::exists(package / "crtpath" / "moveme.txt") &&
+                  crt_waccess(L"GAME:\\crtpath\\moveme.txt", 0) == -1,
+              "_wrename moves a package file into the overlay and hides the old name");
+        check(crt_wunlink(L"GAME:\\crtpath\\moved.txt") == 0 && !std::filesystem::exists(overlay / "crtpath" / "moved.txt"),
+              "_wunlink deletes an overlay file");
+
+        const std::filesystem::path host_dir = root / "host_crt";
+        write_path(host_dir / "a.txt", "a");
+        write_path(host_dir / "b.txt", "b");
+        const std::string host_a = (host_dir / "a.txt").string(), host_b = (host_dir / "b.txt").string();
+        const int host_exists = host_errno_of([&] { return host_rename(host_a.c_str(), host_b.c_str()); });
+        write_path(package / "crtpath" / "other.txt", "other");
+        *host_errno() = 0;
+        check(host_exists != 0 && crt_rename("GAME:\\crtpath\\other.txt", "GAME:\\crtpath\\keep.txt") == -1 &&
+                  *host_errno() == host_exists,
+              "rename onto an existing console name fails with the errno the host CRT gives");
+        *host_errno() = 0;
+        check(crt_rename("GAME:\\crtpath\\other.txt", host_b.c_str()) == -1 && *host_errno() == EXDEV &&
+                  read_path(host_dir / "b.txt") == "b",
+              "rename between GAME: and a host path fails with EXDEV");
+        check(crt_rename(host_a.c_str(), (host_dir / "c.txt").string().c_str()) == 0 &&
+                  read_path(host_dir / "c.txt") == "a",
+              "rename of two host paths goes to the CRT unchanged");
+
+        check(crt_wmkdir(L"GAME:\\crtdir") == 0 && std::filesystem::is_directory(overlay / "crtdir"),
+              "_wmkdir makes a console folder in the overlay");
+        *host_errno() = 0;
+        check(crt_mkdir("GAME:\\crtdir") == -1 && *host_errno() == EEXIST, "_mkdir of an existing name is EEXIST");
+        const int host_not_empty = host_errno_of([&] { return host_rmdir(host_dir.string().c_str()); });
+        *host_errno() = 0;
+        check(host_not_empty != 0 && crt_wrmdir(L"GAME:\\crtpath") == -1 && *host_errno() == host_not_empty,
+              "_wrmdir of a folder that is not empty fails with the errno the host CRT gives");
+        check(crt_rmdir("GAME:\\crtdir") == 0 && !std::filesystem::exists(overlay / "crtdir"),
+              "_rmdir removes the console folder");
+
+        *host_errno() = 0;
+        check(crt_wremove(L"GAME:\\..\\outside.txt") == -1 && *host_errno() == EINVAL,
+              "GAME:\\.. is refused with EINVAL");
+        st = {};
+        check(crt_stat64(host_b.c_str(), &st) == 0 && st.st_size == 1 && crt_remove(host_b.c_str()) == 0 &&
+                  !std::filesystem::exists(host_dir / "b.txt"),
+              "host paths go to the CRT unchanged");
+    }
+
     std::filesystem::remove_all(root);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
