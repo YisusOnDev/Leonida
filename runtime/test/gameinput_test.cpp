@@ -2130,6 +2130,8 @@ void test_unregister_waits_per_token(IGameInput* input, IGameInputDispatcher* di
     SDL_SetJoystickVirtualButton(js, SDL_GAMEPAD_BUTTON_NORTH, north);
     rt::gameinput::poll();
     while (dispatcher->Dispatch(UINT64_MAX)) {}
+}
+
 // The keyboard and mouse devices (LEONIDA_KEYBOARD_MOUSE, RT-159), driven by the same fake keys, focus and cursor as
 // the keyboard pad. No pad is connected while this runs.
 void test_keyboard_mouse(IGameInput* input) {

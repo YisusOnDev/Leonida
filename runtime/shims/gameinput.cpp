@@ -2816,10 +2816,9 @@ public:
         // Blocking enumeration stays on the caller's thread, but has the same cancellation and lifetime guarantees
         // as queued callbacks: StopCallback skips later devices and UnregisterCallback waits for active delivery.
         if (!now.empty()) {
+            // deliver_event enters each invocation in State::running, which UnregisterCallback waits on per token.
             std::lock_guard dl(s.deliver_mu);
-            const DWORD previous_thread = s.delivering_thread.exchange(GetCurrentThreadId());
             for (const Event& e : now) deliver_event(e);
-            s.delivering_thread = previous_thread;  // preserve an outer callback during reentrant enumeration
         }
         return S_OK;
     }
