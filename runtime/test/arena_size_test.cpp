@@ -23,8 +23,8 @@ constexpr VkDeviceSize GiB = 1024 * MiB;
 int request_without_limits() {
     const ArenaLimits none{};
     // Unset (or empty): the default; otherwise clamped to 16..4095 MiB; text that is no number reads as 0, so 16.
-    CHECK(decide_arena_size(nullptr, none).bytes == 256 * MiB);
-    CHECK(decide_arena_size("", none).bytes == 256 * MiB);
+    CHECK(decide_arena_size(nullptr, none).bytes == 2048 * MiB);
+    CHECK(decide_arena_size("", none).bytes == 2048 * MiB);
     CHECK(decide_arena_size("1024", none).bytes == 1024 * MiB);
     CHECK(decide_arena_size("1", none).bytes == 16 * MiB);
     CHECK(decide_arena_size("0", none).bytes == 16 * MiB);
@@ -103,11 +103,24 @@ int floor_and_limits() {
     return 0;
 }
 
+int fallback() {
+    // Only the default falls back: halving, in whole MiB, down to 256 MiB and no further.
+    CHECK(arena_fallback_bytes(true, 2048 * MiB) == 0);
+    CHECK(arena_fallback_bytes(false, 2048 * MiB) == 1024 * MiB);
+    CHECK(arena_fallback_bytes(false, 2047 * MiB) == 1023 * MiB);
+    CHECK(arena_fallback_bytes(false, 512 * MiB) == 256 * MiB);
+    CHECK(arena_fallback_bytes(false, 511 * MiB) == 0);
+    CHECK(arena_fallback_bytes(false, 256 * MiB) == 0);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
-    for (const auto test : {request_without_limits, each_limit, unknown_limits, allocation_overhead, floor_and_limits})
+    for (const auto test : {request_without_limits, each_limit, unknown_limits, allocation_overhead, floor_and_limits,
+                            fallback})
         if (test()) return 1;
-    std::printf("arena_size: request clamp, each device limit, unknown limits, allocation overhead and the floor\n");
+    std::printf("arena_size: request clamp, each device limit, unknown limits, allocation overhead, the floor and the "
+                "fallback\n");
     return 0;
 }

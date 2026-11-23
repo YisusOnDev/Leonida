@@ -1,7 +1,7 @@
 #pragma once
 
 // The size of the GPU address arena (docs/d3d12_vulkan.md section 3.3): one VkBuffer bound to one VkDeviceMemory
-// allocation. LEONIDA_ARENA_MB asks for a size (default 256 MiB, 16..4095 MiB: every console VA must fit 32 bits);
+// allocation. LEONIDA_ARENA_MB asks for a size (default 2048 MiB, 16..4095 MiB: every console VA must fit 32 bits);
 // the device then caps it, since the buffer may be no larger than maxBufferSize (Vulkan 1.3 / VK_KHR_maintenance4)
 // and the allocation, which can be larger than the buffer, no larger than maxMemoryAllocationSize (Vulkan 1.1 /
 // VK_KHR_maintenance3). Vulkan guarantees at least 1 GiB for both; the RX 6800 (AMD 26.11.2) reports 2 GiB for both.
@@ -18,7 +18,12 @@
 namespace leonida {
 
 constexpr VkDeviceSize kArenaMiB = VkDeviceSize(1) << 20;
-constexpr VkDeviceSize kArenaDefaultMiB = 256;
+// The retail title's boot makes a 90 MiB default-heap buffer past 256 MiB of live ones; a refusal there is a null
+// resource it asserts on and then reads (game_scarlett_master.exe+0x6eb888). 2048 MiB is what the RX 6800 and
+// RX 9070 XT allow (both device limits are 2 GiB there).
+constexpr VkDeviceSize kArenaDefaultMiB = 2048;
+// When the default cannot be allocated (a small or non-ReBAR heap), it is halved down to this, the old default.
+constexpr VkDeviceSize kArenaFallbackFloorMiB = 256;
 constexpr VkDeviceSize kArenaMinMiB = 16;
 constexpr VkDeviceSize kArenaMaxMiB = 4095;
 
@@ -75,6 +80,15 @@ inline ArenaSize decide_arena_size(const char* env, const ArenaLimits& limits, V
     if (by_buffer == cap) size.capped |= arena_cap_buffer;
     if (by_allocation == cap) size.capped |= arena_cap_allocation;
     return size;
+}
+
+// The next, smaller size to try after the allocation of `bytes` failed, or 0 to give up. Only the default size falls
+// back (an explicit LEONIDA_ARENA_MB is honoured or fails); it halves, rounded down to whole MiB, and never below
+// kArenaFallbackFloorMiB.
+inline VkDeviceSize arena_fallback_bytes(bool env_set, VkDeviceSize bytes) {
+    if (env_set) return 0;
+    const VkDeviceSize half = bytes / 2 / kArenaMiB * kArenaMiB;
+    return half >= kArenaFallbackFloorMiB * kArenaMiB ? half : 0;
 }
 
 // The Vulkan names of the limits in `capped`, for the log line.

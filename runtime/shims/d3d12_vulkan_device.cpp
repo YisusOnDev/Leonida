@@ -5258,7 +5258,7 @@ public:
         return true;
     }
 
-    // LEONIDA_ARENA_MB sets its size (default 256, at most 4095, and no more than the device's maxBufferSize and
+    // LEONIDA_ARENA_MB sets its size (default 2048, at most 4095, and no more than the device's maxBufferSize and
     // maxMemoryAllocationSize allow: src/arena_size.h): it holds every default-heap buffer, shader-visible
     // descriptor heap and shader program. M0-M3 keep it host-visible (section 3.3, memory type policy).
     bool create_arena() {
@@ -5315,6 +5315,18 @@ public:
         arena.memory = state_.allocate(requirements,
                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
+        // The default size halves down to 256 MiB when the heap cannot hold it (src/arena_size.h).
+        for (VkDeviceSize next = leonida::arena_fallback_bytes(set, info.size); !arena.memory && next;
+             next = leonida::arena_fallback_bytes(set, info.size)) {
+            vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+            std::fprintf(stderr, "[rt] d3d12: GPU address arena: %llu MiB could not be allocated, trying %llu MiB\n",
+                         static_cast<unsigned long long>(info.size >> 20), static_cast<unsigned long long>(next >> 20));
+            info.size = next;
+            if (!create_buffer()) return false;
+            arena.memory = state_.allocate(requirements,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
+        }
         void* mapped = nullptr;
         if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
             vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {

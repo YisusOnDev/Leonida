@@ -783,8 +783,10 @@ The compute path, end to end:
   refusing anything that would spill. `pack_stage()` lays them out in the console layout of one stage (section 3.5,
   D3D-448); the compute bind point uses it.
 - **GPU address arena** (section 3.3, when the device has `bufferDeviceAddress`): one host-visible,
-  device-addressable buffer, 256 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
-  table pointers).
+  device-addressable buffer, 2048 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
+  table pointers). With the variable unset, an allocation the heap refuses halves the size down to 256 MiB, the old
+  default; the retail title's boot needs more than 256 MiB (a 90 MiB buffer refused there was a null resource that
+  `game_scarlett_master.exe+0x6eb888` asserts on; the RX 9070 XT, like the RX 6800, caps the arena at 2048 MiB).
   - It is also no larger than the device's `maxBufferSize` (Vulkan 1.3) and, counting the buffer's memory
     requirement, `maxMemoryAllocationSize` (Vulkan 1.1), whichever is smaller (`runtime/src/arena_size.h`). When a
     limit cuts the request, one log line names the limit and the size used. `arena_size_test` (CPU) checks the
