@@ -225,6 +225,8 @@ void test_classification() {
           "the console CreateSyntheticDevice is hresult");
     check(cls("d3d12_xs.dll", "D3D12XboxSetProcessDebugFlags") == ReturnClass::Other,
           "unmeasured console function is other");
+    check(cls("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX") == ReturnClass::HResult,
+          "the measured console D3D12ConfigureVirtualMemoryX is hresult");
     check(cls("xaudio2_9.dll", "XAudio2Create") == ReturnClass::HResult, "XAudio2Create is hresult");
     check(cls("xaudio2_9redist.dll", "XAudio2Create") == ReturnClass::HResult,
           "the redist name gets the same class");

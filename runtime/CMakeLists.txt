@@ -170,6 +170,19 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     target_compile_options(root_sig_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(root_sig_test PRIVATE /OPT:NOREF)
 
+    # D3D12ConfigureVirtualMemoryX through the shim registry, in the measured one-pointer call shape, plus its
+    # startup-trace event. No GPU and no game files.
+    add_executable(d3d12_xs_virtual_memory_test
+      test/d3d12_xs_virtual_memory_test.cpp
+      shims/registry.cpp
+      shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_link_libraries(d3d12_xs_virtual_memory_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY})
+    target_compile_definitions(d3d12_xs_virtual_memory_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_xs_virtual_memory_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_xs_virtual_memory_test PRIVATE /OPT:NOREF)
+
     # RTS0 parser oracle: synthetic descriptors only, serialized by the real PC
     # d3d12.dll and parsed back by rt::rootsig::parse_rts0. A layout mismatch
     # fails here with the blob bytes, never silently in a draw.
@@ -1079,6 +1092,9 @@ if(BUILD_TESTING)
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
+  endif()
+  if(TARGET d3d12_xs_virtual_memory_test)
+    add_test(NAME d3d12_xs_virtual_memory COMMAND d3d12_xs_virtual_memory_test)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)

@@ -71,6 +71,9 @@ std::vector<Lookup> g_lookups;
 //                            D3D12XboxCreateSyntheticDevice is the other console-only factory the sibling export
 //                            inventories list (docs/d3d12_vulkan.md §7); same Create*Device HRESULT shape.
 //                            D3D12XboxSetProcessDebugFlags is left out: nothing measured its return.
+//                            D3D12ConfigureVirtualMemoryX (console-only, no public page) is matched by exact name: the
+//                            retail executable's only call site tests its result by the sign bit, as an HRESULT
+//                            (shims/d3d12_xs.cpp). It has a shim, so this only matters if that is ever removed.
 //  dxgi.dll                  CreateDXGIFactory, CreateDXGIFactory1, CreateDXGIFactory2, DXGIGetDebugInterface1 and
 //                            DXGIDeclareAdapterRemovalSupport return HRESULT (win32/api/dxgi/nf-dxgi-createdxgifactory,
 //                            dxgi1_3 and dxgi1_6 pages). Not the whole DXGI* prefix: only these names were verified.
@@ -110,7 +113,8 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
     if (dll == "d3d12.dll" || dll == "d3d12_xs.dll") {
         if (starts_with(name, "D3D12Create") || starts_with(name, "D3D12Serialize") ||
             name == "D3D12GetDebugInterface" || name == "D3D12EnableExperimentalFeatures" ||
-            name == "D3D12XboxCreateDevice" || name == "D3D12XboxCreateSyntheticDevice")
+            name == "D3D12XboxCreateDevice" || name == "D3D12XboxCreateSyntheticDevice" ||
+            name == "D3D12ConfigureVirtualMemoryX")
             return ReturnClass::HResult;
     } else if (dll == "dxgi.dll") {
         if (starts_with(name, "CreateDXGIFactory") || name == "DXGIGetDebugInterface1" ||

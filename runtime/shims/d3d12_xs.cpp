@@ -5,14 +5,17 @@
 // d3d12.dll), version 1.2 descriptions are rewritten as 1.1 when no static sampler uses 1.2's flags.
 // D3D12XboxCreateDevice returns an Xbox-ABI proxy (d3d12_xs_device.h) over the PC device; only the measured slots
 // are overridden, the rest follow the PC vtable.
+// D3D12ConfigureVirtualMemoryX is accepted and logged: on a PC the Vulkan device owns GPU virtual addresses.
 #include <windows.h>
 #include <d3d12.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <type_traits>
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -22,6 +25,7 @@
 #include "d3d12_xs_device.h"
 #include "d3d12_xs_rootsig.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace {
 
@@ -239,7 +243,61 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacyS
 // Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
 // dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
 // so the policy is accepted and ignored.
-HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
+// More detail from the same call site (the call at RVA 0x1e1cfe0, read statically; nothing was run). The function is
+// not publicly documented (SCARAB's bridge only stubs it, with no arguments):
+//  - RCX is the only argument. RDX, R8 and R9 are not loaded for the call; they hold what an earlier call left (a boot
+//    under LEONIDA_UNIMPLEMENTED=stop showed a heap pointer, a stack pointer and zero there).
+//  - The +4 value is ceil(R / 16 GiB) + 2, where R is the range the same function reserves right after the call with
+//    two XMemVirtualAlloc calls: 16 GiB when a device-type query returns 6 (XboxScarlettLockhart in XSystemDeviceType
+//    order), 24 GiB otherwise. So it is 3 or 4, and 4 under this runtime, which reports XboxScarlettAnaconda.
+//  - The result is tested as an HRESULT (sign bit only); a failure reaches a debug break. The block is not read after
+//    the call, so nothing comes back through it.
+// ASSUMPTION: the +4 field is a count of 16 GiB GPU address segments, two of them fixed. Its meaning would not change
+// what this shim does, so it is only logged.
+// ASSUMPTION: the block is 32 bytes (the size the caller zeroes); the shim reads that much and writes nothing.
+// ASSUMPTION: a null pointer is invalid (E_INVALIDARG). The title never passes one.
+// The block's eight 32-bit words are logged once to stderr. gta6rt --trace FILE: the first call made with the trace
+// open goes to the startup trace as a "d3d12_configure_virtual_memory" event with those words and the caller as
+// module+RVA.
+constexpr size_t kVirtualMemoryConfigWords = 8;
+
+HRESULT WINAPI configure_virtual_memory(const void* desc) {
+    if (!desc) {
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX(null) -> E_INVALIDARG\n");
+        return E_INVALIDARG;
+    }
+    uint32_t words[kVirtualMemoryConfigWords];
+    std::memcpy(words, desc, sizeof(words));
+    char line[kVirtualMemoryConfigWords * 9 + 1];
+    line[0] = '\0';
+    size_t used = 0;
+    for (size_t i = 0; i < kVirtualMemoryConfigWords && used < sizeof(line); ++i) {
+        const int n = std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? " " : "",
+                                    static_cast<unsigned>(words[i]));
+        if (n < 0) break;
+        used += static_cast<size_t>(n);
+    }
+
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX(desc[8] = %s; +4 = %u): the Vulkan device owns "
+                     "GPU virtual addresses on a PC; accepted unchanged, S_OK (logged once)\n",
+                     line, static_cast<unsigned>(words[1]));
+    }
+    if (rt::startup_trace::enabled()) {
+        static std::atomic<bool> traced{false};
+        if (!traced.exchange(true, std::memory_order_relaxed)) {
+            rt::startup_trace::event(
+                "d3d12_configure_virtual_memory",
+                std::string("\"api\":\"D3D12ConfigureVirtualMemoryX\",\"words\":") + rt::startup_trace::quote(line) +
+                    ",\"field4\":" + std::to_string(words[1]) + ",\"caller\":" +
+                    rt::startup_trace::quote(
+                        rt::startup_trace::where(reinterpret_cast<uint64_t>(_ReturnAddress()))));
+        }
+    }
+    return S_OK;
+}
 
 }  // namespace
 
