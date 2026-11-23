@@ -1869,6 +1869,117 @@ void test_haptic_motors(IGameInput* input) {
 
 }  // namespace
 
+// A reading callback that, while armed, says it has entered and waits to be released (bounded, so a broken shim
+// cannot keep it forever).
+struct BlockingReading {
+    HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<bool> armed{false};
+    std::atomic<bool> finished{false};
+    ~BlockingReading() {
+        for (HANDLE h : {entered, release})
+            if (h) CloseHandle(h);
+    }
+};
+void CALLBACK blocking_reading(GameInputCallbackToken, void* context, IGameInputReading*, bool) {
+    auto& b = *static_cast<BlockingReading*>(context);
+    if (!b.armed) return;
+    SetEvent(b.entered);
+    WaitForSingleObject(b.release, 30'000);
+    b.finished = true;
+}
+void CALLBACK idle_guide(GameInputCallbackToken, void* context, IGameInputDevice*, uint64_t, bool) {
+    ++*static_cast<std::atomic<int>*>(context);
+}
+
+// One Dispatch blocked inside reading callback Y. UnregisterCallback of another callback X (a guide callback, idle)
+// waits for X's own invocation only, so it returns while Y is still running; UnregisterCallback of Y still waits for
+// Y to return. A title that copies input under its own lock and unregisters another callback under that lock relies
+// on the first; freeing a callback's context after unregistering relies on the second. Every thread is released and
+// joined on every path; a thread still running after its bound ends the process rather than hanging the test.
+// SDL is only touched here, on the main thread.
+void test_unregister_waits_per_token(IGameInput* input, IGameInputDispatcher* dispatcher, SDL_Joystick* js) {
+    BlockingReading y;
+    std::atomic<int> x_calls{0};
+    GameInputCallbackToken y_token = 0, x_token = 0;
+    const bool ready = y.entered && y.release &&
+                       input->RegisterReadingCallback(nullptr, GameInputKindGamepad, 0.0f, &y, blocking_reading, &y_token) == S_OK &&
+                       input->RegisterGuideButtonCallback(nullptr, &x_calls, idle_guide, &x_token) == S_OK;
+    check(ready, "per-token unregister: events and both callbacks created");
+    if (!ready) {
+        if (y_token) input->UnregisterCallback(y_token, 0);
+        if (x_token) input->UnregisterCallback(x_token, 0);
+        return;
+    }
+    // One reading event: NORTH flips.
+    const bool north = SDL_GetJoystickButton(js, SDL_GAMEPAD_BUTTON_NORTH);
+    y.armed = true;
+    SDL_SetJoystickVirtualButton(js, SDL_GAMEPAD_BUTTON_NORTH, !north);
+    rt::gameinput::poll();
+
+    HANDLE dispatched = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE x_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE y_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    auto finish = [](HANDLE done, std::thread& t, const char* what) {
+        if (!t.joinable()) return;
+        if (WaitForSingleObject(done, 30'000) != WAIT_OBJECT_0) {
+            check(false, what);
+            std::printf("%d checks, %d failures\n", g_checks, g_failures);
+            std::fflush(stdout);
+            ExitProcess(1);
+        }
+        t.join();
+    };
+    std::thread dispatch_thread([&] {
+        while (dispatcher->Dispatch(UINT64_MAX)) {}
+        SetEvent(dispatched);
+    });
+    const bool entered = WaitForSingleObject(y.entered, 10'000) == WAIT_OBJECT_0;
+    check(entered, "per-token unregister: Dispatch is inside reading callback Y");
+
+    bool x_removed = false, x_in_time = false;
+    std::thread x_thread;
+    std::thread y_thread;
+    bool y_removed = false, y_early = true, y_finished_on_return = false;
+    if (entered) {
+        x_thread = std::thread([&] {
+            x_removed = input->UnregisterCallback(x_token, 0);
+            SetEvent(x_done);
+        });
+        // Generous for a slow runner: the call takes the state lock and returns.
+        x_in_time = WaitForSingleObject(x_done, 10'000) == WAIT_OBJECT_0;
+        check(x_in_time && x_removed && !y.finished,
+              "per-token unregister: UnregisterCallback(X) returns true while another callback Y is still running");
+
+        y_thread = std::thread([&] {
+            y_removed = input->UnregisterCallback(y_token, 0);
+            y_finished_on_return = y.finished;
+            SetEvent(y_done);
+        });
+        // A correct shim never returns here, however slow the machine; the check below does not depend on time.
+        y_early = WaitForSingleObject(y_done, 500) == WAIT_OBJECT_0;
+    }
+    SetEvent(y.release);
+    finish(dispatched, dispatch_thread, "per-token unregister: Dispatch returns once Y is released");
+    finish(x_done, x_thread, "per-token unregister: UnregisterCallback(X) returns once Y is released");
+    finish(y_done, y_thread, "per-token unregister: UnregisterCallback(Y) returns once Y is released");
+    if (entered) {
+        check(!y_early && y_removed && y_finished_on_return,
+              "per-token unregister: UnregisterCallback(Y) from another thread returns only after Y has returned");
+        check(x_calls == 0, "per-token unregister: the idle guide callback never ran");
+    } else {
+        input->UnregisterCallback(y_token, 0);
+        input->UnregisterCallback(x_token, 0);
+    }
+    for (HANDLE h : {dispatched, x_done, y_done})
+        if (h) CloseHandle(h);
+
+    // Put NORTH back and drain, so the tests after this one see the pad as before.
+    SDL_SetJoystickVirtualButton(js, SDL_GAMEPAD_BUTTON_NORTH, north);
+    rt::gameinput::poll();
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+}
+
 int main() {
     // Only virtual pads: no real controller on the test machine may show up.
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_JOYSTICK_WGI,
@@ -2178,6 +2289,7 @@ int main() {
             rt::gameinput::poll();
             while (dispatcher->Dispatch(UINT64_MAX)) {}
         }
+        test_unregister_waits_per_token(input, dispatcher, xbox.js);
     }
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();

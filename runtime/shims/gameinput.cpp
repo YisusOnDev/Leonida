@@ -39,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -808,7 +809,7 @@ class Dispatcher;
 struct State {
     std::recursive_mutex mu;       // everything below
     std::mutex poll_mu;            // one poller at a time
-    std::recursive_mutex deliver_mu;  // held while callbacks run; UnregisterCallback waits on it
+    std::recursive_mutex deliver_mu;  // held for a whole delivery, so Dispatch and the poll thread take turns
     std::vector<Device*> devices;  // every device seen, for the process lifetime
     std::vector<Device*> connected;  // open now, in connection order
     std::vector<Callback> callbacks;
@@ -822,7 +823,14 @@ struct State {
     bool config_read = false;
     bool sdl_ready = false, sdl_failed = false;
     bool thread_started = false;
-    std::atomic<DWORD> delivering_thread{0};  // written by the delivering thread, read unlocked by UnregisterCallback
+    // One entry per callback invocation in progress, added under mu by deliver_event in the same step that finds the
+    // callback still registered; UnregisterCallback waits on `ran` for the entries of its own token.
+    struct Running {
+        GameInputCallbackToken token;
+        DWORD thread;
+    };
+    std::vector<Running> running;
+    std::condition_variable_any ran;  // used with mu, notified when an entry of `running` is removed
 };
 
 // Never destroyed: the poll thread may still run while the process exits.
@@ -871,9 +879,17 @@ void call(const Callback& c, const Event& e) {
     }
 }
 
-// Runs one queued event's callbacks on the calling thread, without holding the state lock.
+// Whether the calling thread is inside a callback invocation (with mu held).
+bool in_callback(const State& s, DWORD thread) {
+    return std::any_of(s.running.begin(), s.running.end(), [thread](const State::Running& r) { return r.thread == thread; });
+}
+
+// Runs one queued event's callbacks on the calling thread, without holding the state lock. Each invocation is entered
+// in State::running in the same locked step that finds its callback still registered and active, so an
+// UnregisterCallback either removes it first (it is skipped) or sees the entry and waits for it.
 void deliver_event(const Event& e) {
     State& s = g();
+    const DWORD thread = GetCurrentThreadId();
     std::vector<Callback> targets;
     {
         std::lock_guard lock(s.mu);
@@ -881,13 +897,30 @@ void deliver_event(const Event& e) {
             if (matches(c, e)) targets.push_back(c);
     }
     for (const Callback& c : targets) {
-        bool still = false;
         {
             std::lock_guard lock(s.mu);
-            for (const Callback& now : s.callbacks)
-                if (now.token == c.token) still = now.active;
+            const auto now = std::find_if(s.callbacks.begin(), s.callbacks.end(),
+                                          [&c](const Callback& x) { return x.token == c.token; });
+            if (now == s.callbacks.end() || !now->active) continue;
+            s.running.push_back({c.token, thread});
         }
-        if (still) call(c, e);
+        struct Done {  // the entry goes even if the callback unwinds
+            State& s;
+            GameInputCallbackToken token;
+            DWORD thread;
+            ~Done() {
+                {
+                    std::lock_guard lock(s.mu);
+                    for (auto r = s.running.rbegin(); r != s.running.rend(); ++r)
+                        if (r->token == token && r->thread == thread) {
+                            s.running.erase(std::next(r).base());
+                            break;
+                        }
+                }
+                s.ran.notify_all();
+            }
+        } done{s, c.token, thread};
+        call(c, e);
     }
     if (e.device) e.device->Release();
     if (e.reading) e.reading->Release();
@@ -903,9 +936,7 @@ bool deliver() {
         std::lock_guard lock(s.mu);
         events.swap(s.queue);
     }
-    s.delivering_thread = GetCurrentThreadId();
     for (const Event& e : events) deliver_event(e);
-    s.delivering_thread = 0;
     std::lock_guard lock(s.mu);
     return !s.queue.empty();
 }
@@ -924,7 +955,6 @@ bool deliver_within(uint64_t quota_us) {
         std::lock_guard lock(s.mu);
         batch.swap(s.queue);
     }
-    s.delivering_thread = GetCurrentThreadId();
     size_t next = 0;
     while (next < batch.size()) {
         if (next > 0) {
@@ -933,7 +963,6 @@ bool deliver_within(uint64_t quota_us) {
         }
         deliver_event(batch[next++]);
     }
-    s.delivering_thread = 0;
     std::lock_guard lock(s.mu);
     if (next < batch.size()) s.queue.insert(s.queue.begin(), batch.begin() + static_cast<std::ptrdiff_t>(next), batch.end());
     const bool remaining = !s.queue.empty();
@@ -2444,21 +2473,24 @@ public:
             if (c.token == token) c.active = false;
     }
 
-    // Removes the callback and, unless called from inside a callback, waits for one that is running to return.
-    // VERIFY: the timeout is not honoured; the wait is for at most one callback.
+    // Removes the callback; it never starts again. Called outside any callback, it then waits until no invocation of
+    // this callback is running (other callbacks, and the rest of a Dispatch batch, are not waited for), so the title
+    // may free the callback's context once it returns. Called from inside a callback, any callback, it returns at once,
+    // as Microsoft's reference page describes: the caller's own invocation could otherwise wait for itself, and two
+    // threads each inside a callback could wait for each other. The wait releases mu, which no thread holds while a
+    // callback runs, and takes no other lock, so it adds no lock-order edge.
+    // VERIFY: the timeout is not honoured.
     bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t) override {
         State& s = g();
-        bool found = false;
-        {
-            std::lock_guard lock(s.mu);
-            auto it = std::find_if(s.callbacks.begin(), s.callbacks.end(), [token](const Callback& c) { return c.token == token; });
-            if (it != s.callbacks.end()) {
-                s.callbacks.erase(it);
-                found = true;
-            }
-        }
-        if (found && s.delivering_thread != GetCurrentThreadId()) std::lock_guard wait(s.deliver_mu);
-        return found;
+        std::unique_lock lock(s.mu);
+        auto it = std::find_if(s.callbacks.begin(), s.callbacks.end(), [token](const Callback& c) { return c.token == token; });
+        if (it == s.callbacks.end()) return false;
+        s.callbacks.erase(it);
+        if (!in_callback(s, GetCurrentThreadId()))
+            s.ran.wait(lock, [&s, token] {
+                return std::none_of(s.running.begin(), s.running.end(), [token](const State::Running& r) { return r.token == token; });
+            });
+        return true;
     }
 
     HRESULT STDMETHODCALLTYPE CreateDispatcher(IGameInputDispatcher** out) override {
