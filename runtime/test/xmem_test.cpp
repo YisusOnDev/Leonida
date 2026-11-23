@@ -804,11 +804,12 @@ void test_write_combine_window(const PhysicalApi& api) {
     const bool mapped = api.map(window, 1, &page) == window;
     check(mapped, "a page maps into a window reserved with PAGE_WRITECOMBINE");
     if (mapped) {
+        // Physical pages commit on first touch, so the view is queried after the write.
+        fill_page(window, 0x77000000u);
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(window, &info, sizeof(info));
         check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
               "the page mapped there is a plain read-write view");
-        fill_page(window, 0x77000000u);
         check(page_holds(window, 0x77000000u), "the page in the write-combine window holds data");
     }
     check(api.map(window, 1, nullptr) == window, "unmap the write-combine window");
