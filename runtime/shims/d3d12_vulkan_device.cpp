@@ -1526,7 +1526,8 @@ DXGI_FORMAT format_family(DXGI_FORMAT format) {
 bool depth_stencil_family(DXGI_FORMAT format) {
     const DXGI_FORMAT family = format_family(format);
     return family == DXGI_FORMAT_R32_TYPELESS || family == DXGI_FORMAT_R16_TYPELESS ||
-           family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS;
+           family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS ||
+           format == kXboxD16UnormS8Uint;  // the console's D16S8, held as D24S8 (see kXboxD16UnormS8Uint)
 }
 
 // ALLOW_RENDER_TARGET: the host refuses the families below and accepts the rest, D32_FLOAT, D16_UNORM,
