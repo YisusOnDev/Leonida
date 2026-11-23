@@ -36,9 +36,13 @@ public:
     }
     ULONG STDMETHODCALLTYPE Release() override {
         const ULONG left = --refs_;
-        if (!left) delete static_cast<Derived*>(this);
+        if (!left) Derived::final_release(static_cast<Derived*>(this));
         return left;
     }
+
+    // What the last Release does with the object. A class may declare its own to keep the object a while longer
+    // (Resource, while a queue holds work that may name it: D3D-203).
+    static void final_release(Derived* self) { delete self; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
         if (!out) return E_POINTER;

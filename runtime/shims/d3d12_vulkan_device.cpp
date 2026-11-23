@@ -1872,6 +1872,21 @@ public:
         device_.context->reclaim_if_idle();  // nothing in flight: freed now, as the host frees it
     }
 
+    // The last Release (Object::Release). A batch a queue holds on the CPU (a Wait for a fence value no Signal has
+    // reached yet, docs section 4.4) is replayed only when it is released, against the IDs, bindings and Vulkan
+    // objects of the resources it names. So while any queue holds work, a released resource stays whole (and its
+    // pointer, which is its ID, is not reused) until every operation held at this point has been submitted or
+    // dropped (QueueHolds::after_held, owner: the device state); it is destroyed then, and its Vulkan objects wait for
+    // those submissions like any others (D3D-203).
+    static void final_release(Resource* self) {
+        auto& holds = self->device_.context->holds();
+        if (!holds.any_held()) {
+            delete self;
+            return;
+        }
+        holds.after_held(&self->device_, [self] { delete self; });
+    }
+
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
     bool sparse_image() const { return sparse_image_; }
@@ -8836,6 +8851,15 @@ BindlessRoom bindless_room(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     if (!set) return {};
     return {set->free_images(leonida::ImageDimension::dim_2d), set->free_samplers()};
+}
+
+DeferredDestruction deferred_destruction(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    const Device* d = Device::from<Device>(real ? real : device);
+    if (!d || !d->state().context) return {};
+    leonida::VulkanContext& context = *d->state().context;
+    return {context.holds().pending_after(&d->state()), context.deferred_destructions()};
 }
 
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)

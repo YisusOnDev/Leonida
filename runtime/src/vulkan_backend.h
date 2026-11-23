@@ -464,6 +464,12 @@ public:
         ++count_;
     }
 
+    // Items not destroyed yet. For tests.
+    std::size_t size() {
+        std::lock_guard lock(mutex_);
+        return count_;
+    }
+
     // Drains all items with ticket <= current_ticket in O(k), invoking vkDestroy* outside the lock.
     // Uses a stack-local batch vector so concurrent drain() calls from multiple queues never race.
     void drain(std::uint64_t current_ticket, VkDevice device, const VulkanDeviceFunctions& vk) {
@@ -1534,6 +1540,9 @@ public:
         if (completed_retire_ticket() != submitted || is_device_lost()) return;
         deletion_queue_.drain(submitted + 1, device_, vk);
     }
+
+    // Vulkan objects of released resources still waiting for the submissions made before their release. For tests.
+    std::size_t deferred_destructions() { return deletion_queue_.size(); }
 
     // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
     // monotonic even when another queue completes first; global tickets are retired in order.
@@ -2810,7 +2819,9 @@ private:
 
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
 
-    // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
+    // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held). The
+    // callbacks queued behind an operation (QueueHolds::after_held: the presenter, released resources) run only after
+    // this returns, so what the operation names stays until its submission is recorded.
     bool release_ready() override {
         std::vector<std::shared_ptr<void>> retired;
         bool released = false;

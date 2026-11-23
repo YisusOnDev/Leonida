@@ -9,9 +9,10 @@
 // assignment of queue types to a, b and c (27, repeats on separate queues) and every one of the 6 orders the three
 // submissions can reach the queues in. Then: a consumer waiting for a texture from one queue and a buffer from another
 // (two waits), a chain released by a CPU Signal (the producer waits for a fence the CPU sets after everything is
-// submitted), a CPU Signal before the Wait, and two layer-only cases that must not hang: a fence nobody signals (the
-// other queues keep working, the held batch never runs, the queue is destroyed and the layer reports it), and a fence
-// released while a batch waits for it.
+// submitted), a CPU Signal before the Wait, and three layer-only cases: a fence nobody signals (the other queues keep
+// working, the held batch never runs, the queue is destroyed and the layer reports it, without a hang), a fence
+// released while a batch waits for it, and a resource released while a held batch names it and another queue's later
+// work completes (D3D-203: kept until the batch is submitted, destroyed after it completed).
 //
 // The same cases run on the Vulkan layer and on the host D3D12 runtime (the adapter is named in the output). Results are
 // compared byte for byte with the data written by the CPU: a consumer replayed against the layout from before its
@@ -547,8 +548,9 @@ std::string capture_stderr(const std::function<void()>& body) {
     return text;
 }
 
-// A batch waits for a fence nobody signals. The other queues keep working, the batch never runs, destroying the queue
-// does not hang and the layer says why. Layer only: the host runtime has nothing to report.
+// A batch waits for a fence nobody signals. The other queues keep working, the batch never runs, a resource only it
+// names is kept after its release until the queue is destroyed, destroying the queue does not hang and the layer says
+// why. Layer only: the host runtime has nothing to report.
 bool never_signaled(Rig& rig, int seed) {
     if (!rig.available[copy_q] || !rig.available[direct_q]) return true;
     arm("fence nobody signals");
@@ -574,12 +576,20 @@ bool never_signaled(Rig& rig, int seed) {
     if (!c.submit(work[1]) || !c.submit(work[0]) || !c.wait_fence(2, 1) || !c.verify()) return false;
     Sleep(100);
     if (c.fence(6)->GetCompletedValue() != 0) return c.fail("the held batch's Signal was reached", __LINE__);
+    // stage[1], which only the held batch names, is released: kept while the batch is held, then destroyed with the
+    // queue that drops the batch (D3D-203).
+    c.stage[1].texture.Reset();
+    c.stage[1].buffer.Reset();
+    if (rt::d3d12::deferred_destruction(rig.device).kept != 2)
+        return c.fail("the resources the held batch names were not kept", __LINE__);
     arm("destroy a queue with a held batch");
     const std::string log = capture_stderr([&] { victim.Reset(); });
     if (log.find("queue destroyed with") == std::string::npos || log.find("never signaled") == std::string::npos) {
         std::fprintf(stderr, "the layer did not report the held batch; stderr was: \"%s\"\n", log.c_str());
         return c.fail("no report for the held batch", __LINE__);
     }
+    if (rt::d3d12::deferred_destruction(rig.device).kept != 0)
+        return c.fail("the kept resources were not destroyed with the queue that dropped the batch", __LINE__);
     std::printf("never-signaled fence: held, others unaffected, destroyed without a hang; layer says: %s",
                 log.c_str());
     ++cases_run;
@@ -618,6 +628,82 @@ bool fence_released(Rig& rig, int seed) {
     if (!c.submit({direct_q, 0, &c.stage[1], nullptr, 3, {{6, 101}}, 2}) || !c.wait_fence(2, 1) || !c.verify())
         return false;
     std::puts("fence released while a batch waits: the batch ran and its Signal was reached");
+    ++cases_run;
+    return true;
+}
+
+// A resource released while a queue holds a batch that names it (D3D-203). Queue A's batch (stage[0] -> readback)
+// waits for a fence the CPU signals last, so it is held; queue B's work, asked for after it, completes first, again
+// and again, and stage[0] is released in between. The resource must stay whole until A's batch has been submitted
+// (which then reads it intact), and its Vulkan objects must go once that submission has completed. Layer only: the
+// counts are the layer's (rt::d3d12::deferred_destruction), and on the host runtime releasing what queued work uses
+// is the application's error.
+bool released_while_held(Rig& rig, int seed) {
+    arm("resource released while a queue holds a batch that names it");
+    Case c(rig, seed);
+    if (!c.make_resources()) return false;
+    ID3D12Device* device = rig.device;
+    // Queue B's round: upload -> stage[1], then fence 4 at the next value, which the CPU waits for.
+    UINT64 b_value = 0;
+    const auto b_round = [&] {
+        ID3D12GraphicsCommandList* list = c.make_list(copy_q, nullptr, &c.stage[1], 3);
+        if (!list) return false;
+        ID3D12CommandList* batch[] = {list};
+        rig.queues[copy_q][0]->ExecuteCommandLists(1, batch);
+        return SUCCEEDED(rig.queues[copy_q][0]->Signal(c.fence(4), ++b_value)) && c.wait_fence(4, b_value);
+    };
+    const auto b_rounds = [&](int n) {
+        for (int i = 0; i < n; ++i)
+            if (!b_round()) return false;
+        return true;
+    };
+    // stage[0] gets the data, then what earlier cases released is retired, so the counts below are this case's.
+    if (!c.submit({copy_q, 0, nullptr, &c.stage[0], 3, {}, 0}) || !c.wait_fence(0, 1)) return false;
+    if (!b_rounds(3)) return c.fail("queue B round", __LINE__);
+    const auto idle = rt::d3d12::deferred_destruction(device);
+    if (idle.kept || idle.waiting) {
+        std::fprintf(stderr, "kept %zu, waiting %zu\n", idle.kept, idle.waiting);
+        return c.fail("deferred destruction is not idle before the case", __LINE__);
+    }
+
+    // Queue A: Wait(fence 3, 1), stage[0] -> readback, Signal(fence 2, 1); held, fence 3 has no Signal yet.
+    if (!c.submit({direct_q, 0, &c.stage[0], nullptr, 3, {{3, 1}}, 2})) return false;
+    // Queue B's later work completes first; the application releases stage[0]; B's work goes on completing.
+    if (!b_round()) return c.fail("queue B round", __LINE__);
+    c.stage[0].texture.Reset();
+    c.stage[0].buffer.Reset();
+    if (!b_rounds(3)) return c.fail("queue B round", __LINE__);
+    if (c.fence(2)->GetCompletedValue() != 0) return c.fail("the held batch ran before the CPU Signal", __LINE__);
+    const auto held = rt::d3d12::deferred_destruction(device);
+    std::printf("released while held, after 4 completed submissions on queue B: kept %zu, waiting %zu\n", held.kept,
+                held.waiting);
+    if (held.kept != 2 || held.waiting)
+        return c.fail("the released resource was destroyed before the batch that names it was submitted", __LINE__);
+
+    // The CPU Signal releases A's batch: it is submitted, then the resource is destroyed and its Vulkan objects wait
+    // for that submission.
+    bool signaled = false;
+    const std::string log = capture_stderr([&] { signaled = SUCCEEDED(c.fence(3)->Signal(1)); });
+    if (!signaled) return c.fail("CPU Signal failed", __LINE__);
+    if (!log.empty()) {
+        std::fprintf(stderr, "stderr was: \"%s\"\n", log.c_str());
+        return c.fail("the layer reported a problem when the held batch was released", __LINE__);
+    }
+    const auto submitted = rt::d3d12::deferred_destruction(device);
+    std::printf("CPU Signal (held batch submitted): kept %zu, waiting %zu\n", submitted.kept, submitted.waiting);
+    if (submitted.kept || !submitted.waiting)
+        return c.fail("the resource was not destroyed once the held batch was submitted", __LINE__);
+    if (!c.wait_fence(2, 1) || !c.verify()) return false;  // the batch read stage[0] intact
+
+    // A's submissions have completed. The objects also wait for the submission after the last one made before their
+    // release (one may be in flight then): queue B's next round is that one, and the round after it destroys them
+    // when it starts.
+    if (!b_rounds(2)) return c.fail("queue B round", __LINE__);
+    const auto done = rt::d3d12::deferred_destruction(device);
+    std::printf("after the held batch completed and 2 more submissions on queue B: kept %zu, waiting %zu\n", done.kept,
+                done.waiting);
+    if (done.kept || done.waiting)
+        return c.fail("the resource's Vulkan objects were not destroyed after the held batch completed", __LINE__);
     ++cases_run;
     return true;
 }
@@ -839,10 +925,11 @@ bool run_all(ID3D12Device* device, bool layer) {
     ok &= fence_released_in_flight(rig, ++seed);
     ok &= concurrent_signalling(rig, 200, seed += 1000);
     if (layer) {
-        // The layer hands out a limited number of VkQueues: give the spare ones back for the two cases below.
+        // The layer hands out a limited number of VkQueues: give the spare ones back for the cases below.
         for (auto& type_queues : rig.queues)
             for (int i = 1; i < pool_size; ++i) type_queues[i].Reset();
         ok &= never_signaled(rig, ++seed);
+        ok &= released_while_held(rig, ++seed);
         ok &= held_signal_survives_release(rig, ++seed);
         ok &= monotonic_shared_fence(rig, ++seed);
         ok &= teardown_wakes_cpu_waiters(rig, ++seed);

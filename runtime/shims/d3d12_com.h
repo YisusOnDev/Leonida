@@ -284,6 +284,15 @@ struct BindlessRoom {
     std::uint32_t samplers = 0;
 };
 BindlessRoom bindless_room(ID3D12Device* device);
+// Deferred destruction of released resources, for tests (docs section 4.4, D3D-203). `kept`: resources released
+// while a queue held work on the CPU, kept whole until every operation held then has been submitted or dropped.
+// `waiting`: Vulkan objects of destroyed resources that wait for the submissions made before them to complete. Zeros
+// when `device` is not a Vulkan-backed device.
+struct DeferredDestruction {
+    std::size_t kept = 0;
+    std::size_t waiting = 0;
+};
+DeferredDestruction deferred_destruction(ID3D12Device* device);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

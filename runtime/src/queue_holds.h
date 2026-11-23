@@ -21,9 +21,9 @@ namespace leonida {
 //
 // This class is the device-wide half: for every fence, the highest value a Signal has been submitted for (or the
 // CPU has set it to), which is not the completed value; the held queues, which it asks to release whatever became
-// ready; and "after held work" callbacks (the presenter), which run once every operation held when they were
-// registered has been released. It owns no Vulkan objects. Semaphores it was never told about count as satisfied,
-// so a queue used with a plain VkSemaphore behaves as before.
+// ready; and "after held work" callbacks (the presenter, and resources released while work is held: D3D-203), which
+// run once every operation held when they were registered has been released or dropped. It owns no Vulkan objects.
+// Semaphores it was never told about count as satisfied, so a queue used with a plain VkSemaphore behaves as before.
 //
 // Threads. No GPU wait happens here, but the thread that makes a wait satisfiable (a queue's Signal, a CPU Signal)
 // does the release itself, after it has dropped its own queue's state lock: it records and submits the held
@@ -158,6 +158,14 @@ public:
                 }
         }
         pump_ready();
+    }
+
+    // Callbacks of `owner` that have not run yet. For tests.
+    std::size_t pending_after(const void* owner) const {
+        std::lock_guard lock(mutex_);
+        std::size_t count = 0;
+        for (const Barrier& barrier : barriers_) count += barrier.owner == owner;
+        return count;
     }
 
     // Held operations over all queues, for the cheap "is there anything to do" test.
