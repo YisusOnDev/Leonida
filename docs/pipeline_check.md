@@ -333,8 +333,9 @@ Not measured: other AMD GPU families, other vendors' Windows drivers, and a corp
 `--wave64-emulate`.
 
 **The runtime.** The D3D12 shim creates a pipeline on the thread that asks for it
-(`runtime/shims/d3d12_vulkan_device.cpp`), so there the compiler runs on a game thread. The entry thread has 8 MB
-from `run_entry` (`runtime/shims/process_shim.h`). A thread the game starts with `dwStackSize` 0, a thread-pool
+(`runtime/shims/d3d12_vulkan_device.cpp`), so there the compiler runs on a game thread. The entry thread has at least
+8 MB from `run_entry` (`runtime/shims/process_shim.h`), more when the image names a larger reserve. A thread the game
+starts with `dwStackSize` 0, a thread-pool
 thread and a `std::thread` of the shims get the reserve in `gta6rt.exe`'s header, because the game's `CreateThread`
 is Windows' own. `gta6rt` is therefore linked with the same 8 MB (`GTA6RT_STACK` in `runtime/CMakeLists.txt`, and
 the loader's `cl` line in `scripts/build_runtime.ps1`). The CTest `gta6rt_stack` reads the header, and

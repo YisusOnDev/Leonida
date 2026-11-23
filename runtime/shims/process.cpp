@@ -22,8 +22,12 @@
 // title can import them by: kernel32.dll (the classic import libraries), kernelbase.dll, and the API sets that the
 // umbrella libraries a GDK title links (OneCore_apiset.lib, mincore.lib) bind them to. The retail package's own DLLs
 // import ExitProcess from api-ms-win-core-processthreads-l1-1-0.dll.
+// CreateThread and _beginthreadex supply the mapped image's stack reserve (RT-119).
 #include <windows.h>
 
+#include <process.h>
+
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -31,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <string>
@@ -54,6 +59,13 @@ std::wstring g_wcmdline;
 int g_argc = 0;
 char** g_argv_ptr = nullptr;
 wchar_t** g_wargv_ptr = nullptr;
+
+std::size_t g_stack_reserve = 0;  // the mapped image's reserve; 0 until set_thread_stack is called
+
+// RT-119 + BUILD-1457 (PR #5468): use the mapped image's reserve when it is larger than the loader's own 8 MB, and
+// never less. #5468 gives every thread that asks for no size at least 8 MB through gta6rt.exe's PE header; a game
+// image that names a smaller reserve (Windows' 1 MB default, for one) must not take that guarantee away.
+std::size_t game_stack_reserve() { return std::max(g_stack_reserve, kDefaultStackReserve); }
 
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};
@@ -353,6 +365,34 @@ int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, v
     return 0;
 }
 
+// ---- thread stacks (RT-119)
+// A nonzero explicit reserve is caller-owned. For a default reserve or a commit request, pass a reserve
+// explicitly so Windows uses the mapped image's size and the host's default commit.
+template <typename Size, typename Flags>
+void use_image_stack_reserve(Size& stack, Flags& flags) {
+    if (stack != 0 && (flags & STACK_SIZE_PARAM_IS_A_RESERVATION)) return;
+
+    constexpr std::size_t rounding_mask = (1u << 20) - 1;
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    constexpr std::size_t argument_limit = std::numeric_limits<Size>::max();
+    const std::size_t commit = stack;
+    const auto rounded_commit = commit > max_size - rounding_mask ? max_size : (commit + rounding_mask) & ~rounding_mask;
+    stack = static_cast<Size>(std::min(std::max(game_stack_reserve(), rounded_commit), argument_limit));
+    flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
+}
+
+HANDLE __stdcall game_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack, LPTHREAD_START_ROUTINE start,
+                                    LPVOID parameter, DWORD flags, LPDWORD thread_id) {
+    use_image_stack_reserve(stack, flags);
+    return CreateThread(attributes, stack, start, parameter, flags, thread_id);
+}
+
+uintptr_t __cdecl game_begin_threadex(void* security, unsigned stack, unsigned(__stdcall* start)(void*), void* arg,
+                                      unsigned flags, unsigned* thread_id) {
+    use_image_stack_reserve(stack, flags);
+    return _beginthreadex(security, stack, start, arg, flags, thread_id);
+}
+
 struct EntryCall {
     void* entry;
 };
@@ -399,6 +439,8 @@ LPTOP_LEVEL_EXCEPTION_FILTER __stdcall game_set_unhandled_exception_filter(LPTOP
 
 }  // namespace
 
+void set_thread_stack(std::size_t reserve_bytes) { g_stack_reserve = reserve_bytes; }
+
 void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args) {
     g_input_wargs.clear();
     g_input_wargs.push_back(program);
@@ -434,6 +476,7 @@ int run_entry(void* entry, size_t stack_bytes) {
     if (!g_done) return -1;
     g_running = true;
     EntryCall call{entry};
+    if (!stack_bytes) stack_bytes = game_stack_reserve();  // the mapped image's /STACK
     HANDLE thread = CreateThread(nullptr, stack_bytes, game_thread, &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!thread) {
         g_running = false;
@@ -488,6 +531,8 @@ using namespace rt::process;
 #define COMMAND_LINE(dll) \
     {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
+#define CREATE_THREAD(dll) {dll, "CreateThread", reinterpret_cast<void*>(&game_create_thread)}
+#define BEGIN_THREADEX(dll) {dll, "_beginthreadex", reinterpret_cast<void*>(&game_begin_threadex)}
 }  // namespace
 
 SHIM_TABLE(process,
@@ -515,4 +560,14 @@ SHIM_TABLE(process,
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
+    CREATE_THREAD("kernel32.dll"),
+    CREATE_THREAD("kernelbase.dll"),
+    CREATE_THREAD("api-ms-win-core-processthreads-l1-1-0.dll"),
+    CREATE_THREAD("api-ms-win-core-processthreads-l1-1-1.dll"),
+    CREATE_THREAD("api-ms-win-core-processthreads-l1-1-2.dll"),
+    CREATE_THREAD("api-ms-win-core-processthreads-l1-1-3.dll"),
+    BEGIN_THREADEX("api-ms-win-crt-runtime-l1-1-0.dll"),
+    BEGIN_THREADEX("ucrtbase.dll"),
+    BEGIN_THREADEX("ucrtbased.dll"),
+    BEGIN_THREADEX("msvcrt.dll"),
 );

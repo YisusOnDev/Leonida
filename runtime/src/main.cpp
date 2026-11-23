@@ -219,6 +219,10 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
         std::exception_ptr init_failure;
+        // Before any image code runs (TLS callbacks and DllMain in initialise() can create threads), teach the
+        // process/thread shims the mapped image's /STACK reserve (RT-119). 0 or less takes gta6rt's 8 MB /STACK
+        // floor (BUILD-1457).
+        rt::process::set_thread_stack(static_cast<std::size_t>(main_module.stack_reserve_bytes));
         if (init || run) {
             try {
                 loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs

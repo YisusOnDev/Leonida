@@ -1682,6 +1682,8 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
+    m->stack_reserve_bytes = oh.SizeOfStackReserve;
+    m->stack_commit_bytes = oh.SizeOfStackCommit;
     by_name_[module_key(path)] = m;
     order_.push_back(m);
 
