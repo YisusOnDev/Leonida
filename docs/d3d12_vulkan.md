@@ -822,6 +822,26 @@ The compute path, end to end:
     `LEONIDA_ARENA_LOG=1` also logs one line per VA handed out, per refused allocation, and per upload or readback
     buffer VA outside the arena.
   - Default-heap buffers are 64 KiB-aligned ranges in it, zeroed through its mapping; their console VA is the offset.
+  - A released default-heap buffer's range goes back through the device's deletion queue, as the buffer's Vulkan
+    objects do (`DeferredDeletionQueue::Kind::arena_range`, D3D-475): once every submission made before the release,
+    on any queue, has completed, and the one after it, since a submission that has already resolved the buffer may
+    still be on its way to `vkQueueSubmit`. It used to go back at once, so the next buffer placed there was
+    zero-filled through the mapping under a read still in flight. An allocation that finds no room while such ranges
+    are on their way takes back those the GPU is done with (`VulkanContext::reclaim_retired`: with the resource and
+    tracker locks held no submission is half-recorded, so a range released after the last recorded submission is
+    free once that one has completed), then waits for the device to go idle and tries once more; only then is it
+    `E_OUTOFMEMORY`. Allocations that fit cost what they did. Measured (`d3d12_arena_retire_test`, RTX 3060, driver
+    617.14, `LEONIDA_VK_VALIDATION=1` with sync validation, 0 messages): queue A copies a 1 MiB buffer to a readback
+    buffer behind a `Wait` for a fence queue C signals after about 300 ms of 64 MiB copies, C's `Signal` submitted
+    first so A's batch is submitted (a GPU wait, not a batch held on the CPU); the buffer is released and a 1 MiB
+    buffer made while the gate is closed. Before: the new buffer got the released range (VA 0x10000) and the read
+    found all 262144 words zero. Now: it gets 0x110000, the read matches, and once the read and the submission after
+    it have completed the next buffer gets 0x10000 back. With a 16 MiB arena, a 12 MiB buffer made and released four
+    times with nothing submitted gets the same range each time, and one made while a released 12 MiB buffer waits for
+    a gated read waits for the device (280 ms) and gets that range, where before it took it at once (1.4 ms) and the
+    read found 3145728 of 3145728 words zero. Not covered: heaps (`CreateHeap`, whose placed buffers are ranges of
+    the heap's range), shader-visible descriptor heaps and shader code still go back to the arena when the object is
+    destroyed, as D3D12 lets the layer require of the application for those objects.
   - Shader-visible descriptor heaps also live in it: the CPU handle is its host mapping and the GPU handle is the VA,
     so descriptor bytes the application writes itself are what shaders load.
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
@@ -985,9 +1005,9 @@ The compute path, end to end:
   - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
 
   **Resources and heaps:**
-  - A buffer of 0 bytes, or one whose size wraps when aligned, is `E_INVALIDARG`. One the arena cannot hold is
-    `E_OUTOFMEMORY`, and so is a shader-visible descriptor heap the arena cannot hold (in host memory its GPU
-    handle would be 0).
+  - A buffer of 0 bytes, or one whose size wraps when aligned, is `E_INVALIDARG`. One the arena cannot hold, even
+    after the ranges of released buffers have come back (GPU address arena above, D3D-475), is `E_OUTOFMEMORY`, and
+    so is a shader-visible descriptor heap the arena cannot hold (in host memory its GPU handle would be 0).
   - If the arena cannot be created, its buffer is released, so other buffers keep their own memory and get no VA.
   - With `VK_EXT_conditional_rendering`, the arena is created with the conditional-rendering usage, and
     `SetPredication` on a default-heap buffer reads at the buffer's offset in the arena plus the call's offset.

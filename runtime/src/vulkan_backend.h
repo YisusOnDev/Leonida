@@ -416,16 +416,20 @@ public:
         semaphore,  // a released fence's timeline semaphore (D3D-486)
         device_memory,
         acceleration_structure,
+        arena_range,  // a default-heap buffer's range of the GPU address arena (D3D-475)
         framebuffer,
     };
 
     struct Item {
         std::uint64_t ticket = 0;
-        std::uint64_t handle = 0;  // for bindless_slot: (uint64_t(dimension) << 32) | index
+        // for bindless_slot: (uint64_t(dimension) << 32) | index; for arena_range: (offset << 32) | bytes, both below
+        // 4 GiB as the arena is
+        std::uint64_t handle = 0;
         Kind kind = Kind::image_view;
     };
 
     using BindlessReleaseFn = void (*)(void* user, std::uint32_t dimension, std::uint32_t index);
+    using ArenaReleaseFn = void (*)(void* user, std::uint64_t offset, std::uint64_t bytes);
 
     explicit DeferredDeletionQueue(std::size_t initial_capacity = 256) : pending_(next_pow2(initial_capacity)) {}
 
@@ -433,6 +437,13 @@ public:
         std::lock_guard lock(mutex_);
         bindless_release_fn_ = fn;
         bindless_release_user_ = user;
+    }
+
+    // Who takes arena_range items back: the device that owns the arena.
+    void set_arena_release(ArenaReleaseFn fn, void* user) {
+        std::lock_guard lock(mutex_);
+        arena_release_fn_ = fn;
+        arena_release_user_ = user;
     }
 
     void push(std::uint64_t retire_ticket, Kind kind, std::uint64_t handle) {
@@ -458,12 +469,16 @@ public:
     void drain(std::uint64_t current_ticket, VkDevice device, const VulkanDeviceFunctions& vk) {
         BindlessReleaseFn release_fn = nullptr;
         void* release_user = nullptr;
+        ArenaReleaseFn arena_fn = nullptr;
+        void* arena_user = nullptr;
         std::vector<Item> to_destroy;
         {
             std::lock_guard lock(mutex_);
             if (count_ == 0 || pending_[head_].ticket > current_ticket) return;
             release_fn = bindless_release_fn_;
             release_user = bindless_release_user_;
+            arena_fn = arena_release_fn_;
+            arena_user = arena_release_user_;
             const std::size_t mask = pending_.size() - 1;
             while (count_ > 0 && pending_[head_].ticket <= current_ticket) {
                 to_destroy.push_back(pending_[head_]);
@@ -508,6 +523,9 @@ public:
                     vk.vkDestroyAccelerationStructureKHR(
                         device, reinterpret_cast<VkAccelerationStructureKHR>(item.handle), nullptr);
                 break;
+            case Kind::arena_range:
+                if (arena_fn) arena_fn(arena_user, item.handle >> 32, item.handle & 0xFFFFFFFFu);
+                break;
             case Kind::framebuffer:
                 vk.vkDestroyFramebuffer(device, reinterpret_cast<VkFramebuffer>(item.handle), nullptr);
                 break;
@@ -529,6 +547,8 @@ private:
     std::size_t count_ = 0;
     BindlessReleaseFn bindless_release_fn_ = nullptr;
     void* bindless_release_user_ = nullptr;
+    ArenaReleaseFn arena_release_fn_ = nullptr;
+    void* arena_release_user_ = nullptr;
 };
 
 // Centralized single-thread fence dispatcher using Vulkan 1.2 vkWaitSemaphores(VK_SEMAPHORE_WAIT_ANY_BIT).
@@ -1430,6 +1450,9 @@ public:
         deletion_queue_.set_bindless_release(fn, user);
     }
 
+    void set_arena_release(DeferredDeletionQueue::ArenaReleaseFn fn, void* user) {
+        deletion_queue_.set_arena_release(fn, user);
+    }
     // The ticket of the latest submission: everything submitted so far is at or below it, and a resource that any
     // of that work may use can be freed once completed_retire_ticket() has reached it. Tickets run over all queues,
     // each recorded with its queue's timeline value, so this waits for every queue's timeline to pass what was
@@ -1520,6 +1543,23 @@ public:
     }
     void retire_queue_idle_locked(VkSemaphore progress) {
         retire_tickets_.queue_idle(progress);
+    }
+
+    // For an allocator out of room (the GPU address arena, D3D-475): destroys and gives back what is retired now,
+    // having first waited for the device to finish everything submitted when `wait` is set. With resource_mutex_ and
+    // tracker_mutex_ held no submission is between resolving resources and recording its ticket, so once every
+    // recorded submission has completed, what was released after the last of them no longer waits for the next one.
+    void reclaim_retired(bool wait) {
+        std::unique_lock resource_lock(resource_mutex_);
+        std::lock_guard tracker_lock(tracker_mutex_);
+        if (wait && !is_device_lost()) {
+            std::lock_guard submit(submit_mutex_);  // vkDeviceWaitIdle needs every VkQueue externally synchronized
+            if (vk.vkDeviceWaitIdle(device_) == VK_ERROR_DEVICE_LOST) mark_device_lost();
+        }
+        const std::uint64_t submitted = submitted_ticket_.load(std::memory_order_acquire);
+        const std::uint64_t done = completed_retire_ticket();
+        if (is_device_lost()) return;
+        deletion_queue_.drain(done == submitted ? done + 1 : done, device_, vk);
     }
 
     VulkanDeviceFunctions vk;
