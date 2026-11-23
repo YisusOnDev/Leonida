@@ -277,6 +277,7 @@ struct Target {
     DWORD error = 0;  // non-zero: the caller fails with this error and does not touch the host
     // A write-open's hold on the folder it opens in, until the Target goes after the host open (g_folder_locks).
     std::unique_lock<std::mutex> folder;
+    bool replaces_package_file = false;  // CREATE_ALWAYS on a file only the package has: see open_target
 };
 
 Target fail(DWORD error) {
@@ -610,28 +611,40 @@ bool writes(DWORD access, DWORD disposition, DWORD flags) {
 
 Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DWORD flags = 0) {
     if (!writes(access, disposition, flags)) return read_target(path);
-    // CREATE_NEW fails on any name the title can see; the host would only look in the overlay, so a file only the
-    // package has would be shadowed by a new empty one.
-    if (disposition == CREATE_NEW) {
-        std::vector<std::wstring> parts;
-        if (parse_console(path, parts) == Parsed::Console && !parts.empty() && view(roots(), parts).kind != Kind::None)
-            return fail(ERROR_FILE_EXISTS);
-    }
     // OPEN_ALWAYS and TRUNCATE_EXISTING read what is already there, and a write-open must not lose a package file's
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
         disposition == OPEN_EXISTING || disposition == OPEN_ALWAYS || disposition == TRUNCATE_EXISTING;
-    // CREATE_NEW goes to the overlay, where a file only the package has is not there to refuse it. With
-    // FILE_FLAG_DELETE_ON_CLOSE the new overlay file would then be what the close deletes and the marker would hide
-    // the package file, so the open is refused here as the host refuses it for a file that exists. A name a deletion
-    // marker has freed is not in the title's view and can be created.
+    // The host is asked about the overlay name, which a name only the package has does not have yet, so what a
+    // creating open answers for a name that exists is decided here: a folder's name cannot be created as a file,
+    // CREATE_NEW fails on a file, and CREATE_ALWAYS replaces it and says so (OPEN_ALWAYS does through its copy-up).
+    // FILE_FLAG_BACKUP_SEMANTICS is how a folder is opened: with it the host refuses CREATE_NEW and CREATE_ALWAYS
+    // on a folder with ERROR_FILE_EXISTS, and OPEN_ALWAYS opens the folder and reports ERROR_ALREADY_EXISTS itself.
+    // That open goes to the package folder when it asks for no write access, as OPEN_EXISTING does, and otherwise
+    // to a mirror of the folder in the overlay, as SetFileAttributes makes one, so the package is not written.
+    bool replaces_package_file = false;
     std::vector<std::wstring> parts;
-    if (disposition == CREATE_NEW && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0 &&
+    if (disposition != OPEN_EXISTING && disposition != TRUNCATE_EXISTING &&
         parse_console(path, parts) == Parsed::Console) {
         const View v = view(roots(), parts);
-        if (v.kind == Kind::File && v.in_package && !v.in_overlay) return fail(ERROR_FILE_EXISTS);
+        if (v.in_package && !v.in_overlay) {
+            if (v.kind == Kind::Directory) {
+                if ((flags & FILE_FLAG_BACKUP_SEMANTICS) == 0) return fail(ERROR_ACCESS_DENIED);
+                if (disposition != OPEN_ALWAYS) return fail(ERROR_FILE_EXISTS);
+                if (!writes(access, OPEN_EXISTING, flags)) return read_target(path);
+                Target folder = write_target(path, false);
+                std::error_code ec;
+                if (!folder.error) std::filesystem::create_directories(folder.path, ec);
+                if (ec) folder.error = static_cast<DWORD>(ec.value());
+                return folder;
+            }
+            if (disposition == CREATE_NEW) return fail(ERROR_FILE_EXISTS);
+            replaces_package_file = disposition == CREATE_ALWAYS;
+        }
     }
-    return write_target(path, keeps_contents);
+    Target t = write_target(path, keeps_contents);
+    t.replaces_package_file = replaces_package_file;
+    return t;
 }
 
 // A delete-on-close open that succeeded is on the overlay copy, which the host removes at the last close. A name the
@@ -876,6 +889,7 @@ HANDLE open_file(const char* api, const void* caller, LPCWSTR name, DWORD access
     } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
         opened_delete_on_close(name, last_error);
     }
+    if (h != INVALID_HANDLE_VALUE && t.replaces_package_file) SetLastError(ERROR_ALREADY_EXISTS);
     return h;
 }
 
@@ -915,6 +929,7 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
     } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
         opened_delete_on_close(name, last_error);
     }
+    if (h != INVALID_HANDLE_VALUE && t.replaces_package_file) SetLastError(ERROR_ALREADY_EXISTS);
     return h;
 }
 

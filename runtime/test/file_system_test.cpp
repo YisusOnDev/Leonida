@@ -2212,6 +2212,165 @@ void run_checks(const std::filesystem::path& root) {
                   GetLastError() == ERROR_NOT_SAME_DEVICE && !std::filesystem::exists(away),
               "a move from GAME: to a host path outside the game folder is ERROR_NOT_SAME_DEVICE");
     }
+
+    // A creating open answers for a name only the package has the way the host answers for a name that exists:
+    // CREATE_NEW fails with ERROR_FILE_EXISTS, CREATE_ALWAYS and OPEN_ALWAYS succeed and report ERROR_ALREADY_EXISTS,
+    // and a folder's name cannot be created as a file (ERROR_ACCESS_DENIED).
+    {
+        const auto create2 = resolve<CreateFile2Fn>("kernel32.dll", "CreateFile2");
+        for (const char* name : {"new.txt", "new2.txt", "always.txt", "always2.txt", "openalways.txt"})
+            write_path(package / "exists" / name, "package");
+        write_path(package / "exists" / "folder" / "inside.txt", "package");
+
+        SetLastError(0);
+        HANDLE h = create_w(L"GAME:\\exists\\new.txt", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        DWORD error = GetLastError();
+        check(h == INVALID_HANDLE_VALUE && error == ERROR_FILE_EXISTS,
+              "CREATE_NEW on a name only the package has fails with ERROR_FILE_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!std::filesystem::exists(overlay / "exists" / "new.txt"), "the refused CREATE_NEW leaves no overlay file");
+        h = create_w(L"GAME:\\exists\\new.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
+              "the package file still reads after the refused CREATE_NEW");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+
+        CREATEFILE2_EXTENDED_PARAMETERS ext{};
+        ext.dwSize = sizeof(ext);
+        SetLastError(0);
+        h = create2 ? create2(L"GAME:\\exists\\new2.txt", GENERIC_WRITE, 0, CREATE_NEW, &ext)
+                    : INVALID_HANDLE_VALUE;
+        error = GetLastError();
+        check(h == INVALID_HANDLE_VALUE && error == ERROR_FILE_EXISTS,
+              "CreateFile2 CREATE_NEW on a name only the package has fails with ERROR_FILE_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+
+        SetLastError(0);
+        h = create_w(L"GAME:\\exists\\always.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && error == ERROR_ALREADY_EXISTS,
+              "CREATE_ALWAYS on a name only the package has succeeds and reports ERROR_ALREADY_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        SetLastError(0);
+        h = create2 ? create2(L"GAME:\\exists\\always2.txt", GENERIC_WRITE, 0, CREATE_ALWAYS, &ext) : INVALID_HANDLE_VALUE;
+        error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && error == ERROR_ALREADY_EXISTS,
+              "CreateFile2 CREATE_ALWAYS on a name only the package has reports ERROR_ALREADY_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        SetLastError(0);
+        h = create_w(L"GAME:\\exists\\openalways.txt", GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+        error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && error == ERROR_ALREADY_EXISTS,
+              "OPEN_ALWAYS on a name only the package has succeeds and reports ERROR_ALREADY_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+
+        // A name that is new to the title, or one it deleted, is created without the report.
+        SetLastError(ERROR_ALREADY_EXISTS);
+        h = create_w(L"GAME:\\exists\\fresh.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && error == ERROR_SUCCESS, "CREATE_ALWAYS on a new name reports no error");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(delete_w(L"GAME:\\exists\\always.txt") != FALSE, "the replaced file can be deleted");
+        SetLastError(ERROR_ALREADY_EXISTS);
+        h = create_w(L"GAME:\\exists\\always.txt", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && error == ERROR_SUCCESS, "CREATE_NEW makes a name the title deleted again");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+
+        // With FILE_FLAG_DELETE_ON_CLOSE the answers are the same, and a refused open deletes nothing.
+        constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        SetLastError(0);
+        h = create_w(L"GAME:\\exists\\new.txt", GENERIC_READ, kShareAll, nullptr, CREATE_NEW, FILE_FLAG_DELETE_ON_CLOSE,
+                     nullptr);
+        error = GetLastError();
+        check(h == INVALID_HANDLE_VALUE && error == ERROR_FILE_EXISTS,
+              "CREATE_NEW with delete-on-close on a name only the package has fails with ERROR_FILE_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!std::filesystem::exists(overlay / ".gta6rt-deleted" / "exists" / "new.txt") &&
+                  attributes_w(L"GAME:\\exists\\new.txt") != INVALID_FILE_ATTRIBUTES,
+              "the refused open leaves no deletion marker and the name in place");
+        SetLastError(0);
+        h = create_w(L"GAME:\\exists\\new2.txt", GENERIC_READ, kShareAll, nullptr, CREATE_ALWAYS,
+                     FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && error == ERROR_ALREADY_EXISTS,
+              "CREATE_ALWAYS with delete-on-close on a name only the package has reports ERROR_ALREADY_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\exists\\new2.txt") == INVALID_FILE_ATTRIBUTES &&
+                  read_path(package / "exists" / "new2.txt") == "package",
+              "and after the close the name is gone while the package keeps the file");
+        // new2.txt is now a name the title deleted: CREATE_NEW makes it, and the close deletes it again.
+        SetLastError(ERROR_ALREADY_EXISTS);
+        h = create_w(L"GAME:\\exists\\new2.txt", GENERIC_READ, kShareAll, nullptr, CREATE_NEW, FILE_FLAG_DELETE_ON_CLOSE,
+                     nullptr);
+        error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && error == ERROR_SUCCESS,
+              "CREATE_NEW with delete-on-close makes a name the title deleted");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\exists\\new2.txt") == INVALID_FILE_ATTRIBUTES &&
+                  !std::filesystem::exists(overlay / "exists" / "new2.txt") &&
+                  read_path(package / "exists" / "new2.txt") == "package",
+              "and it is gone again after the close, with the package file untouched");
+
+        CREATEFILE2_EXTENDED_PARAMETERS backup{};
+        backup.dwSize = sizeof(backup);
+        backup.dwFileFlags = FILE_FLAG_BACKUP_SEMANTICS;
+
+        // A package folder's name, for each disposition that would create a file there.
+        for (const DWORD disposition : {DWORD{CREATE_NEW}, DWORD{CREATE_ALWAYS}, DWORD{OPEN_ALWAYS}}) {
+            SetLastError(0);
+            h = create_w(L"GAME:\\exists\\folder", GENERIC_WRITE, 0, nullptr, disposition, 0, nullptr);
+            error = GetLastError();
+            check(h == INVALID_HANDLE_VALUE && error == ERROR_ACCESS_DENIED,
+                  "a creating open of a package folder's name fails with ERROR_ACCESS_DENIED");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        }
+        check(!std::filesystem::exists(overlay / "exists" / "folder"), "no overlay file shadows the package folder");
+
+        // With FILE_FLAG_BACKUP_SEMANTICS the host opens folders: CREATE_NEW and CREATE_ALWAYS on a folder's name fail
+        // with ERROR_FILE_EXISTS, and OPEN_ALWAYS returns a handle to the folder with ERROR_ALREADY_EXISTS.
+        for (const DWORD disposition : {DWORD{CREATE_NEW}, DWORD{CREATE_ALWAYS}}) {
+            SetLastError(0);
+            h = create_w(L"GAME:\\exists\\folder", GENERIC_READ, kShareAll, nullptr, disposition,
+                         FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            error = GetLastError();
+            check(h == INVALID_HANDLE_VALUE && error == ERROR_FILE_EXISTS,
+                  "CREATE_NEW or CREATE_ALWAYS with backup semantics on a package folder fails with ERROR_FILE_EXISTS");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        }
+        const auto is_folder_handle = [](HANDLE handle) {
+            BY_HANDLE_FILE_INFORMATION info{};
+            return handle != INVALID_HANDLE_VALUE && ::GetFileInformationByHandle(handle, &info) != FALSE &&
+                   (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        };
+        SetLastError(0);
+        h = create_w(L"GAME:\\exists\\folder", GENERIC_READ, kShareAll, nullptr, OPEN_ALWAYS, FILE_FLAG_BACKUP_SEMANTICS,
+                     nullptr);
+        error = GetLastError();
+        check(is_folder_handle(h) && error == ERROR_ALREADY_EXISTS,
+              "OPEN_ALWAYS with backup semantics opens a package folder and reports ERROR_ALREADY_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!std::filesystem::exists(overlay / "exists" / "folder"),
+              "a read-only folder handle leaves nothing in the overlay");
+        SetLastError(0);
+        h = create_w(L"GAME:\\exists\\folder", GENERIC_WRITE, kShareAll, nullptr, OPEN_ALWAYS,
+                     FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        error = GetLastError();
+        check(is_folder_handle(h) && error == ERROR_ALREADY_EXISTS,
+              "OPEN_ALWAYS with backup semantics and write access opens a folder too");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(std::filesystem::is_directory(overlay / "exists" / "folder") &&
+                  attributes_w(L"GAME:\\exists\\folder\\inside.txt") != INVALID_FILE_ATTRIBUTES,
+              "a writable folder handle is on the overlay's mirror of the folder, and the package's files stay visible");
+        SetLastError(0);
+        h = create2 ? create2(L"GAME:\\exists\\folder", GENERIC_READ, kShareAll, OPEN_ALWAYS, &backup)
+                    : INVALID_HANDLE_VALUE;
+        error = GetLastError();
+        check(is_folder_handle(h) && error == ERROR_ALREADY_EXISTS,
+              "CreateFile2 OPEN_ALWAYS with backup semantics opens the folder");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\exists\\folder\\inside.txt") != INVALID_FILE_ATTRIBUTES,
+              "the package folder's file is still visible");
+    }
 }
 
 }  // namespace

@@ -247,6 +247,12 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   package is never written.
   An open with `FILE_FLAG_DELETE_ON_CLOSE` is treated as a delete regardless of the access it asks for (the host adds
   `DELETE`): it uses the overlay copy, and a package name gets its marker once the open has succeeded.
+  A creating open treats a name only the package has as existing: `CREATE_NEW` fails with `ERROR_FILE_EXISTS`,
+  `CREATE_ALWAYS` and `OPEN_ALWAYS` succeed with `ERROR_ALREADY_EXISTS` as the last error, and a package folder's
+  name cannot be created as a file (`ERROR_ACCESS_DENIED`).
+  With `FILE_FLAG_BACKUP_SEMANTICS`, which is how a folder is opened, `CREATE_NEW` and `CREATE_ALWAYS` on a folder fail
+  with `ERROR_FILE_EXISTS` and `OPEN_ALWAYS` opens it: the package folder for read access, a mirror of it in the
+  overlay for write access.
 - `DeleteFileA/W` checks the visible file's `FILE_ATTRIBUTE_READONLY`: a read-only package file with no overlay is
   refused with `ERROR_ACCESS_DENIED` before writing a deletion marker. An overlay copy supplies its own attributes,
   so a writable overlay can still be deleted when the package file underneath is read-only. The native A/W controls
