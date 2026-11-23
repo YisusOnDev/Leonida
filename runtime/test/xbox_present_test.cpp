@@ -30,6 +30,8 @@
 #include <io.h>
 #include <iterator>
 #include <string>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -89,6 +91,43 @@ struct Ref {
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     return DefWindowProcW(window, message, w, l);
 }
+
+// The test device's loader, with vkAcquireNextImageKHR held at VK_TIMEOUT while `hold` is set: a present then waits
+// for a swapchain image (VulkanPresenter::acquire polls its abort callback) until SuspendX gives up on it.
+namespace held_acquire {
+PFN_vkGetInstanceProcAddr real_instance_proc = nullptr;
+PFN_vkGetDeviceProcAddr real_device_proc = nullptr;
+PFN_vkAcquireNextImageKHR real_acquire = nullptr;
+std::atomic<bool> hold{false};
+std::atomic<unsigned> held_calls{0};
+
+VKAPI_ATTR VkResult VKAPI_CALL acquire(VkDevice device, VkSwapchainKHR swapchain, std::uint64_t timeout,
+                                       VkSemaphore semaphore, VkFence fence, std::uint32_t* image) {
+    if (hold.load()) {
+        ++held_calls;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return VK_TIMEOUT;
+    }
+    return real_acquire(device, swapchain, timeout, semaphore, fence, image);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL device_proc(VkDevice device, const char* name) {
+    if (name && !std::strcmp(name, "vkAcquireNextImageKHR")) {
+        if (!real_acquire) real_acquire = reinterpret_cast<PFN_vkAcquireNextImageKHR>(real_device_proc(device, name));
+        return real_acquire ? reinterpret_cast<PFN_vkVoidFunction>(acquire) : nullptr;
+    }
+    return real_device_proc(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL instance_proc(VkInstance instance, const char* name) {
+    if (name && !std::strcmp(name, "vkGetDeviceProcAddr")) {
+        if (!real_device_proc)
+            real_device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(real_instance_proc(instance, name));
+        return real_device_proc ? reinterpret_cast<PFN_vkVoidFunction>(device_proc) : nullptr;
+    }
+    return real_instance_proc(instance, name);
+}
+}  // namespace held_acquire
 
 void pump() {
     MSG message;
@@ -356,7 +395,8 @@ int main() {
 
     {
         rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = d.instance_proc;
+        held_acquire::real_instance_proc = d.instance_proc;
+        info.get_instance_proc = held_acquire::instance_proc;  // passes everything through until `hold` is set
         info.instance = d.instance;
         info.physical = d.physical;
         info.device = d.device;
@@ -1259,6 +1299,35 @@ int main() {
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         std::printf("suspend/resume with re-registration: ok\n");
+
+        // SuspendX while a present waits for a swapchain image: the present gives up with ERROR_INVALID_STATE, not the
+        // presenter's E_FAIL, for a blank present (0 planes) as for a plane (xbox_present.h, PresentX "While suspended").
+        for (const UINT plane_count : {0u, 1u}) {
+            std::uint64_t held_token = 0;
+            if (plane_count) EXPECT(next_token(held_token));
+            plane = plane_of(rgba, held_token);
+            held_acquire::held_calls = 0;
+            held_acquire::hold = true;
+            HRESULT held_result = S_OK;
+            std::thread presenting([&] { held_result = xbox.PresentX(plane_count, plane_count ? &plane : nullptr, nullptr); });
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (held_acquire::held_calls.load() == 0 && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const bool waited = held_acquire::held_calls.load() > 0;
+            const HRESULT suspended = xbox.SuspendX(0);
+            presenting.join();
+            held_acquire::hold = false;
+            EXPECT(waited && suspended == S_OK);
+            if (held_result != invalid_state)
+                std::fprintf(stderr, "PresentX(%u planes) held at acquire, then SuspendX: 0x%08lx\n", plane_count,
+                             static_cast<unsigned long>(held_result));
+            EXPECT(held_result == invalid_state);
+            EXPECT(xbox.ResumeX() == S_OK);
+            EXPECT(SUCCEEDED(xbox.SetFrameIntervalX(nullptr, period, 1, 0)));
+            EXPECT(SUCCEEDED(xbox.ScheduleFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0)));
+        }
+        EXPECT(xbox.PresentX(0, nullptr, nullptr) == S_OK);  // the acquire is released again
+        std::printf("SuspendX while a present waits for a swapchain image (0 and 1 planes): ERROR_INVALID_STATE\n");
 
         // ImmediateThresholdPercent: a frame that missed its vblank by less than the threshold is shown at once (mid-scan,
         // IMMEDIATE or FIFO_RELAXED), else it waits; the decision is the pacer's lateness on the fake clock, and the
