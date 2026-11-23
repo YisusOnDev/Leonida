@@ -2563,7 +2563,7 @@ public:
             return E_INVALIDARG;
         const auto* pages = static_cast<const std::uint8_t*>(address);
         // The shadow is a range of the GPU address arena when it fits there (docs/d3d12_vulkan.md section 3.3).
-        // The title's VA is about 1.5 TiB on Windows, far past the arena, so a shader's heap_base + VA would miss
+        // The title's VA is a user-mode Windows address far above 4 GiB, past the arena, so a shader's heap_base + VA would miss
         // any buffer of the layer's; the root views and V#s the layer writes for that VA name the arena offset
         // instead (src/title_va_alias.h), a VA below 4 GiB that a root view and a V#'s 48 bits both hold. The arena
         // is host-visible, so the per-submission copy writes it in place.

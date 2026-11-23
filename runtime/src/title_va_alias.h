@@ -4,7 +4,7 @@
 //
 // A translated shader computes heap_base + console_va, with heap_base the GPU address arena's device address. The
 // layer chooses every console VA it hands out, so they all land in the arena. The title does not always use them:
-//   - device slot 133 places a buffer at the CPU address of the title's own pages (about 1.5 TiB on Windows);
+//   - device slot 133 places a buffer at the CPU address of the title's own pages (a user-mode Windows address, far above 4 GiB);
 //   - the title points V#s and root views at its own memory (a per-frame constant ring, #8862 section 3.5).
 // Both are far past the arena, so heap_base + VA reads nothing the layer made. An address inside such a range is
 // therefore replaced, wherever the layer can see it, by the console VA of a GPU copy of that range: its arena offset
