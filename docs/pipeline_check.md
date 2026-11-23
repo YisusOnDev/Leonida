@@ -434,6 +434,24 @@ On Windows with an RTX 5090 (driver 621.14), a synthetic three-compute, one-vert
 sample reported zero application-cache hits on its first run and five on the seeded run. On Mesa
 llvmpipe the same five pipelines succeeded both times and neither run reported a hit.
 
+### The cache and the runtime's device
+
+The runtime seeds its `VkPipelineCache` from the cache this tool saves, so a pipeline hits there only when the
+driver gives it the same cache key in both programs. Measured on Windows with an RX 9070 XT (driver
+32.0.32029.2010) and one synthetic compute shader, reading the application-cache-hit bit:
+
+- `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` are each part of the key. The runtime's
+  device enables none of them, so the checker's does not either. Nothing else that differs between the two
+  devices changed the key: the checker's other features, the runtime's extensions, the application name.
+- The executable's file name is part of the key; its folder is not. A copy of the checker under another name
+  misses the cache the original wrote, and the runtime's device hits the checker's cache only from a program
+  with the checker's file name. So on this driver a cache written by `vk_pipeline_check.exe` does not hit in
+  `gta6rt.exe`, and one written by a copy of the checker named `gta6rt.exe` does.
+
+The `pipeline_cache_seed` test runs the checker, then creates the same pipeline on the runtime's device from
+the saved cache; the checker runs as a copy with the test program's file name. It is skipped where the driver
+reports no hit even for a cache the device wrote itself, as llvmpipe does.
+
 ## Wave64-emulated corpus (`--wave64-emulate`)
 
 A GPU that only runs 32-wide subgroups (NVIDIA, Intel) needs the corpus translated with
