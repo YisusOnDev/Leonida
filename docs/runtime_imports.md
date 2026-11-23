@@ -329,9 +329,7 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   `_wfsopen`, `_wremove`, `_wrename` and `_wrmdir` (the only CRT path calls those modules import, all from
   `msvcp140.dll`) at the shim registered under the same name, as it already points its `RtlPcToFileHeader` at the
   loader's; a name with no shim keeps the host's. `gta6rt` links the static CRT and does not use those modules
-  itself. `runtime/test/loader_test.cpp` checks it through `std::_Fiopen`. Not covered: `std::filesystem`, which
-  `msvcp140.dll` runs on kernel32 (`CreateFile2`, `FindFirstFileExW`, `GetFileAttributesExW` and others) and which
-  deletes through a handle (`SetFileInformationByHandle`), so routing it needs more than this list.
+  itself. `runtime/test/loader_test.cpp` checks it through `std::_Fiopen`.
 - The CRT's other path calls follow the same rules (RT-359): `remove`/`_wremove`, `_unlink`/`_wunlink`,
   `rename`/`_wrename`, `_mkdir`/`_wmkdir`, `_rmdir`/`_wrmdir`, `_access`/`_waccess`, `_access_s`/`_waccess_s` and
   `_stat32`, `_stat32i64`, `_stat64`, `_stat64i32` with their `_wstat` forms, under
@@ -341,6 +339,24 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   move from `GAME:` to a host path fails with `EXDEV`. `_stat*` and `_access*` look at the copy a read would open,
   through ucrtbase's wide function. Errors land in the caller's CRT `errno` as that CRT maps them. Host paths go to
   ucrtbase unchanged.
+- `std::filesystem` on `GAME:` paths (RT-369). C++17 `std::filesystem` is not in `msvcp140.dll`: `msvcprt.lib`
+  links its implementation (`filesystem.obj`, the `__std_fs_*` functions) into the title, so it calls kernel32
+  through the title's own imports, which the loader binds to these shims. Its `remove` deletes through a handle:
+  `CreateFileW` with `DELETE`, then `SetFileInformationByHandle` with `FileDispositionInfoEx` (or
+  `FileDispositionInfo`). `DELETE` makes the open a write, so the handle names the overlay copy of a package file
+  (a package folder is mirrored there, as `SetFileAttributes` does); the `SetFileInformationByHandle` shim, on a
+  delete request for a handle under the overlay, also leaves the marker `DeleteFile` or `RemoveDirectory` leaves, so
+  the package name is hidden too. A package folder that still holds files fails with `ERROR_DIR_NOT_EMPTY`. Other
+  classes and host handles go to the host unchanged. `msvcp140.dll` itself still exports the older
+  `std::experimental::filesystem` (`_Stat`, `_Open_dir`/`_Read_dir`, `_Make_dir`, `_Copy_file`, ...), which calls
+  kernel32 directly; the host CRT copy's imports of every wide kernel32 file call with a shim (`CopyFile2`,
+  `CopyFileW`, `CreateFile2`, `CreateFileW`, `CreateDirectoryW`, `FindFirstFileExW`, `GetFileAttributesExW`,
+  `SetFileInformationByHandle`, ...) are pointed at the shims with the CRT names above. The whole set is listed
+  because versions differ: `msvcp140.dll` 14.51 imports `CopyFile2`/`CreateFile2`, 14.44 `CopyFileW`/`CreateFileW`
+  (dumpbin). `CreateHardLinkW` and `CreateSymbolicLinkW` have no shim and stay with the host. `loader_test`
+  checks `_Stat`, the merged listing, `_Make_dir` and `_Copy_file`; `file_system_test` checks the remove. Not covered:
+  `std::filesystem::canonical` (`GetFinalPathNameByHandleW`), hard and symbolic links, and `absolute`
+  (`GetFullPathNameW`, a separate pull request).
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 

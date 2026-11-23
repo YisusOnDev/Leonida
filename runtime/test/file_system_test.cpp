@@ -2538,6 +2538,66 @@ void run_checks(const std::filesystem::path& root) {
         std::filesystem::remove_all(extended(fixture), cleanup_error);
         check(!cleanup_error, "the synthetic long paths are removed after the test");
     }
+    // std::filesystem::remove, as msvcprt.lib's __std_fs_remove does it (RT-369): a CreateFileW with DELETE and
+    // attribute access, then SetFileInformationByHandle with FileDispositionInfoEx, or FileDispositionInfo where the
+    // host rejects the Ex class.
+    {
+        using SetInfoFn = BOOL(WINAPI*)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
+        const auto set_info = resolve<SetInfoFn>("kernel32.dll", "SetFileInformationByHandle");
+        check(set_info != nullptr, "SetFileInformationByHandle resolves through the registry");
+        write_path(package / "rm" / "ex.txt", "package");
+        write_path(package / "rm" / "plain.txt", "package");
+        std::filesystem::create_directories(package / "rm" / "empty");
+        const auto remove_with = [&](const std::wstring& path, bool ex) {
+            constexpr DWORD kRemoveAccess = DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES;
+            const HANDLE h = create_w(path.c_str(), kRemoveAccess, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                      nullptr);
+            if (h == INVALID_HANDLE_VALUE) return false;
+            FILE_DISPOSITION_INFO_EX info_ex{FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS |
+                                             FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE};
+            FILE_DISPOSITION_INFO info{TRUE};
+            const BOOL ok = ex ? set_info(h, FileDispositionInfoEx, &info_ex, sizeof(info_ex))
+                               : set_info(h, FileDispositionInfo, &info, sizeof(info));
+            ::CloseHandle(h);
+            return ok != FALSE;
+        };
+        const auto gone = [&](const wchar_t* path) {
+            return attributes_w(path) == INVALID_FILE_ATTRIBUTES && ::GetLastError() == ERROR_FILE_NOT_FOUND;
+        };
+
+        check(remove_with(L"GAME:\\rm\\ex.txt", true), "a remove through FileDispositionInfoEx succeeds");
+        check(gone(L"GAME:\\rm\\ex.txt"), "the removed package file is gone from GAME:");
+        check(read_path(package / "rm" / "ex.txt") == "package", "and stays installed in the package");
+        check(remove_with(L"GAME:\\rm\\plain.txt", false) && gone(L"GAME:\\rm\\plain.txt"),
+              "a remove through FileDispositionInfo hides the package file the same way");
+        check(!remove_with(L"GAME:\\rm\\ex.txt", true), "a second remove finds nothing to open");
+
+        check(remove_with(L"GAME:\\rm\\empty", true) && gone(L"GAME:\\rm\\empty") &&
+                  std::filesystem::is_directory(package / "rm" / "empty"),
+              "an empty package folder is removed from GAME: and stays in the package");
+        write_path(package / "rm" / "full" / "kept.txt", "package");
+        std::filesystem::create_directories(overlay / "rm" / "full");
+        check(!remove_with(L"GAME:\\rm\\full", true) && ::GetLastError() == ERROR_DIR_NOT_EMPTY &&
+                  attributes_w(L"GAME:\\rm\\full\\kept.txt") != INVALID_FILE_ATTRIBUTES,
+              "a package folder that still holds files is not removed");
+
+        const HANDLE created =
+            create_w(L"GAME:\\rm\\mine.txt", GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (created != INVALID_HANDLE_VALUE) ::CloseHandle(created);
+        check(remove_with(L"GAME:\\rm\\mine.txt", true) && !std::filesystem::exists(overlay / "rm" / "mine.txt") &&
+                  !std::filesystem::exists(overlay / ".gta6rt-deleted" / "rm" / "mine.txt"),
+              "a file the title made is deleted from the overlay and leaves no marker");
+
+        const std::filesystem::path host_file_rm = root / "host_rm.txt";
+        write_path(host_file_rm, "host");
+        check(remove_with(host_file_rm.wstring(), true) && !std::filesystem::exists(host_file_rm),
+              "a host file is deleted through the handle unchanged");
+    }
+
+    std::filesystem::remove_all(root);
+    std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
+    return g_failures == 0 ? 0 : 1;
 }
 
 }  // namespace

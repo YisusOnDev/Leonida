@@ -13,8 +13,9 @@
 //
 // The shims that use this live in file_system.cpp: CreateFile*, FindFirstFile*/FindNextFile*/FindClose,
 // GetFileAttributes*/GetFileAttributesEx*, DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*/MoveFileEx*,
-// CopyFile*/CopyFileEx*/CopyFile2, SetFileAttributes*, the Universal CRT's fopen/_open families and its
-// remove/rename/_stat/_access/_mkdir/_rmdir (the rules for each are in docs/runtime_imports.md).
+// CopyFile*/CopyFileEx*/CopyFile2, SetFileAttributes*, SetFileInformationByHandle's delete requests, the Universal
+// CRT's fopen/_open families and its remove/rename/_stat/_access/_mkdir/_rmdir (the rules for each are in
+// docs/runtime_imports.md).
 #pragma once
 
 #include <filesystem>

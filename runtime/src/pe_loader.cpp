@@ -1241,21 +1241,31 @@ PVOID NTAPI pc_to_file_header(PVOID pc, PVOID* base) {
     return *base;
 }
 
-// The Universal CRT's path calls a host CRT copy imports. A mapped title's std::fstream opens through the host
-// msvcp140.dll (std::_Fiopen calls _wfsopen), which the Windows loader binds to the host ucrtbase, so a GAME: path
-// never reached the CRT shims of file_system.cpp. Each of these is pointed at the shim registered under the same
-// import name, when there is one; a host path goes through the shim to ucrtbase unchanged. These are the CRT path
-// calls the host CRT copies import (dumpbin: only msvcp140.dll has any).
-constexpr const char* kCrtPathImports[] = {"_fsopen", "_wfsopen", "_wremove", "_wrename", "_wrmdir"};
+// The file calls a host CRT copy imports. A mapped title's std::fstream opens through the host msvcp140.dll
+// (std::_Fiopen calls _wfsopen), which the Windows loader binds to the host ucrtbase, so a GAME: path never reached
+// the CRT shims of file_system.cpp; its std::experimental::filesystem exports (_Stat, _Open_dir/_Read_dir, _Make_dir,
+// _Copy_file, ...) call kernel32 the same way. Each of these is pointed at the shim registered under the same import
+// name, when there is one; a host path goes through the shim unchanged. These are the CRT path calls the host CRT copies
+// import (dumpbin: only msvcp140.dll has any) and every wide kernel32 file call with a shim: msvcp140 versions differ
+// (14.51 imports CopyFile2 and CreateFile2, 14.44 CopyFileW and CreateFileW), and a name a copy does not import costs
+// nothing. CreateHardLinkW and CreateSymbolicLinkW have no shim and stay with the host. C++17 std::filesystem is not
+// among them: msvcprt.lib links it into the title, whose own imports the loader binds to the shims.
+constexpr const char* kHostFileImports[] = {
+    "_fsopen",          "_wfsopen",           "_wremove",           "_wrename",
+    "_wrmdir",          "CopyFile2",          "CopyFileExW",        "CopyFileW",
+    "CreateDirectoryExW", "CreateDirectoryW", "CreateFile2",        "CreateFileW",
+    "DeleteFileW",      "FindClose",          "FindFirstFileExW",   "FindFirstFileW",
+    "FindNextFileW",    "GetFileAttributesExW", "GetFileAttributesW", "MoveFileExW",
+    "MoveFileW",        "RemoveDirectoryW",   "SetFileAttributesW", "SetFileInformationByHandle"};
 
-bool is_crt_path_import(const char* name) {
-    for (const char* n : kCrtPathImports)
+bool is_host_file_import(const char* name) {
+    for (const char* n : kHostFileImports)
         if (std::strcmp(name, n) == 0) return true;
     return false;
 }
 
 // Patches a host CRT module's imports once per module: RtlPcToFileHeader by name goes to pc_to_file_header, and the
-// CRT path calls above go to their shims. The module is a system DLL the Windows loader has already validated and
+// file calls above go to their shims. The module is a system DLL the Windows loader has already validated and
 // bound, so its tables are read unchecked. The patches stay for the process lifetime; with no live Loader
 // pc_to_file_header answers exactly as Windows does, and gta6rt itself links the static CRT, so only mapped code
 // reaches the patched module.
@@ -1286,7 +1296,7 @@ void patch_host_imports(HMODULE host) {
                 if (*slot == target) continue;
                 PcToFileHeaderFn expected = nullptr;  // the first bound address is the Windows function
                 g_host_pc_to_file_header.compare_exchange_strong(expected, reinterpret_cast<PcToFileHeaderFn>(*slot));
-            } else if (is_crt_path_import(name)) {
+            } else if (is_host_file_import(name)) {
                 target = shims::find(dll, name);
             }
             if (!target || *slot == target) continue;

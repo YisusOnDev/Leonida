@@ -2,7 +2,8 @@
 //
 // A GDK title names its files on the console's drives, "GAME:\\data\\x.sps" being one in the installed game folder, so
 // the imports it makes of CreateFile*, FindFirstFile*/FindNextFile*/FindClose, GetFileAttributes*/GetFileAttributesEx*,
-// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes*, and the
+// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2, SetFileAttributes* and
+// SetFileInformationByHandle's delete requests (std::filesystem::remove deletes through a handle), and the
 // Universal CRT's fopen/_open families and its remove/rename/_stat/_access/_mkdir/_rmdir, are answered here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
@@ -35,6 +36,7 @@
 #include <share.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -724,6 +726,11 @@ Target write_target(const std::wstring& path, bool copy_up) {
             std::filesystem::remove(tmp, ec);
             if (!std::filesystem::exists(t.path, ec)) t.error = error;
         }
+    } else if (copy_up && !deleted(r.overlay, parts) && std::filesystem::is_directory(package_path, ec)) {
+        // A package folder is mirrored, as SetFileAttributes does, so a handle opened on it for DELETE or attribute
+        // writes (std::filesystem::remove) names the overlay folder and never the package's.
+        std::filesystem::create_directories(t.path, ec);
+        if (ec) t.error = static_cast<DWORD>(ec.value());
     }
     return t;
 }
@@ -1403,6 +1410,71 @@ BOOL WINAPI delete_file_a(LPCSTR name) {
     }
     const std::wstring wide = widen_ansi(name);
     return delete_file_w(wide.c_str());
+}
+
+// ---- Delete through a handle (RT-369)
+//
+// std::filesystem::remove, which msvcprt.lib links into the title itself (filesystem.obj), deletes through a handle:
+// CreateFileW with DELETE, then SetFileInformationByHandle with FileDispositionInfoEx or FileDispositionInfo. DELETE
+// makes the open a write, so the handle names the overlay copy of a package file; deleting only that copy would bring
+// the package file back into view. A delete request on a handle under the overlay therefore also leaves the marker
+// DeleteFile and RemoveDirectory leave.
+
+std::wstring final_path(HANDLE h) {
+    const DWORD n = ::GetFinalPathNameByHandleW(h, nullptr, 0, FILE_NAME_NORMALIZED);
+    if (n == 0) return {};
+    std::wstring path(n, L'\0');
+    const DWORD got = ::GetFinalPathNameByHandleW(h, path.data(), n, FILE_NAME_NORMALIZED);
+    path.resize(got < n ? got : 0);
+    return path;
+}
+
+// The overlay-relative components of the file a handle names. False when it is not below the overlay root or is in
+// one of the overlay's own folders: a host file, or a package file opened for reading.
+bool overlay_parts(HANDLE file, const std::filesystem::path& overlay, std::vector<std::wstring>& parts) {
+    const HANDLE root_handle =
+        ::CreateFileW(overlay.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (root_handle == INVALID_HANDLE_VALUE) return false;
+    const std::wstring root = final_path(root_handle);
+    ::CloseHandle(root_handle);
+    const std::wstring path = final_path(file);
+    if (root.empty() || path.size() <= root.size() + 1 || path[root.size()] != L'\\' ||
+        ::CompareStringOrdinal(path.c_str(), static_cast<int>(root.size()), root.c_str(),
+                               static_cast<int>(root.size()), TRUE) != CSTR_EQUAL)
+        return false;
+    for (size_t start = root.size() + 1; start < path.size();) {
+        const size_t end = std::min(path.find(L'\\', start), path.size());
+        parts.push_back(path.substr(start, end - start));
+        start = end + 1;
+    }
+    return !parts.empty() && !internal_dir(parts.front().c_str());
+}
+
+bool sets_delete(FILE_INFO_BY_HANDLE_CLASS info_class, const void* info, DWORD size) {
+    if (!info) return false;
+    if (info_class == FileDispositionInfo && size >= sizeof(FILE_DISPOSITION_INFO))
+        return static_cast<const FILE_DISPOSITION_INFO*>(info)->DeleteFile != FALSE;
+    if (info_class == FileDispositionInfoEx && size >= sizeof(FILE_DISPOSITION_INFO_EX))
+        return (static_cast<const FILE_DISPOSITION_INFO_EX*>(info)->Flags & FILE_DISPOSITION_FLAG_DELETE) != 0;
+    return false;
+}
+
+BOOL WINAPI set_file_information_by_handle(HANDLE file, FILE_INFO_BY_HANDLE_CLASS info_class, LPVOID info,
+                                           DWORD size) {
+    const Roots r = roots();
+    std::vector<std::wstring> parts;
+    if (!sets_delete(info_class, info, size) || r.overlay.empty() || !overlay_parts(file, r.overlay, parts))
+        return ::SetFileInformationByHandle(file, info_class, info, size);
+    // A package folder goes only once nothing is left in it, as RemoveDirectory requires.
+    const View v = view(r, parts);
+    if (v.in_package && v.kind == Kind::Directory && !empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
+    if (!::SetFileInformationByHandle(file, info_class, info, size)) return FALSE;
+    if (!v.in_package) return TRUE;
+    std::filesystem::path mark = marker(r.overlay, parts);
+    if (v.kind == Kind::Directory) mark /= kRemovedDirMarker;
+    DWORD error = 0;
+    return write_marker(mark, error) ? TRUE : fail_bool(error);
 }
 
 // ---- Folders: created in the overlay, removed by a marker when the package has them
@@ -2342,7 +2414,8 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
         {dll, "GetDiskFreeSpaceA", reinterpret_cast<void*>(&get_disk_free_space_a)},                     \
         {dll, "GetDiskFreeSpaceW", reinterpret_cast<void*>(&get_disk_free_space_w)},                     \
         {dll, "GetDriveTypeA", reinterpret_cast<void*>(&get_drive_type_a)},                              \
-        {dll, "GetDriveTypeW", reinterpret_cast<void*>(&get_drive_type_w)}
+        {dll, "GetDriveTypeW", reinterpret_cast<void*>(&get_drive_type_w)},                              \
+        {dll, "SetFileInformationByHandle", reinterpret_cast<void*>(&set_file_information_by_handle)}
 
 // The Universal CRT's opens, under the api set a package DLL links (api-ms-win-crt-stdio-l1-1-0) and under ucrtbase
 // itself, which that set forwards to.
