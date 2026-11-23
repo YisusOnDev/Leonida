@@ -1092,9 +1092,9 @@ int main(int argc, char** argv) {
                 lib.find_fspx_by_code("9e5ffd2c6c521c037cf57582a23f8ff7ba494a71ca63bb899357caee8baab850");
             const auto* vs_entry =
                 lib.find_fspx_by_code("160fbe4368fb1a6349a2683bf72817f183d780c42a35cf25c86560917228061a");
-            check(ps_entry && ps_entry->stage == "ps" && ps_entry->spv_file == "9e5ffd2c6c521c03_libps_00842.spv",
+            check(ps_entry && ps_entry->stage == "ps" && ps_entry->spv_file == "fspx_gfx/9e5ffd2c6c521c03_libps_00842.spv",
                   "fspx_gfx PS entry preserves stage and custom spv filename");
-            check(vs_entry && vs_entry->stage == "vs" && vs_entry->spv_file == "160fbe4368fb1a63_libvs_00843.spv",
+            check(vs_entry && vs_entry->stage == "vs" && vs_entry->spv_file == "fspx_gfx/160fbe4368fb1a63_libvs_00843.spv",
                   "fspx_gfx VS entry preserves stage and custom spv filename");
             std::filesystem::remove_all(tmp_dir, ec);
         }
