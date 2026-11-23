@@ -88,11 +88,13 @@ void log_once(const char* what, int value) {
 }
 
 // True the first time `key` is passed: for lines logged once per distinct text (a setting, a probed pipeline).
+// Namespace scope, not function-local statics: a guarded static's first use on a title thread goes through the
+// exe's TLS slot.
+std::mutex g_first_time_mutex;
+std::set<std::string> g_first_time_seen;
 bool first_time(const std::string& key) {
-    static std::mutex mutex;
-    static std::set<std::string> seen;
-    std::lock_guard lock(mutex);
-    return seen.insert(key).second;
+    std::lock_guard lock(g_first_time_mutex);
+    return g_first_time_seen.insert(key).second;
 }
 
 // LEONIDA_PROBE's settings (src/debug_probe.h). Read for every graphics pipeline, so a test can change them between
