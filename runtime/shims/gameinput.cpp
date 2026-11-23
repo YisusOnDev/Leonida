@@ -742,6 +742,7 @@ struct Callback {
     void* context;
     void* fn;
     bool active;
+    uint64_t after_event_order = 0;  // Reading/Device events queued before registration are excluded
 };
 
 struct Event {
@@ -752,6 +753,7 @@ struct Event {
     uint32_t current, previous;
     bool pressed;
     GameInputCallbackToken only;  // enumeration: deliver to this callback only
+    uint64_t order = 0;           // assigned under the state lock when queued; blocking enumeration is not queued
 };
 
 // One effect a title created, on the device it belongs to. The object and its parameters belong to the title; SDL's
@@ -813,6 +815,7 @@ struct State {
     std::vector<Event> queue;
     GameInputCallbackToken next_token = 1;
     uint64_t last_order = 0;  // Reading::order of the newest reading
+    uint64_t last_event_order = 0;
     int dispatchers = 0;
     HANDLE wait_event = nullptr;  // auto-reset, signalled when a dispatcher has work
     rt::gameinput::Config config;
@@ -828,7 +831,8 @@ State& g() {
     return *s;
 }
 
-void queue_event(const Event& e) {
+void queue_event(Event e) {
+    e.order = ++g().last_event_order;
     if (e.device) e.device->AddRef();
     if (e.reading) e.reading->AddRef();
     g().queue.push_back(e);
@@ -838,6 +842,8 @@ bool matches(const Callback& c, const Event& e) {
     if (!c.active || c.type != e.type) return false;
     if (e.only && e.only != c.token) return false;
     if (c.device && c.device != e.device) return false;
+    if (!e.only && (e.type == CbType::Reading || e.type == CbType::Device) && e.order <= c.after_event_order)
+        return false;
     switch (e.type) {
         case CbType::Device:
             if (!(c.kind & e.device->info.supportedInput) && c.kind != GameInputKindUnknown) return false;
@@ -2392,7 +2398,7 @@ public:
             std::lock_guard lock(s.mu);
             t = s.next_token++;
             s.callbacks.push_back({t, CbType::Device, as_device(device), kind, status_filter, context,
-                                   reinterpret_cast<void*>(fn), true});
+                                   reinterpret_cast<void*>(fn), true, s.last_event_order});
             if (enumeration != GameInputNoEnumeration) {
                 const uint64_t ts = now_us();
                 for (Device* d : s.connected) {
@@ -2529,6 +2535,7 @@ private:
         if (token) *token = kInvalidCallbackToken;
         if (!c.fn) return E_INVALIDARG;
         std::lock_guard lock(g().mu);
+        if (c.type == CbType::Reading) c.after_event_order = g().last_event_order;
         c.token = g().next_token++;
         g().callbacks.push_back(c);
         if (token) *token = c.token;

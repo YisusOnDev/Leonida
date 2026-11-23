@@ -282,6 +282,161 @@ void release_all(std::vector<IGameInputReading*>& v) {
     v.clear();
 }
 
+void CALLBACK remember_reading(GameInputCallbackToken, void* context, IGameInputReading* reading, bool) {
+    if (!reading) return;
+    reading->AddRef();
+    static_cast<std::vector<IGameInputReading*>*>(context)->push_back(reading);
+}
+
+struct RegisterDuringReading {
+    IGameInput* input;
+    std::vector<IGameInputReading*> child;
+    GameInputCallbackToken child_token = 0;
+    HRESULT result = E_FAIL;
+    int calls = 0;
+};
+void CALLBACK register_child_reading(GameInputCallbackToken, void* context, IGameInputReading*, bool) {
+    auto& state = *static_cast<RegisterDuringReading*>(context);
+    if (++state.calls == 1)
+        state.result = state.input->RegisterReadingCallback(nullptr, GameInputKindGamepad, 0.0f, &state.child,
+                                                            remember_reading, &state.child_token);
+}
+
+void CALLBACK remember_device(GameInputCallbackToken token, void* context, IGameInputDevice* device, uint64_t,
+                              uint32_t current_status, uint32_t previous_status) {
+    static_cast<std::vector<DeviceEvent>*>(context)->push_back({device, current_status, previous_status, token});
+}
+
+void test_device_registration_boundary(IGameInput* input) {
+    IGameInputDispatcher* dispatcher = nullptr;
+    check(input->CreateDispatcher(&dispatcher) == S_OK && dispatcher, "device registration: manual dispatcher created");
+    if (!dispatcher) return;
+    std::vector<DeviceEvent> early, none, async, blocking;
+    GameInputCallbackToken early_token = 0, none_token = 0, async_token = 0, blocking_token = 0;
+    check(input->RegisterDeviceCallback(nullptr, GameInputKindGamepad, GameInputDeviceConnected,
+                                        GameInputNoEnumeration, &early, remember_device, &early_token) == S_OK,
+          "device registration: an earlier callback is registered");
+    Pad pad;
+    attach(pad, "Leonida device registration pad", 0x045E, 0x0B12, false);
+    rt::gameinput::poll();
+    IGameInputReading* reading = current(input, nullptr);
+    IGameInputDevice* device = device_of(reading);
+    check(pad.js && device && rt::gameinput::connected_count() == 1,
+          "device registration: one connection is queued before registration");
+    check(input->RegisterDeviceCallback(nullptr, GameInputKindGamepad, GameInputDeviceConnected,
+                                        GameInputNoEnumeration, &none, remember_device, &none_token) == S_OK,
+          "device registration: NoEnumeration callback registered");
+    check(input->RegisterDeviceCallback(device, GameInputKindGamepad, GameInputDeviceConnected,
+                                        GameInputAsyncEnumeration, &async, remember_device, &async_token) == S_OK,
+          "device registration: filtered AsyncEnumeration callback registered");
+    check(input->RegisterDeviceCallback(device, GameInputKindGamepad, GameInputDeviceConnected,
+                                        GameInputBlockingEnumeration, &blocking, remember_device, &blocking_token) == S_OK,
+          "device registration: filtered BlockingEnumeration callback registered");
+    const auto connected_once = [device](const std::vector<DeviceEvent>& events) {
+        return events.size() == 1 && events[0].device == device &&
+               (events[0].current & GameInputDeviceConnected) && events[0].previous == GameInputDeviceNoStatus;
+    };
+    check(early.empty() && none.empty() && async.empty() && connected_once(blocking),
+          "device registration: only blocking enumeration runs before dispatch");
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    check(connected_once(early), "device registration: the earlier callback retains the queued connection");
+    check(none.empty(), "device registration: NoEnumeration skips the pre-registration connection");
+    check(connected_once(async), "device registration: async enumeration reports the connected device only once");
+    check(connected_once(blocking), "device registration: blocking enumeration is not repeated by an old event");
+
+    for (auto* events : {&early, &none, &async, &blocking}) events->clear();
+    detach(pad);
+    rt::gameinput::poll();
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    for (const auto* events : {&early, &none, &async, &blocking}) {
+        check(events->size() == 1 && (*events)[0].device == device &&
+                  (*events)[0].current == GameInputDeviceNoStatus &&
+                  ((*events)[0].previous & GameInputDeviceConnected),
+              "device registration: each callback receives the subsequent disconnect exactly once");
+    }
+    for (GameInputCallbackToken token : {early_token, none_token, async_token, blocking_token})
+        input->UnregisterCallback(token, 0);
+    if (reading) reading->Release();
+    dispatcher->Release();
+}
+
+// A callback observes state changes after registration. Old queued readings still belong to earlier callbacks,
+// including when a manual dispatcher has not delivered them yet. Compare reading objects, not clock thresholds.
+void test_reading_registration_boundary(IGameInput* input) {
+    Pad pad;
+    attach(pad, "Leonida reading registration pad", 0x045E, 0x0B12, false);
+    rt::gameinput::poll();
+    check(pad.js && rt::gameinput::connected_count() == 1, "reading registration: one virtual pad connected");
+    if (!pad.js) return;
+    IGameInputDispatcher* dispatcher = nullptr;
+    check(input->CreateDispatcher(&dispatcher) == S_OK && dispatcher, "reading registration: manual dispatcher created");
+    if (!dispatcher) {
+        detach(pad);
+        rt::gameinput::poll();
+        return;
+    }
+
+    std::vector<IGameInputReading*> early, late_any, late_device;
+    GameInputCallbackToken early_token = 0, any_token = 0, device_token = 0;
+    check(input->RegisterReadingCallback(nullptr, GameInputKindGamepad, 0.0f, &early, remember_reading, &early_token) == S_OK,
+          "reading registration: an earlier callback is registered");
+    RegisterDuringReading nested{input};
+    GameInputCallbackToken parent_token = 0;
+    check(input->RegisterReadingCallback(nullptr, GameInputKindGamepad, 0.0f, &nested, register_child_reading,
+                                        &parent_token) == S_OK,
+          "reading registration: a callback can register another callback during delivery");
+    SDL_SetJoystickVirtualButton(pad.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    rt::gameinput::poll();
+    IGameInputReading* first = current(input, nullptr);
+    SDL_SetJoystickVirtualButton(pad.js, SDL_GAMEPAD_BUTTON_NORTH, true);
+    rt::gameinput::poll();
+    IGameInputReading* second = current(input, nullptr);
+    IGameInputDevice* device = device_of(second);
+    check(first && second && first != second && device, "reading registration: two state changes already exist");
+    check(input->RegisterReadingCallback(nullptr, GameInputKindGamepad, 0.0f, &late_any, remember_reading, &any_token) == S_OK &&
+              input->RegisterReadingCallback(device, GameInputKindGamepad, 0.0f, &late_device, remember_reading,
+                                              &device_token) == S_OK,
+          "reading registration: late callbacks registered with and without a device filter");
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    check(early.size() == 2 && early[0] == first && early[1] == second,
+          "reading registration: the earlier callback retains both queued changes");
+    check(late_any.empty(), "reading registration: a new callback does not receive already queued changes");
+    check(late_device.empty(), "reading registration: a device-filtered callback also skips already queued changes");
+    check(nested.calls == 2 && nested.result == S_OK && nested.child_token && nested.child.empty(),
+          "reading registration: a callback registered during delivery skips the rest of the old queue");
+    release_all(late_any);
+    release_all(late_device);  // keep the positive controls independent of the negative checks above
+    release_all(nested.child);
+
+    SDL_SetJoystickVirtualButton(pad.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
+    rt::gameinput::poll();
+    IGameInputReading* next = current(input, nullptr);
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    check(next && early.size() == 3 && early.back() == next && late_any.size() == 1 && late_any[0] == next &&
+              late_device.size() == 1 && late_device[0] == next && nested.child.size() == 1 && nested.child[0] == next,
+          "reading registration: all callbacks receive the first subsequent state change");
+    SDL_SetJoystickVirtualButton(pad.js, SDL_GAMEPAD_BUTTON_NORTH, false);
+    rt::gameinput::poll();
+    IGameInputReading* last = current(input, nullptr);
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    check(last && early.size() == 4 && early.back() == last && late_any.size() == 2 && late_any.back() == last &&
+              late_device.size() == 2 && late_device.back() == last && nested.child.size() == 2 && nested.child.back() == last,
+          "reading registration: later state changes keep reaching every callback");
+
+    for (GameInputCallbackToken token : {early_token, any_token, device_token, parent_token, nested.child_token})
+        input->UnregisterCallback(token, 0);
+    release_all(early);
+    release_all(late_any);
+    release_all(late_device);
+    release_all(nested.child);
+    for (IGameInputReading* reading : {first, second, next, last})
+        if (reading) reading->Release();
+    detach(pad);
+    rt::gameinput::poll();
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    dispatcher->Release();
+}
+
 // ---- keyboard pad: a fake key source instead of GetAsyncKeyState ----
 bool g_keys[256] = {};
 bool g_focus = false;
@@ -2232,6 +2387,8 @@ int main() {
     test_haptic_motors(input);
     test_raw_hid(input);
     test_raw_report_during_reconnect(input);
+    test_reading_registration_boundary(input);
+    test_device_registration_boundary(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
