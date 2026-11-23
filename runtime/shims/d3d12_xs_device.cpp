@@ -3277,6 +3277,9 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const
 
     const auto* xbox_desc = static_cast<const XboxNativeGraphicsPipelineStateDesc*>(desc);
     const std::uint64_t call = g_slot57_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    // LEONIDA_SLOT57_OFF (diagnostic): refuse every slot-57 PSO, to tell its draws from the stream PSOs' (slot 86).
+    static const bool refuse_all = GetEnvironmentVariableW(L"LEONIDA_SLOT57_OFF", nullptr, 0) != 0;
+    if (refuse_all) return E_INVALIDARG;
 
     // 1. Inspect and log measured state-blob fields once per offset (no unmeasured offsets).
     if (xbox_desc->state_blob && xbox_desc->state_blob_size) {
