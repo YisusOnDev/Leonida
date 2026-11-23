@@ -1178,10 +1178,25 @@ PVOID NTAPI pc_to_file_header(PVOID pc, PVOID* base) {
     return *base;
 }
 
-// Points every import of RtlPcToFileHeader by name in a host module at pc_to_file_header, once per module. The
-// module is a system DLL the Windows loader has already validated and bound, so its tables are read unchecked.
-// The redirect stays for the process lifetime; with no live Loader it answers exactly as Windows does.
-void redirect_pc_to_file_header(HMODULE host) {
+// The Universal CRT's path calls a host CRT copy imports. A mapped title's std::fstream opens through the host
+// msvcp140.dll (std::_Fiopen calls _wfsopen), which the Windows loader binds to the host ucrtbase, so a GAME: path
+// never reached the CRT shims of file_system.cpp. Each of these is pointed at the shim registered under the same
+// import name, when there is one; a host path goes through the shim to ucrtbase unchanged. These are the CRT path
+// calls the host CRT copies import (dumpbin: only msvcp140.dll has any).
+constexpr const char* kCrtPathImports[] = {"_fsopen", "_wfsopen", "_wremove", "_wrename", "_wrmdir"};
+
+bool is_crt_path_import(const char* name) {
+    for (const char* n : kCrtPathImports)
+        if (std::strcmp(name, n) == 0) return true;
+    return false;
+}
+
+// Patches a host CRT module's imports once per module: RtlPcToFileHeader by name goes to pc_to_file_header, and the
+// CRT path calls above go to their shims. The module is a system DLL the Windows loader has already validated and
+// bound, so its tables are read unchecked. The patches stay for the process lifetime; with no live Loader
+// pc_to_file_header answers exactly as Windows does, and gta6rt itself links the static CRT, so only mapped code
+// reaches the patched module.
+void patch_host_imports(HMODULE host) {
     static std::mutex mutex;
     static std::vector<HMODULE> done;
     std::lock_guard lock(mutex);
@@ -1194,32 +1209,40 @@ void redirect_pc_to_file_header(HMODULE host) {
     if (!dir.Size || !dir.VirtualAddress) return;
     for (auto* d = at<IMAGE_IMPORT_DESCRIPTOR>(base, dir.VirtualAddress); d->Name; ++d) {
         if (!d->OriginalFirstThunk) continue;  // no name table to match against
+        const std::string dll = lower(at<const char>(base, d->Name));
         auto* names = at<IMAGE_THUNK_DATA64>(base, d->OriginalFirstThunk);
         auto* iat = at<IMAGE_THUNK_DATA64>(base, d->FirstThunk);
         for (; names->u1.AddressOfData; ++names, ++iat) {
             if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) continue;
             auto* by_name = at<IMAGE_IMPORT_BY_NAME>(base, static_cast<uint32_t>(names->u1.AddressOfData));
-            if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), "RtlPcToFileHeader") != 0) continue;
+            const char* name = reinterpret_cast<const char*>(by_name->Name);
             auto* slot = reinterpret_cast<void**>(&iat->u1.Function);
-            if (*slot == reinterpret_cast<void*>(&pc_to_file_header)) continue;
-            PcToFileHeaderFn expected = nullptr;  // the first bound address is the Windows function
-            g_host_pc_to_file_header.compare_exchange_strong(expected, reinterpret_cast<PcToFileHeaderFn>(*slot));
+            void* target = nullptr;
+            if (std::strcmp(name, "RtlPcToFileHeader") == 0) {
+                target = reinterpret_cast<void*>(&pc_to_file_header);
+                if (*slot == target) continue;
+                PcToFileHeaderFn expected = nullptr;  // the first bound address is the Windows function
+                g_host_pc_to_file_header.compare_exchange_strong(expected, reinterpret_cast<PcToFileHeaderFn>(*slot));
+            } else if (is_crt_path_import(name)) {
+                target = shims::find(dll, name);
+            }
+            if (!target || *slot == target) continue;
             DWORD old = 0;
             if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) continue;
-            *slot = reinterpret_cast<void*>(&pc_to_file_header);
+            *slot = target;
             VirtualProtect(slot, sizeof(void*), old, &old);
         }
     }
 }
 
 // The module a host import actually resolved into. GetProcAddress follows forwarders, so this can be another DLL
-// than the one imported (on Windows vcruntime140.dll implements _CxxThrowException itself); that module's
-// RtlPcToFileHeader import is the one the throw calls.
-void redirect_pc_to_file_header_at(const void* resolved) {
+// than the one imported (on Windows vcruntime140.dll implements _CxxThrowException itself); that module's imports
+// are the ones the call goes through.
+void patch_host_imports_at(const void* resolved) {
     HMODULE owner = nullptr;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(resolved), &owner) && owner)
-        redirect_pc_to_file_header(owner);
+        patch_host_imports(owner);
 }
 
 }  // namespace
@@ -1973,10 +1996,10 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
 
     HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!h) return nullptr;
-    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
+    if (prefer_host_copy(shim_key)) patch_host_imports(h);
     FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
     if (!p) return nullptr;
-    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+    if (prefer_host_copy(shim_key)) patch_host_imports_at(reinterpret_cast<const void*>(p));
     binding = Binding::Host;
     return reinterpret_cast<void*>(p);
 }
@@ -2007,10 +2030,10 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
     }
     // Host Windows: system DLLs and API sets. LOAD_LIBRARY_SEARCH_SYSTEM32 keeps the game folder out of the search.
     if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
-        if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
+        if (prefer_host_copy(key)) patch_host_imports(h);  // before any mapped code can throw through it
         FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
         if (p) {
-            if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+            if (prefer_host_copy(key)) patch_host_imports_at(reinterpret_cast<const void*>(p));
             m.imports.push_back({dll, sym, Binding::Host});
             return reinterpret_cast<void*>(p);
         }

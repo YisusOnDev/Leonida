@@ -539,6 +539,7 @@ if(BUILD_TESTING)
     add_executable(loader_test
       test/loader_test.cpp
       src/pe_loader.cpp
+      shims/file_system.cpp
       shims/registry.cpp
     )
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)

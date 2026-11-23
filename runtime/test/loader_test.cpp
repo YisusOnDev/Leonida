@@ -6,6 +6,7 @@
 // a message instead of being followed out of bounds. The truncation case covers every length of a valid image.
 #include <windows.h>
 #include <intrin.h>
+#include <share.h>
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "../shims/file_system.h"
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
 #include "free_image_base.h"
@@ -1310,6 +1312,62 @@ std::string written_images_blocked() {
 
 }  // namespace
 
+// RT-358. A mapped title's std::ifstream opens through the host msvcp140.dll: basic_filebuf::open calls std::_Fiopen
+// there, and _Fiopen calls _wfsopen, which the Windows loader binds to the host ucrtbase. Mapping an image that
+// imports msvcp140.dll must point that module's CRT path imports at the RT-354 shims, so a GAME: path opens.
+void test_host_crt_paths() {
+    const char* what = "the host msvcp140.dll opens GAME: paths once a mapped image imports it";
+    HMODULE msvcp = LoadLibraryExA("msvcp140.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE ucrtbase = LoadLibraryExA("ucrtbase.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    constexpr const char* kFiopen = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
+    using FiopenFn = FILE*(__cdecl*)(const wchar_t*, int, int);
+    const auto fiopen = msvcp ? reinterpret_cast<FiopenFn>(GetProcAddress(msvcp, kFiopen)) : nullptr;
+    if (!fiopen || !ucrtbase) {
+        std::printf("SKIP %s: no msvcp140.dll with std::_Fiopen in System32\n", what);
+        return;
+    }
+    // The FILE* belongs to the host ucrtbase, so it is read and closed there (this test links the static CRT).
+    const auto host_fread =
+        reinterpret_cast<size_t(__cdecl*)(void*, size_t, size_t, FILE*)>(GetProcAddress(ucrtbase, "fread"));
+    const auto host_fputs = reinterpret_cast<int(__cdecl*)(const char*, FILE*)>(GetProcAddress(ucrtbase, "fputs"));
+    const auto host_fclose = reinterpret_cast<int(__cdecl*)(FILE*)>(GetProcAddress(ucrtbase, "fclose"));
+
+    const auto package = g_dir / "rt358_package";
+    const auto overlay = g_dir / "rt358_overlay";
+    std::filesystem::create_directories(package / "data");
+    std::ofstream(package / "data" / "fiopen.txt", std::ios::binary) << "package";
+    rt::fs::configure(package, overlay);
+
+    constexpr int kIn = 0x01, kOut = 0x02, kBinary = 0x20;  // std::ios_base::openmode as msvcp140 defines it
+    if (FILE* before = fiopen(L"GAME:\\data\\fiopen.txt", kIn | kBinary, _SH_DENYNO)) {
+        host_fclose(before);
+        return failed(what, "the host msvcp140.dll opened a GAME: path before any image imported it");
+    }
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(write_image_as(make_import_image("msvcp140.dll", kFiopen), "importer_msvcp.exe"));
+        if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Host ||
+            *reinterpret_cast<void**>(m.base + 0x1180) != reinterpret_cast<void*>(fiopen))
+            return failed(what, "std::_Fiopen did not bind to the host msvcp140.dll");
+        FILE* in = fiopen(L"GAME:\\data\\fiopen.txt", kIn | kBinary, _SH_DENYNO);
+        if (!in) return failed(what, "std::_Fiopen could not open GAME:\\data\\fiopen.txt");
+        char text[16] = {};
+        const size_t got = host_fread(text, 1, sizeof(text), in);
+        host_fclose(in);
+        if (std::string(text, got) != "package") return failed(what, "the package file read back wrong");
+        FILE* out = fiopen(L"game:/data/written.txt", kOut, _SH_DENYNO);
+        if (!out) return failed(what, "std::_Fiopen could not create game:/data/written.txt");
+        host_fputs("overlay", out);
+        host_fclose(out);
+        if (!std::filesystem::exists(overlay / "data" / "written.txt") ||
+            std::filesystem::exists(package / "data" / "written.txt"))
+            return failed(what, "a file written through GAME: did not land in the overlay");
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 int main() {
     g_dir = work_dir();
     std::error_code ec;
@@ -1354,6 +1412,7 @@ int main() {
         test_tls_directory_count();
         test_unwind_registration();
         test_lookup_during_loads();
+        test_host_crt_paths();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());
