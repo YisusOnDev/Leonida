@@ -462,12 +462,15 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
+thread_local const char* t_map_failure = "";
+
 bool unmap_page(uintptr_t address) {
     const FaultLockExclusive lock;
     const auto it = g_mapped.find(address);
     if (it == g_mapped.end()) return true;
     if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
                                        MEM_PRESERVE_PLACEHOLDER)) {
+        t_map_failure = "UnmapViewOfFile2 failed";
         return false;
     }
     g_mapped.erase(it);
@@ -481,16 +484,23 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
     if (page == 0) return true;
     const auto it = g_pages.find(page);
     if (it == g_pages.end()) {
+        t_map_failure = "unknown page";
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
     void* const target = reinterpret_cast<void*>(address);
-    if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
+    if (!isolate_placeholder(target, kPhysicalPageSize)) {
+        t_map_failure = "target is not inside one placeholder";
+        return false;
+    }
     const FaultLockExclusive lock;
     void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
                                                    it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
                                                    protect, nullptr, 0);
-    if (!view) return false;
+    if (!view) {
+        t_map_failure = "MapViewOfFile3 failed";
+        return false;
+    }
     g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
     return true;
 }
@@ -684,6 +694,89 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
     return TRUE;
 }
 
+// A refused map call stops the title (it asserts on the null result), so every refusal goes to stderr (the first 64,
+// then every 1000th) with what the call asked for and why it was refused. With g_phys_mutex held.
+std::string describe_window_near(uintptr_t address) {
+    char buf[256];
+    const auto it = g_windows.upper_bound(address);
+    std::string text;
+    if (it != g_windows.begin()) {
+        const auto prev = std::prev(it);
+        std::snprintf(buf, sizeof(buf), " prev-window=%llx+%llx/prot %lx", static_cast<unsigned long long>(prev->first),
+                      static_cast<unsigned long long>(prev->second.size), static_cast<unsigned long>(prev->second.protect));
+        text += buf;
+    }
+    if (it != g_windows.end()) {
+        std::snprintf(buf, sizeof(buf), " next-window=%llx+%llx", static_cast<unsigned long long>(it->first),
+                      static_cast<unsigned long long>(it->second.size));
+        text += buf;
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info))) {
+        std::snprintf(buf, sizeof(buf), " host=[alloc %p base %p size %llx state %lx type %lx prot %lx]",
+                      info.AllocationBase, info.BaseAddress, static_cast<unsigned long long>(info.RegionSize),
+                      static_cast<unsigned long>(info.State), static_cast<unsigned long>(info.Type),
+                      static_cast<unsigned long>(info.Protect));
+        text += buf;
+    }
+    return text;
+}
+
+std::string describe_pages(const uint64_t* pages, uint64_t count) {
+    if (!pages) return "pages=null";
+    uint64_t zeros = 0, unknown = 0, first_unknown_index = 0, first_unknown = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        if (pages[i] == 0) {
+            ++zeros;
+        } else if (!g_pages.count(pages[i])) {
+            if (unknown++ == 0) {
+                first_unknown_index = i;
+                first_unknown = pages[i];
+            }
+        }
+    }
+    char buf[256];
+    std::string text = "pages=[";
+    for (uint64_t i = 0; i < count && i < 4; ++i) {
+        std::snprintf(buf, sizeof(buf), "%s%llx", i ? " " : "", static_cast<unsigned long long>(pages[i]));
+        text += buf;
+    }
+    std::snprintf(buf, sizeof(buf), "%s] zeros=%llu unknown=%llu", count > 4 ? " ..." : "",
+                  static_cast<unsigned long long>(zeros), static_cast<unsigned long long>(unknown));
+    text += buf;
+    if (unknown) {
+        std::snprintf(buf, sizeof(buf), " first-unknown=[%llu]=%llx live-pages=%llu next-page=%llx free-slots=%llu",
+                      static_cast<unsigned long long>(first_unknown_index), static_cast<unsigned long long>(first_unknown),
+                      static_cast<unsigned long long>(g_pages.size()),
+                      static_cast<unsigned long long>(g_next_slot * kFramesPerPage),
+                      static_cast<unsigned long long>(g_free_slots.size()));
+        text += buf;
+    }
+    return text;
+}
+
+void log_map_refusal(const char* api, uintptr_t address, uint64_t count, const std::string& pages, const Window* window,
+                     const char* reason, uint64_t index, const void* caller) {
+    const DWORD error = GetLastError();
+    static std::atomic<uint64_t> refusals{0};
+    const uint64_t n = refusals.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 64 && n % 1000 != 0) {
+        SetLastError(error);
+        return;
+    }
+    const std::string near_text = describe_window_near(address);
+    std::fprintf(stderr,
+                 "[rt] xmem: %s refused #%llu caller %s: address %llx count %llu %s window=%s entry %llu: %s "
+                 "(GetLastError %lu)%s\n",
+                 api, static_cast<unsigned long long>(n),
+                 rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)).c_str(),
+                 static_cast<unsigned long long>(address), static_cast<unsigned long long>(count), pages.c_str(),
+                 window ? "found" : "none", static_cast<unsigned long long>(index), reason,
+                 static_cast<unsigned long>(error), near_text.c_str());
+    std::fflush(stderr);
+    SetLastError(error);
+}
+
 // PVOID XMemMapPhysicalPages(PVOID address, UINT64 pageCount, UINT64* pageArray). Measured at twelve call sites: RCX
 // is an address in a window XMemVirtualAlloc reserved, RDX a 64-bit count, R8 the pages to map there one after another,
 // or null to unmap that many (four calls at shutdown). Callers test the 64-bit result for zero, so it is the address on
@@ -693,10 +786,14 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // without touching its neighbours. An unknown page number fails the call before any page changes; a host failure
 // part-way leaves the pages before it mapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
+    const void* const caller = _ReturnAddress();
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
         start > (std::numeric_limits<uintptr_t>::max)() - page_count * kPhysicalPageSize) {
         SetLastError(ERROR_INVALID_PARAMETER);
+        const std::lock_guard lock(g_phys_mutex);
+        log_map_refusal("XMemMapPhysicalPages", start, page_count, "", nullptr, "unaligned address or overflow", 0,
+                        caller);
         return nullptr;
     }
     if (!placeholder_api().available()) {
@@ -706,24 +803,36 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     const std::lock_guard lock(g_phys_mutex);
     if (!page_array) {
         for (uint64_t i = 0; i < page_count; ++i) {
-            if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
+            if (!unmap_page(start + i * kPhysicalPageSize)) {
+                log_map_refusal("XMemMapPhysicalPages", start, page_count, "pages=null", nullptr, t_map_failure, i,
+                                caller);
+                return nullptr;
+            }
         }
         return address;
     }
     const Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
         SetLastError(ERROR_INVALID_ADDRESS);
+        log_map_refusal("XMemMapPhysicalPages", start, page_count, describe_pages(page_array, page_count), nullptr,
+                        "range not inside a recorded window", 0, caller);
         return nullptr;
     }
     for (uint64_t i = 0; i < page_count; ++i) {
         if (!known_page(page_array[i])) {
             SetLastError(ERROR_INVALID_PARAMETER);
+            log_map_refusal("XMemMapPhysicalPages", start, page_count, describe_pages(page_array, page_count), window,
+                            "unknown page number", i, caller);
             return nullptr;
         }
     }
     const DWORD protect = view_protect(*window);
     for (uint64_t i = 0; i < page_count; ++i) {
-        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
+        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) {
+            log_map_refusal("XMemMapPhysicalPages", start + i * kPhysicalPageSize, page_count,
+                            describe_pages(page_array, page_count), window, t_map_failure, i, caller);
+            return nullptr;
+        }
     }
     return address;
 }
@@ -733,6 +842,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
 // unmaps). The result is tested as a 32-bit BOOL. Like MapUserPhysicalPagesScatter: entry i maps pageArray[i] at
 // addresses[i]. Every entry is checked before any page changes.
 BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_count, const uint64_t* page_array) {
+    const void* const caller = _ReturnAddress();
     if (page_count && !addresses) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -748,23 +858,29 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
         const uint64_t page = page_array ? page_array[i] : 0;
         if (!aligned_page_address(address) || !known_page(page)) {
             SetLastError(ERROR_INVALID_PARAMETER);
+            log_map_refusal("XMemMapPhysicalPagesScatter", address, page_count, describe_pages(page_array, page_count),
+                            nullptr, aligned_page_address(address) ? "unknown page number" : "unaligned address", i,
+                            caller);
             return FALSE;
         }
         if (page == 0) continue;
         windows[i] = find_window(address, kPhysicalPageSize);
         if (!windows[i]) {
             SetLastError(ERROR_INVALID_ADDRESS);
+            log_map_refusal("XMemMapPhysicalPagesScatter", address, page_count, describe_pages(page_array, page_count),
+                            nullptr, "address not inside a recorded window", i, caller);
             return FALSE;
         }
     }
     for (uint32_t i = 0; i < page_count; ++i) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
         const uint64_t page = page_array ? page_array[i] : 0;
-        if (page == 0) {
-            if (!unmap_page(address)) return FALSE;
-            continue;
+        const bool ok = page == 0 ? unmap_page(address) : map_page(address, page, view_protect(*windows[i]));
+        if (!ok) {
+            log_map_refusal("XMemMapPhysicalPagesScatter", address, page_count, describe_pages(page_array, page_count),
+                            windows[i], t_map_failure, i, caller);
+            return FALSE;
         }
-        if (!map_page(address, page, view_protect(*windows[i]))) return FALSE;
     }
     return TRUE;
 }
