@@ -891,6 +891,55 @@ if(BUILD_TESTING)
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
 
+    set(attach_order_fixtures dll_attach_cycle_a dll_attach_cycle_b dll_attach_cycle_seed
+      dll_attach_failcycle_a dll_attach_failcycle_b dll_attach_failcycle_seed)
+    foreach(target dll_attach_a dll_attach_b ${attach_order_fixtures})
+      if(target IN_LIST attach_order_fixtures)
+        add_library(${target} SHARED test/fixtures/dll_attach_order.cpp)
+      else()
+        add_library(${target} SHARED test/fixtures/dll_reentrant_attach.cpp)
+      endif()
+      target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /GS-)
+      target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_link_options(${target} PRIVATE /NODEFAULTLIB /ENTRY:dll_attach_main)
+      target_link_libraries(${target} PRIVATE kernel32)
+      set_target_properties(${target} PROPERTIES PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+        ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
+    endforeach()
+    target_compile_definitions(dll_attach_a PRIVATE ATTACH_DLL_A)
+    # The import-only fixtures have no relocations, so give them distinct preferred bases.
+    target_link_options(dll_attach_b PRIVATE /BASE:0x181000000)
+    # Static cycles: link B against a stand-in import library for A, then link the actual A against B. The second
+    # cycle's A returns FALSE from DllMain after B attached.
+    foreach(cycle cycle failcycle)
+      set_target_properties(dll_attach_${cycle}_seed PROPERTIES OUTPUT_NAME dll_attach_${cycle}_a
+        RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}/${cycle}-seed"
+        ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}/${cycle}-seed")
+      target_compile_definitions(dll_attach_${cycle}_seed PRIVATE ATTACH_CYCLE_SEED)
+      target_compile_definitions(dll_attach_${cycle}_a PRIVATE ATTACH_CYCLE_A)
+      target_link_libraries(dll_attach_${cycle}_b PRIVATE dll_attach_${cycle}_seed)
+      target_link_libraries(dll_attach_${cycle}_a PRIVATE dll_attach_${cycle}_b)
+    endforeach()
+    target_compile_definitions(dll_attach_failcycle_a PRIVATE ATTACH_A_FAILS)
+    target_link_options(dll_attach_cycle_b PRIVATE /BASE:0x183000000)
+    target_link_options(dll_attach_failcycle_b PRIVATE /BASE:0x184000000)
+    add_executable(dll_reentrant_attach_test
+      test/dll_reentrant_attach_test.cpp
+      src/pe_loader.cpp
+      shims/library_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(dll_reentrant_attach_test PRIVATE src shims)
+    target_compile_definitions(dll_reentrant_attach_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dll_reentrant_attach_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_libraries(dll_reentrant_attach_test PRIVATE psapi)
+    add_dependencies(dll_reentrant_attach_test dll_attach_a dll_attach_b
+      dll_attach_cycle_a dll_attach_failcycle_a)
+    set_target_properties(dll_reentrant_attach_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
+    add_test(NAME dll_reentrant_attach COMMAND dll_reentrant_attach_test
+      WORKING_DIRECTORY "$<TARGET_FILE_DIR:dll_reentrant_attach_test>")
+
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
     # the machine to run (the test skips with 77 only when Windows cannot load GameInput.dll). No game files.

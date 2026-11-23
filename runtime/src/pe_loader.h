@@ -5,6 +5,7 @@
 // ~Loader() delivers process detach before unmapping initialised modules. The TLS slot and template are set up by load().
 // gta6rt_tls_host.dll must sit next to the executable; the loader reuses the module TLS index the OS assigns it.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -35,6 +36,7 @@ struct Module {
     uint32_t size = 0;
     uint32_t entry_rva = 0;
     bool relocated = false;
+    std::atomic<bool> attaching{false};  // process attach is on the stack; a reentrant load must not attach it again
     bool initialised = false;
 
     // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception
@@ -79,7 +81,7 @@ public:
     explicit Loader(std::filesystem::path game_dir);
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
-    // Delivers process detach to initialised modules in reverse dependency order before freeing any mappings or TLS.
+    // Delivers process detach to initialised modules in reverse attach completion order before freeing any mappings or TLS.
     // Restores the TLS slot for the calling thread. Destroy the Loader on the thread that called load() while any
     // mapped TLS module is still live; all other threads executing mapped code must have finished first.
     ~Loader();
@@ -153,6 +155,7 @@ private:
     std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
+    std::vector<Module*> attach_done_;  // in the order process attach completed; detach runs it backwards
     int runtime_loads_ = 0;  // > 0 while a run-time load or forwarder maps modules (under mutex_): they are dynamic
 
     // What find_address reads: one entry per mapped image, added once its memory exists. Under ranges_mutex_, a leaf

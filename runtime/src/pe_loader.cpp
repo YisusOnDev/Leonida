@@ -1245,7 +1245,8 @@ Loader::~Loader() {
     // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
     // block alive throughout the notifications: a detach handler can still call an imported function or free an
     // FLS slot whose destructor lives in another mapped image.
-    for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
+    // Reverse of attach completion: a module whose DllMain loaded another finishes after it, so it detaches first.
+    for (auto it = attach_done_.rbegin(); it != attach_done_.rend(); ++it) {
         Module& m = **it;
         if (!m.initialised) continue;  // a map-only load never opts in to running image code
         set_initialised(m, false);  // under the TLS lock: thread events stop running its callbacks
@@ -1399,6 +1400,9 @@ void* Loader::load_runtime_candidate(Module* existing, const std::filesystem::pa
     }
 
     if (existing) {
+        // Its process attach is on the stack (a DllMain loading a module that loads it back): the handle is
+        // already mapped, and a second DLL_PROCESS_ATTACH would be wrong.
+        if (existing->attaching) return static_cast<void*>(existing->base);
         try {
             initialise();
             return static_cast<void*>(existing->base);
@@ -1516,11 +1520,19 @@ void Loader::register_unwind(Module& m) {
 void Loader::initialise() {
     // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
     // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
-    for (auto* m : init_order_) initialise(*m);
+    // A nested LoadLibrary can append to init_order_, which would invalidate iterators.
+    for (size_t i = 0; i < init_order_.size(); ++i) initialise(*init_order_[i]);
 }
 
 void Loader::initialise(Module& m) {
-    if (m.initialised) return;
+    if (m.attaching || m.initialised) return;
+
+    // TLS callbacks and DllMain can both re-enter initialise() through LoadLibrary.
+    m.attaching = true;
+    const struct ResetAttaching {
+        std::atomic<bool>& attaching;
+        ~ResetAttaching() { attaching = false; }
+    } reset_attaching{m.attaching};
 
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);
@@ -1539,10 +1551,12 @@ void Loader::initialise(Module& m) {
                                                 ",\"result\":" + std::to_string(ok));
         if (!ok) {
             set_initialised(m, true);  // it ran: a second DLL_PROCESS_ATTACH would be wrong
+            attach_done_.push_back(&m);
             throw std::runtime_error(m.name + ": DllMain returned FALSE");
         }
     }
     set_initialised(m, true);
+    attach_done_.push_back(&m);
 }
 
 // Under the TLS lock, which orders it against the thread events: they run a module's TLS callbacks only while this is
