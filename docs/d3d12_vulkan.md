@@ -152,11 +152,11 @@ The design is therefore an **IR per command list**:
 - `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle's recorded commands and calls are replayed at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
 - Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves, `SetPredication`, `DiscardResource`, the atomic copies, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets` and `ClearState`; `WriteBufferImmediate` is allowed in a bundle); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. `d3d12_bundle_forbidden_test` measured the last four on the PC runtime without the debug layer: the bundle's `Close` fails (`E_FAIL`, where this layer gives `E_INVALIDARG`) on the default adapter and on WARP, and executing a bundle whose `Close` failed crashes the runtime, so the layer refuses it in `ExecuteBundle` instead. A bundle has no render targets, viewport or root signature of its own, so its state calls (pipeline state, root signature and arguments, vertex and index buffers, topology, blend factor, stencil references) and its draws and dispatches are kept as they were called, and `ExecuteBundle` plays them on the parent through the same members the application would have called. A draw then snapshots the parent's state plus what the bundle set, and what the bundle set stays on the parent afterwards. Commands that need no state (markers, immediate writes) are copied between them in order. `d3d12_bundle_test` measured the rule on the PC runtime, where the default adapter (an RTX 4060 Ti) and WARP drew the same picture in every case it ran. A bundle's draws see the parent's render targets, viewport and scissor, root signature and arguments (also when the bundle sets the same root signature first, so those arguments stay), and vertex and index buffers. A bundle starts with the pipeline state it was created or reset with, not the parent's. After `ExecuteBundle` the parent has that pipeline state and whatever else the bundle set: topology, root arguments, vertex and index buffers, and a different root signature with the bundle's arguments in place of the parent's. Topology: the default adapter takes the parent's when the bundle sets none. That is more lenient than Microsoft's stated rule (topology is undefined when a bundle begins), and WARP follows the rule by removing the device when a bundle draws or hands back without one, so a bundle should set it; the layer follows the default adapter. A bundle that sets a root argument before any root signature crashes the NVIDIA driver (the layer applies it to the parent's signature). The deferred calls are checked when they play, against the parent's root signature, so a bad one makes the parent's `Close` fail, not the bundle's; with no root signature on the parent at all the call is dropped, as on a direct list. A per-list state setter must go through the deferred path (`defer()` in `d3d12_com.cpp`, replaying through a private member that does not trace) to work in a bundle. Not deferred yet: `ExecuteIndirect` in a bundle, and bundle `Dispatch` has no GPU test.
 - What `Close` returns after one recorded call is compared with the PC runtime over WARP (no debug layer) by
-  `d3d12_close_parity_test`, 116 cases on fresh lists, nothing executed. 84 agree; the other 32 are listed in the
-  test as known differences. In 17 the layer fails a list WARP closes: draws and dispatches with no pipeline,
-  a `CopyTextureRegion` box that is empty or inverted, footprint to
+  `d3d12_close_parity_test`, 113 cases on fresh lists, nothing executed. 82 agree; the other 31 are listed in the
+  test as known differences. In 16 the layer fails a list WARP closes: draws and dispatches with no pipeline,
+  root arguments before a root signature, a `CopyTextureRegion` box that is empty or inverted, footprint to
   footprint or at an unaligned footprint offset or pitch, `CopyResource` of a resource onto itself,
-  `ClearDepthStencilView` with no flag, an unknown flag or a depth outside 0..1, vertex-buffer slots past 31,
+  `ClearDepthStencilView` with an unknown flag, vertex-buffer slots past 31,
   17 viewports, an `OCCLUSION` query ended as `BINARY_OCCLUSION`, and `WriteBufferImmediate` at an address that
   is not 4-aligned. Since one failed list fails the whole `ExecuteCommandLists`, each of these drops a submission
   D3D12 would run. A root argument with no root signature bound has nowhere to go: the runtime drops the call on
@@ -207,7 +207,9 @@ What is implemented (all of it testable without the game):
   A `ClearDepthStencilView` flag for a plane the view's format doesn't have is ignored, as the PC runtime (WARP)
   does: `STENCIL` on a `D32_FLOAT` view clears nothing and `DEPTH | STENCIL` clears the depth plane. Until 2026-11-23
   `prepare` returned `invalid_clear` for it and the whole list was dropped (D3D-437); `d3d12_clear_test` compares three
-  such cases with WARP.
+  such cases with WARP. The depth value is kept as given: on a `D32_FLOAT` target WARP stores 1.5, -0.5 and NaN
+  unchanged, and a clear whose flags name no plane clears nothing, so neither fails the list any more
+  (`d3d12_clear_test` reads the texels back on WARP and here; `d3d12_close_parity_test` compares the `Close` verdicts).
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
   `vulkan_sync` / `vulkan_barrier_access` / `vulkan_layout` to `vkCmdPipelineBarrier2`. Whole-view clears are
@@ -3107,6 +3109,12 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   shown. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
+  `LEONIDA_PRESENT_UNCAP` (any non-empty value other than "0", read when the object is made) takes the frame-rate
+  cap off: a wait hands its token out at once (no vblank grid, no latency throttle) and `PresentX` presents
+  unsynced — MAILBOX or IMMEDIATE, not FIFO — so the frame rate is whatever the title renders; registration and
+  suspension errors are unchanged, and the statistics of an uncapped frame report its present time. This covers
+  the frame-event cap only: a cap inside the game's own code would still apply, and the DXGI swapchain fallback
+  keeps the app's sync interval.
   `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render;
   `PercentScanned` only for a frame shown at once by `ImmediateThresholdPercent`, else 0); `S_FALSE` with count 0 for what it does not have.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
@@ -3300,6 +3308,13 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
   order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed
   out gives `E_INVALIDARG` (nothing presented). Skipping a token is fine.
+- *Frame capture* (`LEONIDA_CAPTURE=<dir>`, `LEONIDA_CAPTURE_EVERY=<n>`, `LEONIDA_CAPTURE_LIMIT=<n>`): writes
+  every n-th presented frame (default 30, at most 24) to `<dir>/frame_NNNNN.ppm`, a binary P6 of the swapchain image
+  converted to 8-bit RGB, and appends one line per frame to `<dir>/index.txt` with the extent and the mean RGB. Off
+  unless the variable is set, and the folder is created. This is what a check reads when it has to know what the
+  layer actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
+  mean is enough to tell a real frame from a black one. `d3d12_present_test` turns it on and checks the files against
+  the colour it clears to.
 - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
   with `ERROR_INVALID_STATE` and refuses presents (a `PresentX` waiting for a swapchain image polls the suspended
   state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until

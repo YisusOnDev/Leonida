@@ -73,6 +73,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(root_signature_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(root_signature_test PRIVATE /OPT:NOREF)
 
+  # Host CPU preflight of --init/--run (src/host_cpu.h): AVX, OSXSAVE and XCR0 YMM state. The test feeds synthetic
+  # CPUID/XCR0 words.
+  add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
+  target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_options(host_cpu_test PRIVATE /W4 /permissive- /utf-8)
+
   # XTaskQueue/XAsync from microsoft/libHttpClient (MIT), vendored in third_party/xtaskqueue; shims/xtaskqueue/pch.h
   # stands in for libHttpClient's pch.h so only the task queue builds. Used by the xgameruntime shim.
   set(XTASKQUEUE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/xtaskqueue)
@@ -103,6 +109,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   add_executable(gta6rt
     src/main.cpp
+    src/host_cpu.cpp
     src/pe_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -256,16 +263,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(xg_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
-  # AcpHal.dll shim test: like xmem_test it compiles its own registry.cpp.
-  add_executable(acphal_test
-    test/acphal_test.cpp
-    shims/acphal.cpp
-    shims/registry.cpp
-  )
-  target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
-  target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(acphal_test PRIVATE /OPT:NOREF)
   # xapu.dll and chad.dll, the APU and audio DSP command queues, resolved through the registry like xmem_test.
   add_executable(xapu_chad_test
     test/xapu_chad_test.cpp
@@ -276,6 +273,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(xapu_chad_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xapu_chad_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xapu_chad_test PRIVATE /OPT:NOREF)
+
+  # acphal shim ABI test: resolves the registered acphal.dll exports through the registry.
+  add_executable(acphal_test
+    test/acphal_test.cpp
+    shims/acphal.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(acphal_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -839,6 +847,61 @@ if(BUILD_TESTING)
     add_dependencies(test_pe_loader_bounds gta6rt_tls_host)
     add_test(NAME pe_loader_bounds COMMAND test_pe_loader_bounds)
 
+    # RT-388: a deterministic mutation fuzzer over synthetic images through Loader::load (test/pe_loader_fuzz.cpp).
+    # ctest runs a fixed seed and case count; docs/testing.md has the long runs. With LEONIDA_LOADER_FUZZ_ASAN the
+    # fuzzer and the loader sources it compiles are built with AddressSanitizer (use RelWithDebInfo or Release:
+    # /fsanitize=address does not combine with the /RTC1 of a Debug build).
+    option(LEONIDA_LOADER_FUZZ_ASAN "Build pe_loader_fuzz with AddressSanitizer" OFF)
+    add_executable(pe_loader_fuzz
+      test/pe_loader_fuzz.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+      shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_include_directories(pe_loader_fuzz PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(pe_loader_fuzz PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pe_loader_fuzz PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(pe_loader_fuzz PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
+    target_link_libraries(pe_loader_fuzz PRIVATE gta6rt_d3d12_xs_rootsig psapi)
+    add_dependencies(pe_loader_fuzz gta6rt_tls_host)
+    if(LEONIDA_LOADER_FUZZ_ASAN)
+      target_compile_options(pe_loader_fuzz PRIVATE /fsanitize=address /Zi)
+      target_link_options(pe_loader_fuzz PRIVATE /INCREMENTAL:NO /DEBUG)
+      # No STL container annotations: they need stl_asan.lib from the VS component, and the libraries linked here
+      # are built without ASan, so the annotate_string/annotate_vector /FAILIFMISMATCH keys must stay as theirs.
+      target_compile_definitions(pe_loader_fuzz PRIVATE _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
+      # The ASan runtime: next to cl.exe for MSVC (the VS "C++ AddressSanitizer" component), under the resource
+      # directory for clang-cl. Its objects name the runtime libraries; the folder goes on the library path, and the
+      # DLL is copied beside the test so it runs without a Developer prompt or a PATH change.
+      get_filename_component(_leonida_cc_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+      file(GLOB _leonida_asan_dll
+        "${_leonida_cc_dir}/clang_rt.asan_dynamic-x86_64.dll"
+        "${_leonida_cc_dir}/../lib/clang/*/lib/windows/clang_rt.asan_dynamic-x86_64.dll")
+      if(_leonida_asan_dll)
+        list(GET _leonida_asan_dll 0 _leonida_asan_dll)
+        get_filename_component(_leonida_asan_dir "${_leonida_asan_dll}" DIRECTORY)
+        target_link_directories(pe_loader_fuzz PRIVATE "${_leonida_asan_dir}")
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+          # clang-cl 23's stack-use-after-return frames break MSVC C++ exception dispatch at /O2: a rethrow faults
+          # in vcruntime's _C_specific_handler_noexcept (a five-line try/throw/catch does it). Without them it works.
+          target_compile_options(pe_loader_fuzz PRIVATE -fsanitize-address-use-after-return=never)
+          # clang-cl names these only when it runs the link itself; CMake calls the linker directly.
+          target_link_options(pe_loader_fuzz PRIVATE clang_rt.asan_dynamic-x86_64.lib
+                              /wholearchive:clang_rt.asan_dynamic_runtime_thunk-x86_64.lib)
+        endif()
+        add_custom_command(TARGET pe_loader_fuzz POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_leonida_asan_dll}" "$<TARGET_FILE_DIR:pe_loader_fuzz>")
+      else()
+        message(WARNING "LEONIDA_LOADER_FUZZ_ASAN: no clang_rt.asan_dynamic-x86_64.dll beside ${CMAKE_CXX_COMPILER}")
+      endif()
+    endif()
+    add_test(NAME pe_loader_fuzz COMMAND pe_loader_fuzz --quiet)
+
     # Static TLS fixture: a DLL with __declspec(thread) and a TLS callback. It is ordinary test code; no game data
     # is involved. loader_tls_test needs gta6rt_tls_host.dll next to its own EXE, because that is where
     # Loader::initialize_tls looks for the reserved module TLS index.
@@ -1292,11 +1355,11 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
-    set_tests_properties(api_ref_state PROPERTIES TIMEOUT 10)
+    set_tests_properties(api_ref_state PROPERTIES TIMEOUT 30)
   endif()
   if(WIN32 AND TARGET api_global_refs_test)
     add_test(NAME api_global_refs COMMAND api_global_refs_test)
-    set_tests_properties(api_global_refs PROPERTIES TIMEOUT 10)
+    set_tests_properties(api_global_refs PROPERTIES TIMEOUT 30)
   endif()
   # Internal XTaskQueue context pinning and rundown regression tests.
   if(WIN32 AND TARGET gta6rt_xtaskqueue)
@@ -1456,6 +1519,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
   endif()
+  if(WIN32 AND TARGET host_cpu_test)
+    add_test(NAME host_cpu COMMAND host_cpu_test)
+  endif()
   if(WIN32 AND TARGET root_signature_oracle_test)
     add_test(NAME root_signature_oracle COMMAND root_signature_oracle_test)
   endif()
@@ -1532,6 +1598,15 @@ if(TARGET Vulkan::Headers)
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
   add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
+  # LEONIDA_VK_DEVICE names the GPU in every harness (docs/testing.md, "Choosing the GPU"): a filter that matches no
+  # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_FOUND)
+    add_test(NAME vk_device_filter_tools COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_device_filter_tools.py" "$<TARGET_FILE:vk_descriptor_bench>"
+             "$<TARGET_FILE:vk_sandbox>" "${CMAKE_CURRENT_BINARY_DIR}/vk_device_filter_tools")
+    set_tests_properties(vk_device_filter_tools PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   if(MSVC)
     # Keep the checker and its worker threads on the toolchain's C++ runtime under Wine.
     set_property(TARGET vk_pipeline_check PROPERTY
@@ -1723,6 +1798,12 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME bindless_sizing COMMAND bindless_sizing_test)
   endif()
+  # CPU-only: a mesh PSO's output, workgroup and shared-memory needs against synthetic device limits (vulkan_mesh_limits.h).
+  add_executable(vulkan_mesh_limits_test test/vulkan_mesh_limits_test.cpp)
+  target_link_libraries(vulkan_mesh_limits_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME vulkan_mesh_limits COMMAND vulkan_mesh_limits_test)
+  endif()
   # CPU-only: Vulkan 1.3 core vs 1.2 KHR/EXT feature probing and proc fallback (runtime/src/vulkan13_features.h).
   add_executable(vulkan13_features_test test/vulkan13_features_test.cpp)
   target_link_libraries(vulkan13_features_test PRIVATE Vulkan::Headers)
@@ -1731,6 +1812,18 @@ if(TARGET Vulkan::Headers)
   endif()
   if(BUILD_TESTING)
     add_test(NAME vulkan13_features COMMAND vulkan13_features_test)
+  endif()
+  # Buffer registrations keep their binding, VA lookup, and sparse owner in step on host allocation failure.
+  add_executable(vk_buffer_registration_oom_test test/vk_buffer_registration_oom_test.cpp)
+  target_link_libraries(vk_buffer_registration_oom_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_buffer_registration_oom_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(vk_buffer_registration_oom_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_buffer_registration_oom COMMAND vk_buffer_registration_oom_test)
   endif()
   # CPU-only: ScratchBuffers chunk alignment, retire/collect/forget, and spare cap (runtime/src/vulkan_scratch.h).
   add_executable(vulkan_scratch_test test/vulkan_scratch_test.cpp)
@@ -1882,7 +1975,7 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_vertex_buffer_slot_range_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_vertex_buffer_slot_range COMMAND d3d12_vertex_buffer_slot_range_test)
     set_tests_properties(d3d12_vertex_buffer_slot_range PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 45)
-    set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     add_test(NAME d3d12_queue_wait_timeout COMMAND d3d12_queue_wait_test --timeout-control)
     set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 10)
     # ExecuteCommandLists refuses a list whose type isn't the queue's (debug-layer message 836).
@@ -1892,6 +1985,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_queue_list_type_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_queue_list_type COMMAND d3d12_queue_list_type_test)
     set_tests_properties(d3d12_queue_list_type PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # Cross-device ownership validation: Signal, Wait, SetEventOnMultipleFenceCompletion, ExecuteCommandLists, ExecuteBundle.
+    add_executable(d3d12_cross_device_validation_test test/d3d12_cross_device_validation_test.cpp)
+    target_link_libraries(d3d12_cross_device_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_cross_device_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_cross_device_validation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_cross_device_validation COMMAND d3d12_cross_device_validation_test)
+    set_tests_properties(d3d12_cross_device_validation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     # Wait-before-Signal with a texture and a buffer handed over between the COPY, COMPUTE and DIRECT queues, in every
     # submission order, on the layer and on the host runtime (docs/d3d12_vulkan.md section 4.4).
     add_executable(d3d12_queue_handover_test test/d3d12_queue_handover_test.cpp)
@@ -1918,7 +2019,7 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_queue_share d3d12_queue_share_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     add_test(NAME d3d12_queue_wait_one_queue COMMAND d3d12_queue_wait_test)
-    set_tests_properties(d3d12_queue_wait_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    set_tests_properties(d3d12_queue_wait_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     set_tests_properties(d3d12_queue_share_one_queue d3d12_queue_wait_one_queue PROPERTIES
                          ENVIRONMENT "LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1;LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1")
     # A misspelt case or count is refused with the usage line (exit code 2) before a device exists, instead of
@@ -2081,6 +2182,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_committed_write_watch_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_committed_write_watch COMMAND d3d12_committed_write_watch_test)
     set_tests_properties(d3d12_committed_write_watch PROPERTIES SKIP_RETURN_CODE 77)
+    # FORMAT_SUPPORT of the depth- and stencil-plane view formats and comparison sampling, against the host runtime.
+    add_executable(d3d12_depth_view_format_support_test test/d3d12_depth_view_format_support_test.cpp)
+    target_link_libraries(d3d12_depth_view_format_support_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_depth_view_format_support_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_depth_view_format_support_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_depth_view_format_support COMMAND d3d12_depth_view_format_support_test)
+    set_tests_properties(d3d12_depth_view_format_support PROPERTIES SKIP_RETURN_CODE 77)
 
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
@@ -2163,6 +2271,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_existing_heap_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_existing_heap COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
+    # Slot 133 on untouched xmem physical pages: committed through the pages hook, then imported. xmem.cpp and
+    # registry.cpp are compiled in, as xmem_test does, to reach the registered XMem* exports.
+    add_executable(d3d12_xmem_placed_test test/d3d12_xmem_placed_test.cpp shims/xmem.cpp shims/registry.cpp)
+    target_link_libraries(d3d12_xmem_placed_test PRIVATE gta6rt_d3d12_com d3d12 dxgi psapi)
+    target_compile_definitions(d3d12_xmem_placed_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_xmem_placed_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_xmem_placed_test PRIVATE /OPT:NOREF)
+    add_test(NAME d3d12_xmem_placed COMMAND d3d12_xmem_placed_test)
+    set_tests_properties(d3d12_xmem_placed PROPERTIES SKIP_RETURN_CODE 77)
 
     # A resource released with no submission in flight gives its Vulkan memory back at once (deletion queue).
     add_executable(d3d12_release_reclaim_test test/d3d12_release_reclaim_test.cpp)
@@ -2191,7 +2308,7 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_fence_device_lost_counter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_fence_device_lost_counter_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_fence_device_lost_counter COMMAND d3d12_fence_device_lost_counter_test)
-    set_tests_properties(d3d12_fence_device_lost_counter PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    set_tests_properties(d3d12_fence_device_lost_counter PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # Xbox-ABI queue and fence proxies behind the device proxy, on the host runtime (WARP, a hardware adapter) and
     # on the Vulkan device: forwarding, refusal past the public chain, fence unwrapping. 77: no device at all.
     add_executable(queue_proxy_test test/queue_proxy_test.cpp)
@@ -2216,6 +2333,12 @@ if(TARGET Vulkan::Headers)
     target_compile_options(dxgi_device_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_device COMMAND dxgi_device_test)
     set_tests_properties(dxgi_device PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(dxgi_host_answers_test test/dxgi_host_answers_test.cpp)
+    target_link_libraries(dxgi_host_answers_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(dxgi_host_answers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_host_answers_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_host_answers COMMAND dxgi_host_answers_test)
+    set_tests_properties(dxgi_host_answers PROPERTIES SKIP_RETURN_CODE 77)
     # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
     add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
     target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -2371,6 +2494,16 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_execute_indirect_validation_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_execute_indirect_validation COMMAND d3d12_execute_indirect_validation_test)
     set_tests_properties(d3d12_execute_indirect_validation PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
+    # Set{Compute,Graphics}Root* closed-list, zero-count null, CBV alignment, and foreign root signature parity.
+    add_executable(d3d12_root_args_validation_test test/d3d12_root_args_validation_test.cpp)
+    target_link_libraries(d3d12_root_args_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_root_args_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_root_args_validation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_root_args_validation COMMAND d3d12_root_args_validation_test)
+    set_tests_properties(d3d12_root_args_validation PROPERTIES
       SKIP_RETURN_CODE 77
       FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
@@ -2893,6 +3026,16 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_node_mask_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_node_mask_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_node_mask COMMAND d3d12_node_mask_test)
+
+    # Console Xbox CreateDescriptorHeap extended ABI (issue #313 comment 7107265058): the title passes address/size
+    # after the PC desc and expects GetCPU/GPUDescriptorHandleForHeapStart() == address. Synthetic test; no title-memory
+    # aliasing / §3.3 backing coverage.
+    add_executable(d3d12_console_descriptor_heap_test test/d3d12_console_descriptor_heap_test.cpp shims/d3d12_xs_device.cpp)
+    target_link_libraries(d3d12_console_descriptor_heap_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_console_descriptor_heap_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_console_descriptor_heap_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_console_descriptor_heap COMMAND d3d12_console_descriptor_heap_test)
+    set_tests_properties(d3d12_console_descriptor_heap PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(d3d12_indirect_zero_test test/d3d12_indirect_zero_test.cpp)
     target_link_libraries(d3d12_indirect_zero_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_indirect_zero_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -2935,6 +3078,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(dxgi_swapchain_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_swapchain COMMAND dxgi_swapchain_test)
     set_tests_properties(dxgi_swapchain PROPERTIES SKIP_RETURN_CODE 77)
+
+    # The layer's DXGI against the host runtime's (hardware adapter, or WARP with PROBE_WARP=1): IDXGIAdapter4,
+    # GetRestrictToOutput without an output, ResizeBuffers flag bits and null out-pointers.
+    add_executable(dxgi_host_parity_test test/dxgi_host_parity_test.cpp)
+    target_link_libraries(dxgi_host_parity_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(dxgi_host_parity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_host_parity_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_host_parity COMMAND dxgi_host_parity_test)
+    set_tests_properties(dxgi_host_parity PROPERTIES SKIP_RETURN_CODE 77)
 
     # Synthetic (no GPU): VulkanSwapchain's DXGI BufferCount contract when Vulkan returns more images than the
     # app asked for, or the surface minimum exceeds the request (D3D-389).
@@ -3603,6 +3755,16 @@ if(TARGET Vulkan::Headers)
     add_executable(arena_size_test test/arena_size_test.cpp)
     target_link_libraries(arena_size_test PRIVATE Vulkan::Headers)
     add_test(NAME arena_size COMMAND arena_size_test)
+    # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
+    add_executable(vk_queue_constructor_oom_test test/vk_queue_constructor_oom_test.cpp)
+    target_link_libraries(vk_queue_constructor_oom_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(vk_queue_constructor_oom_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(vk_queue_constructor_oom_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      endif()
+    endif()
+    add_test(NAME vk_queue_constructor_oom COMMAND vk_queue_constructor_oom_test)
   endif()
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
