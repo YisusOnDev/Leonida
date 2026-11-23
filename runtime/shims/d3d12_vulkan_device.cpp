@@ -453,7 +453,8 @@ bool rgba8_any_order(DXGI_FORMAT format) {
 
 bool typed_depth(DXGI_FORMAT format) {
     return format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D16_UNORM ||
-           format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+           format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+           format == kXboxD16UnormS8Uint;
 }
 
 // D3D-466: typed sRGB and depth-only formats have no UAV view in D3D12, and without a castable-format list no view
