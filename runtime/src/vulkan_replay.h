@@ -2132,7 +2132,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
 
     p.colors.assign(pipeline->color_formats.size(), {});
     const std::uint32_t render_target_count = draw.views ? draw.views->render_target_count : 0;
-    for (std::size_t slot = 0; slot < render_target_count && slot < p.colors.size(); ++slot) {
+    for (std::size_t slot = 0; slot < render_target_count && slot < p.colors.size() &&
+                               slot < draw.views->render_targets.size();
+         ++slot) {
         const TargetView& target = draw.views->render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);

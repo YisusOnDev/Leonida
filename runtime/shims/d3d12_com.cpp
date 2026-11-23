@@ -433,17 +433,32 @@ public:
         scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
     }
 
+    // A rebind that changes nothing keeps the views block, or a title that re-sets the same state before every draw
+    // would build (and allocate) a new one per draw.
+    static bool same(const leonida::TargetView& a, const leonida::TargetView& b) {
+        return a.resource == b.resource && a.mip == b.mip && a.first_layer == b.first_layer &&
+               a.layer_count == b.layer_count && a.format == b.format;
+    }
+    static bool same(const leonida::VertexBufferView& a, const leonida::VertexBufferView& b) {
+        return a.va == b.va && a.size == b.size && a.stride == b.stride;
+    }
+
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
-        render_targets_.fill({});
-        render_target_count_ = count;
-        draw_views_stale_ = true;
+        std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> next{};
         for (UINT i = 0; i < count && targets; ++i) {
             const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
-            if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
+            if (handle) next[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
+        }
+        bool changed = render_target_count_ != count;
+        for (std::size_t i = 0; i < next.size(); ++i) changed = changed || !same(next[i], render_targets_[i]);
+        if (changed) {
+            render_targets_ = next;
+            render_target_count_ = count;
+            draw_views_stale_ = true;
         }
         depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(depth->ptr) : leonida::TargetView{};
     }
@@ -1419,11 +1434,13 @@ private:
     }
 
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
-        if (count) draw_views_stale_ = true;
-        for (UINT i = 0; i < count; ++i)
-            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
-                                                                          views[i].StrideInBytes}
-                                               : leonida::VertexBufferView{};
+        for (UINT i = 0; i < count; ++i) {
+            const leonida::VertexBufferView next =
+                views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes, views[i].StrideInBytes}
+                      : leonida::VertexBufferView{};
+            if (!same(next, vertex_buffers_[start + i])) draw_views_stale_ = true;
+            vertex_buffers_[start + i] = next;
+        }
     }
 
     void set_index_buffer(const D3D12_INDEX_BUFFER_VIEW* view) {

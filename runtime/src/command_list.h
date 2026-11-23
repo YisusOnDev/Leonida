@@ -407,7 +407,9 @@ struct IndexBufferView {
 
 // The views a draw captured, at the D3D12 maxima. Kept by value because the CPU descriptor slots and the bound
 // views can change after the draw is recorded, and out of line because the command variant is sized by its largest
-// member: inline they made every recorded command, barriers included, 976 bytes.
+// member: inline they made every recorded command, barriers included, 976 bytes. The shim allocates one block on the
+// first draw after the render targets or the bound vertex buffers change, and the draws after it share that block; a
+// call that rebinds the values already bound does not start a new one.
 struct DrawViews {
     std::array<TargetView, 8> render_targets{};
     std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
