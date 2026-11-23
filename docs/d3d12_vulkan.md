@@ -1584,27 +1584,41 @@ Arena VAs (at most 4095 MiB, so 32-bit) pass. A VA biased from outside the arena
 VAs above are at or above 2^40 as unsigned values. That is one more reason for the rule above that every buffer
 a console client can address is an arena range, whichever heap it comes from.
 
-**Title-placed buffers (device slot 133).** Here the title, not the layer, chooses the VA: `CreatePlacedResourceX`
-puts a buffer at the CPU address of the title's own pages. On Windows that is a user-mode address around 1.5 TiB,
-far past the arena (at most 4095 MiB, and descriptor tables must stay below 4 GiB), so `heap_base + title_va`
-names nothing the layer made. The layer therefore translates the title's VA where it
-writes an address itself: root CBV/SRV/UAV arguments (`SetGraphicsRoot*View`, `SetComputeRoot*View`) and the base
-of the V# it writes for a CBV or a buffer SRV/UAV (counter included). An address inside a title-placed buffer
-becomes the console VA of that buffer's GPU copy (`runtime/src/title_va_alias.h`); every other address is left
-alone, and the range is forgotten when the buffer is released.
-- When the pages can't be imported (write-combined or uncommitted pages, a missing extension, an import budget),
-  the copy is the per-submission shadow, and the shadow is an **arena range** when it fits. Its console VA is the
-  arena offset: below 4 GiB, so it holds in a root argument, in a V#'s 48 bits and in a 32-bit table pointer alike.
-  When the arena has no room, the shadow keeps its own memory and is biased like an upload buffer (logged once;
-  raise `LEONIDA_ARENA_MB`).
-- When the pages are imported (`VK_EXT_external_memory_host`), the copy is the import and its console VA is its
-  device address minus `heap_base` (mod 2^64): exact for 64-bit root arguments, and for a V# only when the driver
-  put the import above the arena (otherwise logged once, as measured for upload buffers above).
-- The title's own VA is still what `GetGPUVirtualAddress` answers and what vertex, index, copy and immediate-write
-  calls resolve through the buffer VA index, so nothing the title reads back changes.
-- **Not covered:** a pointer or V# the title writes into memory itself (inside its constant data, say). The layer
-  never sees it, so it keeps the title's VA. Covering it needs the title's pages inside the GPU address space
-  (one of the options in #7218's design note) or the translator rewriting addresses.
+**Title-chosen addresses.** Two kinds of buffer address are the title's choice, not the layer's:
+- device slot 133 (`CreatePlacedResourceX`) puts a buffer at the CPU address of the title's own pages;
+- the title points root views and V#s at its own memory, for instance a per-frame constant ring (#8862, section
+  3.5 of `docs/retail_boot_chain.md`).
+
+On Windows these are user-mode addresses around 1.5 TiB, far past the arena (at most 4095 MiB, and descriptor
+tables must stay below 4 GiB), so `heap_base + VA` names nothing the layer made (the D3D-53 failure above). The layer
+therefore replaces such an address, wherever it sees one, by the console VA of a GPU copy of that memory
+(`runtime/src/title_va_alias.h`):
+
+| Where the address is | When it is replaced |
+|---|---|
+| Root CBV/SRV/UAV (`Set*Root*View`) | when the argument is set |
+| CBV and buffer SRV/UAV V#s the layer writes (`Create*View`, slot 70, counter V#s included) | when the descriptor is written |
+| Buffer V#s the title writes into a shader-visible CBV/SRV/UAV heap itself | before each `ExecuteCommandLists`, in place, for the tables the submitted lists bind and only the slots their root signatures declare |
+
+The copies:
+- A **slot-133 buffer** whose pages cannot be imported is the per-submission shadow, and the shadow is an **arena
+  range** when it fits. Its console VA is its arena offset, which holds in a root argument, in a V#'s 48 bits and in
+  a 32-bit table pointer alike. Without room in the arena it keeps its own memory and is biased like an upload buffer
+  (logged once; raise `LEONIDA_ARENA_MB`). An **imported** slot-133 buffer is reached at its device address minus
+  `heap_base` (mod 2^64): exact for root arguments, and for a V# only when the driver put the import above the arena
+  (logged once otherwise).
+- Any **other address in the title's memory** gets a window: the 64 KiB-aligned pages it covers, clipped to the
+  title's range, copied into the arena now and before every submission, through the same shadow refresh as slot 133
+  (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
+  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default).
+- **Only the title's memory** gets a copy: the blocks and ranges the xmem shims hand the title (`XMemAlloc`,
+  `XMemAllocDefault`, `XMemVirtualAlloc`, the title's `VirtualAlloc`). An address anywhere else, the runtime's or a
+  host DLL's memory included, is left as it was and counted, as is an arena VA or a buffer the layer made.
+
+The title's own VA is still what `GetGPUVirtualAddress` answers, and vertex, index, copy and immediate-write calls
+still resolve it through the buffer VA index, which knows slot-133 buffers by that VA. The copies are one way: what
+the GPU writes into a copy does not reach the title's pages. A pointer the title hides elsewhere (a raw VA inside its
+constant data that a shader dereferences) is not seen by the layer and keeps the title's VA.
 
 Why not give each buffer its own BDA and set `heap_base = 0`? Because 25,865 of the 26,503 shaders (97.6%)
 truncate descriptor-table pointers to 32 bits, and host BDAs are not guaranteed to be below 4 GB. The arena keeps console VAs low and stable.

@@ -135,6 +135,22 @@ std::uint64_t vsharp_address(std::uint64_t va, std::uint64_t bytes,
     return to;
 }
 
+// The CBV/SRV/UAV slots a descriptor table declares: the end of its furthest range (D3D12 appends a range at
+// D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND), an unbounded range counted as 1024. 0 for a sampler table or no table.
+std::uint32_t table_view_descriptors(const rt::rootsig::RootParameter& param) {
+    if (param.type != rt::rootsig::ParamType::Table) return 0;
+    constexpr std::uint32_t kUnbounded = 1024;
+    std::uint64_t next = 0, end = 0;
+    for (const auto& range : param.ranges) {
+        const std::uint64_t start = range.offset_in_table == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND ? next
+                                                                                                    : range.offset_in_table;
+        const std::uint64_t count = range.num_descriptors == UINT_MAX ? kUnbounded : range.num_descriptors;
+        next = start + count;
+        if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) end = std::max(end, next);
+    }
+    return std::uint32_t(std::min<std::uint64_t>(end, kUnbounded));
+}
+
 // memcpy that a page fault ends instead of killing the process: the title may decommit a page between the
 // VirtualQuery that saw it committed and the read. No C++ objects here: it is a __try frame.
 // `streaming` reads with MOVNTDQA, for write-combined pages: ordinary loads from them are not cached, and memcpy
@@ -917,11 +933,15 @@ struct DeviceState {
         out = va;
         if (!arena.mapped || va < arena.size || !context) return false;
         if (context->knows_buffer_va(va)) return false;  // an upload or readback buffer's biased VA, say
+        auto& aliases = leonida::title_va_aliases();
+        // Only the title's own memory gets a copy (xmem's ranges): an address anywhere else, the runtime's or a host
+        // DLL's memory included, is left as it was and counted.
+        std::uint64_t title_lo = 0, title_hi = 0;
+        if (!aliases.title_memory(va, title_lo, title_hi)) return true;
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), &mbi, sizeof(mbi)) ||
             mbi.State != MEM_COMMIT || !mbi.Protect || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-            return false;
-        auto& aliases = leonida::title_va_aliases();
+            return true;
         std::lock_guard lock(title_window_mutex);
         if (const std::uint64_t made = aliases.shader_va(va); made != va) {  // another thread made it meanwhile
             out = made;
@@ -929,6 +949,8 @@ struct DeviceState {
         }
         std::uint64_t lo = 0, hi = UINT64_MAX;
         aliases.gap(va, lo, hi);  // never over a slot-133 buffer's range or another window
+        lo = std::max(lo, title_lo);  // nor past the title's range
+        hi = std::min(hi, title_hi);
         const std::uint64_t want = std::clamp<std::uint64_t>(bytes, 1, kTitleWindowMax);
         const std::uint64_t start = std::max(va & ~(kTitleWindowAlign - 1), lo);
         std::uint64_t end = va > UINT64_MAX - want - kTitleWindowAlign ? UINT64_MAX
@@ -973,7 +995,7 @@ struct DeviceState {
     // The buffer V#s of the table at `table_va` whose base is in the title's own memory get the address of a copy,
     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
     // null slots are skipped; so is a V# already in the arena, so a rewritten one is left alone next time.
-    void scan_title_table(std::uint64_t table_va) {
+    void scan_title_table(std::uint64_t table_va, std::uint32_t descriptors) {
         VkDeviceSize end = 0;
         {
             std::lock_guard lock(cbv_heap_mutex);
@@ -981,7 +1003,9 @@ struct DeviceState {
             if (it == cbv_heaps.begin()) return;
             --it;
             if (table_va >= it->second) return;
-            end = std::min<VkDeviceSize>(it->second, table_va + kTableScanDescriptors * kDescriptorSize);
+            end = std::min<VkDeviceSize>(
+                it->second, table_va + VkDeviceSize(std::min<std::uint32_t>(descriptors, kTableScanDescriptors)) *
+                                           kDescriptorSize);
         }
         auto& aliases = leonida::title_va_aliases();
         for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize) {
@@ -5941,7 +5965,9 @@ public:
             [](void* device, std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
                 return static_cast<DeviceState*>(device)->resolve_title_memory(va, bytes, out);
             },
-            [](void* device, std::uint64_t table) { static_cast<DeviceState*>(device)->scan_title_table(table); });
+            [](void* device, std::uint64_t table, std::uint32_t descriptors) {
+                static_cast<DeviceState*>(device)->scan_title_table(table, descriptors);
+            });
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -6930,7 +6956,8 @@ public:
             layout.parameters.push_back({parsed.sig.params[i].type,
                                          packed.ok ? packed.first_sgpr[i] : rt::rootsig::kNoSgpr,
                                          parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                         table_view_descriptors(parsed.sig.params[i])});
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
             std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
