@@ -11,8 +11,11 @@
 //   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
 //     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
 //     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
-//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages between
-//     the read and the destination write, BCPack after the inflate).
+//   - A DestinationIsPhysicalPages request names its destination by 64 KiB page numbers of XMemAllocatePhysicalPages
+//     and a byte offset into the first one. The data is staged and written through the pages' backing
+//     (rt::xmem::write_physical_pages), so the pages need not be mapped.
+//   - BCPack, swizzle and SourceIsPhysicalPages requests fail with E_NOTIMPL for now (later PRs: BCPack and swizzle
+//     become stages between the read and the destination write, BCPack after the inflate).
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
@@ -37,6 +40,7 @@
 #include "dstorage_xs_abi.h"
 #include "kernel_write_hook.h"
 #include "shims.h"
+#include "xmem_pages.h"
 
 using namespace dsx;
 
@@ -822,10 +826,11 @@ private:
             log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (o & (options::kDestinationPages | options::kSourcePages)) {
-            log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
+        if (o & options::kSourcePages) {
+            log_once("pages", "requests whose source is physical pages are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
+        const bool pages = (o & options::kDestinationPages) != 0;
         const bool zlib = options::zlib(o);
         // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
         // it is 0 for every request that gets here (BCPack is refused above).
@@ -837,10 +842,11 @@ private:
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
-        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not implemented
-        // yet (refused above). The source is never larger than the destination here (the same size without zlib,
-        // smaller with it), so this covers both buffers, and bounds the staging buffers of a zlib request too.
-        if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
+        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages. A physical-page
+        // destination is 64 KiB pages; the page size behind an address is not known here, so an address keeps the
+        // limit. The source is never larger than the destination here (the same size without zlib, smaller with it),
+        // so this covers both buffers, and with kMaxRequestBytes above it bounds every staging buffer.
+        if (!pages && r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
         // DSTORAGE_REQUEST: with ZlibDecompress the file offset must be 16-byte aligned.
         if (zlib && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
         if (!r.Destination) return E_INVALIDARG;
@@ -852,8 +858,49 @@ private:
         }
         if (zlib) return inflate_request(e, memory);
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
-        if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
-        return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+        if (!pages) {
+            if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+            return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+        }
+        // Physical pages have no address to read into: the source is staged, then written to the pages.
+        std::vector<uint8_t> staged;
+        try {
+            staged.resize(r.SourceSize);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (memory) {
+            if (!guarded_move(staged.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+        } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, staged.data(), r.SourceSize);
+                   FAILED(hr)) {
+            return hr;
+        }
+        return write_destination(r, staged.data(), staged.size());
+    }
+
+    // The last step of a request: `size` bytes of the shim's own buffer go to the destination. For a
+    // DestinationIsPhysicalPages request that is DestinationPageArray, entries of 64 KiB page numbers, starting
+    // DestinationPageOffset bytes into the first (a UINT16, so always inside it). The entries the range covers are
+    // copied out of the title's array first, and every one is checked before a byte is written, so a bad array or a
+    // page that is not a live XMemAllocatePhysicalPages page leaves the pages as they were. Both are
+    // E_DSTORAGE_ACCESS_VIOLATION, the code for a destination that cannot be written.
+    static HRESULT write_destination(const DSTORAGE_REQUEST& r, const uint8_t* data, size_t size) {
+        if (!(r.Options.AsUINT64 & options::kDestinationPages))
+            return guarded_move(r.Destination, data, size) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+        if (size == 0) return S_OK;
+        log_once("destination-pages", "DestinationIsPhysicalPages requests are written through the xmem shim's pages");
+        const size_t offset = r.DestinationPageOffset;
+        const size_t count = (offset + size + rt::xmem::kPhysicalPageBytes - 1) / rt::xmem::kPhysicalPageBytes;
+        std::vector<uint64_t> page_numbers;
+        try {
+            page_numbers.resize(count);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (!guarded_move(page_numbers.data(), r.DestinationPageArray, count * sizeof(uint64_t)))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        return rt::xmem::write_physical_pages(page_numbers.data(), offset, data, size) ? S_OK
+                                                                                       : E_DSTORAGE_ACCESS_VIOLATION;
     }
 
     // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
@@ -903,7 +950,7 @@ private:
             ++stats().s.DecompressionErrors;
             return hr;
         }
-        return guarded_move(r.Destination, result.data(), result.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+        return write_destination(r, result.data(), result.size());
     }
 
     void set_pending(int delta) {

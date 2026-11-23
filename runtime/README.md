@@ -229,7 +229,8 @@ Current limits, by design:
   (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
   overlay; each queue reads file or memory ranges into memory in order on its own worker thread, inflating zlib
   requests (RFC 1950, `src/shader_library.h`'s inflater), and reports through status arrays, `ID3D12Fence` signals
-  and events. BCPack, swizzle and physical-page requests are not done yet.
+  and events. A `DestinationIsPhysicalPages` request is written through the `xmem` shim's pages
+  (`shims/xmem_pages.h`). BCPack, swizzle and physical-page sources are not done yet.
   See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
