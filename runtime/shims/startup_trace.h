@@ -39,11 +39,27 @@ namespace rt::startup_trace {
 
 namespace detail {
 inline std::atomic<bool> on{false};
+
+// A heap object allocated once, immortal, and never guarded by a _Init_thread_header ($TSS) thread check: the one
+// static here is constant-initialised and a compare-exchange publishes the object, so a losing allocation leaks on
+// purpose (the object is immortal). Function-local dynamic statics are guarded by $TSS, and the boot chain runs on
+// threads whose TLS array the loader replaced (runtime/src/pe_loader.cpp, "Windows replaces a thread's TLS array
+// ... when some thread loads a DLL with static TLS"): a skipped guard leaves the guarded pointer null, and the next
+// caller dereferences it — seen as a page fault at the xmem once-per-attribute set below and in library_loader.cpp.
+template <typename T>
+inline T& immortal() {
+    static std::atomic<T*> slot{nullptr};   // constant-initialised: no thread guard
+    if (T* held = slot.load(std::memory_order_acquire)) return *held;
+    T* fresh = new T;
+    T* expected = nullptr;
+    return *(slot.compare_exchange_strong(expected, fresh, std::memory_order_release, std::memory_order_acquire)
+                 ? fresh : expected);
+}
+
 // Intentionally immortal: vectored exception handlers or late teardown paths can still run after normal statics would
 // have been destroyed.
 inline std::mutex& mutex() {
-    static auto* m = new std::mutex;
-    return *m;
+    return immortal<std::mutex>();
 }
 inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
@@ -196,16 +212,24 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
 // so a boot can be followed past the title's soft asserts (an int3 followed by code that carries on). Off by default:
 // a console title never reaches one in a correct run, so each skipped address is a finding, not a fix.
 inline bool skip_int3(EXCEPTION_POINTERS* info) {
-    static const bool skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
-    if (!skip || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord) return false;
+    struct SkipFlag {
+        bool value;
+        SkipFlag() : value(GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0) {}
+    };
+    if (!immortal<SkipFlag>().value || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT
+        || !info->ContextRecord)
+        return false;
     const auto* at = static_cast<const unsigned char*>(info->ExceptionRecord->ExceptionAddress);
     if (!at || *at != 0xCC || info->ContextRecord->Rip != reinterpret_cast<DWORD64>(at)) return false;
-    static std::mutex m;
-    static std::set<const void*> seen;
+    struct Int3Notes {
+        std::mutex mutex;
+        std::set<const void*> seen;
+    };
+    auto& notes = immortal<Int3Notes>();
     bool first = false;
     {
-        const std::lock_guard lock(m);
-        first = seen.insert(at).second;
+        const std::lock_guard lock(notes.mutex);
+        first = notes.seen.insert(at).second;
     }
     if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
     info->ContextRecord->Rip += 1;

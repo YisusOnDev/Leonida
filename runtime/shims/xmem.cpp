@@ -55,11 +55,11 @@ std::string caller_field(const void* caller) {
 // real run without logging every allocation, which would fill the file. Off: one relaxed load per call.
 void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
-    static std::mutex mutex;
-    static std::set<std::pair<std::string, uint64_t>> seen;
+    struct Notes { std::mutex mutex; std::set<std::pair<std::string, uint64_t>> seen; };
+    auto& notes = rt::startup_trace::detail::immortal<Notes>();
     {
-        const std::lock_guard lock(mutex);
-        if (!seen.insert({api, attributes}).second) return;
+        const std::lock_guard lock(notes.mutex);
+        if (!notes.seen.insert({api, attributes}).second) return;
     }
     std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
@@ -590,11 +590,11 @@ bool known_page(uint64_t page) { return page == 0 || g_pages.count(page) != 0; }
 // as an "xmem_physical_pages" event with the page count and the caller.
 void note_physical_attributes(uint64_t attributes, uint64_t count, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
-    static std::mutex mutex;
-    static std::set<uint64_t> seen;
+    struct Notes { std::mutex mutex; std::set<uint64_t> seen; };
+    auto& notes = rt::startup_trace::detail::immortal<Notes>();
     {
-        const std::lock_guard lock(mutex);
-        if (!seen.insert(attributes).second) return;
+        const std::lock_guard lock(notes.mutex);
+        if (!notes.seen.insert(attributes).second) return;
     }
     rt::startup_trace::event("xmem_physical_pages",
                              "\"api\":\"XMemAllocatePhysicalPages\",\"attributes\":" +
@@ -805,12 +805,12 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
                      type, static_cast<size_t>(size));
     }
     if (rt::startup_trace::enabled()) {
-        static std::mutex mutex;
-        static std::set<std::pair<uint32_t, uint64_t>> seen;
+        struct Notes { std::mutex mutex; std::set<std::pair<uint32_t, uint64_t>> seen; };
+        auto& notes = rt::startup_trace::detail::immortal<Notes>();
         bool first = false;
         {
-            const std::lock_guard lock(mutex);
-            first = seen.insert({type, static_cast<uint64_t>(size)}).second;
+            const std::lock_guard lock(notes.mutex);
+            first = notes.seen.insert({type, static_cast<uint64_t>(size)}).second;
         }
         if (first) {
             rt::startup_trace::event(
