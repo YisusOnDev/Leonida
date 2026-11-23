@@ -19,14 +19,14 @@
 // one 2D level, without mips or the layout structure slot 2 fills), so nothing else here computes a layout:
 // - XGSuggestSwizzleMode returns E_NOTIMPL and writes nothing, so the field keeps the 0 the caller put there.
 // - XGCreateTextureComputer stores a computer in *out whatever it returns. For a description it can lay out linearly
-//   (2D or 3D, one sample, a format element_size knows) it returns S_OK, and slots 2 and 9 answer that linear layout
+//   (2D or 3D, one sample, a format element_size knows) it returns S_OK, and slots 2, 8 and 9 answer that linear layout
 //   (their sections below). Otherwise it returns E_NOTIMPL: the two checking callers then fail cleanly, and the two
 //   that do not check would otherwise call through a null pointer. COM says *out is null on failure; this breaks that
 //   on purpose, because the measured callers need it.
-// - Slot 0 and slot 1 count nothing (a computer lives for the run). Every other slot but 2, 9 and 10, up to kSlots, prints its
+// - Slot 0 and slot 1 count nothing (a computer lives for the run). Every other slot but 2, 8, 9 and 10, up to kSlots, prints its
 //   index and caller once and returns E_NOTIMPL without writing its arguments, so a caller's own zero-filled outputs
 //   stay zero and a stack structure the caller did not fill stays as it was.
-// Hypothesis, not measured: slots 0 and 1 being AddRef and Release; the meaning of slots 2 and 8; that callers
+// Hypothesis, not measured: slots 0 and 1 being AddRef and Release; that callers
 // reach no slot above kSlots - 1 (the computer is also stored in an object at one site and may be called later).
 #include <windows.h>
 #include <d3d12.h>
@@ -201,12 +201,33 @@ bool can_lay_out(const Computer& c) {
     return linear_layout(c, mips, count, arrays);
 }
 
-// Slot 2: GetResourceLayout(layout*). Measured at the checking creation site (game_scarlett_master.exe+0x979c40): for
-// its mip m the title reads a qword at +0x50 + 0x70*m (the subresource's size: it allocates that much for slot 9's
-// output), a qword at +0x60 + 0x70*m (the depth-slice pitch) and a dword at +0x6C + 0x70*m (the row pitch). When the
-// two pitches equal its own tight ones, slot 9 copies straight into its buffer (+0x979e30). Only those three fields of
-// the mips the description has are written; the rest of the caller's structure (at most 0x1B40 bytes at that site)
-// stays as it was.
+// Slot 2: GetResourceLayout(layout*). The structure is 0x1B40 bytes: measured at +0x5121a84, which hands slot 2 a stack
+// structure and then copies one 0x6C8-byte plane record out of it (from +0x18 + 0x6C8 * plane) into a cache the title
+// sizes its texture memory from; and at the checking creation site (+0x979c40), which for mip m reads +0x50 + 0x70*m
+// (the subresource's size: it allocates that much for slot 9's output), +0x60 + 0x70*m (the depth-slice pitch) and
+// +0x6C + 0x70*m (the row pitch). Field offsets as documented by VIctory (github.com/Marvisak/VIctory, GPL-3.0,
+// crates/victory-hle/src/modules/xg.rs), which agree with both sites:
+//   +0x00 u64 size, +0x08 u64 alignment, +0x10 u32 mips, +0x14 u32 planes, +0x18 plane[4] (0x6C8 each),
+//   +0x1B38 u32 dimension;
+//   plane: +0x00 u32 usage (1 data), +0x08 u64 size, +0x10 u64 slice (one array slice) size, +0x18 u64 offset,
+//   +0x20 u64 alignment, +0x28 u32 element bytes, +0x2C u32 standard mips, +0x30 u32 tail mips, +0x38 mip[15]
+//   (0x70 each);
+//   mip: +0x00 u64 size, +0x08 u64 offset in the array slice, +0x10 u64 depth-slice size, +0x18 u32 pitch in texels,
+//   +0x1C u32 pitch in bytes, +0x20 u32 alignment, +0x24 u32[3] padded width/height (elements) and depth or array
+//   size, +0x30 u32[2] width/height in elements, +0x38 u32[2] width/height in texels, +0x40 u32 depth or array size,
+//   +0x44 u32 samples, +0x48 u32 swizzle mode (0 linear), +0x60 u32 slice depth, +0x64 u32 in mip tail.
+// The whole structure is written (zeros first): the title used to read the plane's size and offsets from whatever
+// its stack held, sized a 256 x 1 RGBA32F texture's memory from that and overran it into the next object
+// (game_scarlett_master.exe+0x550e60f, the AV at +0x13360a3). The layout is the linear one slot 9 reads, one data
+// plane, no mip tail.
+constexpr size_t kLayoutBytes = 0x1B40, kPlaneAt = 0x18, kPlaneBytes = 0x6C8, kMipAt = 0x38, kMipBytes = 0x70;
+constexpr uint64_t kLinearAlignment = 0x100, kResourceAlignment = 0x1000;
+
+template <typename T>
+void put(uint8_t* at, T value) {
+    std::memcpy(at, &value, sizeof(value));
+}
+
 HRESULT __stdcall computer_get_resource_layout(Computer* self, uint8_t* layout) {
     MipLayout mips[kMaxLayoutMips];
     uint32_t count = 0, arrays = 0;
@@ -215,26 +236,83 @@ HRESULT __stdcall computer_get_resource_layout(Computer* self, uint8_t* layout) 
         warn_once(warned, "texture computer slot ", 2, _ReturnAddress());
         return kNotImpl;
     }
+    const D3D12_RESOURCE_DESC& d = self->desc;
+    const bool volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    uint32_t bytes = 0, block = 1;
+    element_size(d.Format, bytes, block);
+    std::memset(layout, 0, kLayoutBytes);
+    uint64_t per_array = 0;
+    uint8_t* const plane = layout + kPlaneAt;
     for (uint32_t m = 0; m < count; ++m) {
-        uint8_t* entry = layout + 0x70 * m;
-        std::memcpy(entry + 0x50, &mips[m].size, sizeof(uint64_t));
-        std::memcpy(entry + 0x60, &mips[m].slice, sizeof(uint64_t));
-        std::memcpy(entry + 0x6C, &mips[m].row, sizeof(uint32_t));
+        const MipLayout& l = mips[m];
+        const uint32_t width = static_cast<uint32_t>(std::max<uint64_t>(1, d.Width >> m));
+        const uint32_t height = std::max<uint32_t>(1, d.Height >> m);
+        const uint32_t elements_wide = l.row / bytes;
+        uint8_t* entry = plane + kMipAt + kMipBytes * m;
+        put<uint64_t>(entry + 0x00, l.size);
+        put<uint64_t>(entry + 0x08, per_array);
+        put<uint64_t>(entry + 0x10, l.slice);
+        put<uint32_t>(entry + 0x18, elements_wide * block);
+        put<uint32_t>(entry + 0x1C, l.row);
+        put<uint32_t>(entry + 0x20, static_cast<uint32_t>(kLinearAlignment));
+        put<uint32_t>(entry + 0x24, elements_wide);
+        put<uint32_t>(entry + 0x28, l.rows);
+        put<uint32_t>(entry + 0x2C, volume ? l.depth : arrays);
+        put<uint32_t>(entry + 0x30, elements_wide);
+        put<uint32_t>(entry + 0x34, l.rows);
+        put<uint32_t>(entry + 0x38, width);
+        put<uint32_t>(entry + 0x3C, height);
+        put<uint32_t>(entry + 0x40, volume ? l.depth : arrays);
+        put<uint32_t>(entry + 0x44, 1);
+        put<uint32_t>(entry + 0x60, 1);
+        per_array += l.size;
     }
+    const uint64_t total = per_array * arrays;
+    put<uint32_t>(plane + 0x00, 1);
+    put<uint64_t>(plane + 0x08, total);
+    put<uint64_t>(plane + 0x10, per_array);
+    put<uint64_t>(plane + 0x20, kResourceAlignment);
+    put<uint32_t>(plane + 0x28, bytes);
+    put<uint32_t>(plane + 0x2C, count);
+    put<uint64_t>(layout + 0x00, total);
+    put<uint64_t>(layout + 0x08, kResourceAlignment);
+    put<uint32_t>(layout + 0x10, count);
+    put<uint32_t>(layout + 0x14, 1);
+    put<uint32_t>(layout + kPlaneAt + 4 * kPlaneBytes, static_cast<uint32_t>(d.Dimension));
     return S_OK;
 }
 
 // Row copies that turn an access violation into a failure (no C++ objects here: the function has __try).
-bool guarded_rows(uint8_t* dst, uint64_t dst_row, uint64_t dst_slice, const uint8_t* src, const MipLayout& l) {
+// `into` copies the caller's rows into the texture's memory (slot 8) instead of out of it (slot 9).
+bool guarded_rows(uint8_t* caller, uint64_t caller_row, uint64_t caller_slice, uint8_t* texels, const MipLayout& l,
+                  bool into) {
     __try {
         for (uint32_t z = 0; z < l.depth; ++z)
-            for (uint32_t y = 0; y < l.rows; ++y)
-                std::memcpy(dst + z * dst_slice + y * dst_row, src + z * l.slice + uint64_t{y} * l.row, l.row);
+            for (uint32_t y = 0; y < l.rows; ++y) {
+                uint8_t* const c = caller + z * caller_slice + y * caller_row;
+                uint8_t* const t = texels + z * l.slice + uint64_t{y} * l.row;
+                if (into) std::memcpy(t, c, l.row);
+                else std::memcpy(c, t, l.row);
+            }
         return true;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                   : EXCEPTION_CONTINUE_SEARCH) {
         return false;
     }
+}
+
+// The byte offset of a subresource in the linear layout, or false for one past the description.
+bool subresource_at(const Computer& c, UINT subresource, MipLayout& mip, uint64_t& offset) {
+    MipLayout mips[kMaxLayoutMips];
+    uint32_t count = 0, arrays = 0;
+    if (!linear_layout(c, mips, count, arrays) || subresource >= count * arrays) return false;
+    uint64_t per_array = 0;
+    for (uint32_t m = 0; m < count; ++m) per_array += mips[m].size;
+    const uint32_t m = subresource % count;
+    offset = per_array * (subresource / count);
+    for (uint32_t i = 0; i < m; ++i) offset += mips[i].size;
+    mip = mips[m];
+    return true;
 }
 
 // Slot 9: copies one subresource out of the texture's memory: (dst, plane, subresource, box, texel base, dst row
@@ -243,22 +321,33 @@ bool guarded_rows(uint8_t* dst, uint64_t dst_row, uint64_t dst_slice, const uint
 // layout slot 2 answers. A box, another plane or a subresource past the description is refused with nothing written.
 HRESULT __stdcall computer_copy_from_subresource(Computer* self, uint8_t* dst, UINT plane, UINT subresource,
                                                  const void* box, const uint8_t* texels, UINT dst_row, UINT dst_slice) {
-    MipLayout mips[kMaxLayoutMips];
-    uint32_t count = 0, arrays = 0;
-    if (!self || !dst || !texels || plane || box || !linear_layout(*self, mips, count, arrays) ||
-        subresource >= count * arrays) {
+    MipLayout l{};
+    uint64_t offset = 0;
+    if (!self || !dst || !texels || plane || box || !subresource_at(*self, subresource, l, offset)) {
         static std::atomic<bool> warned{false};
         warn_once(warned, "texture computer slot ", 9, _ReturnAddress());
         return kNotImpl;
     }
-    uint64_t per_array = 0;
-    for (uint32_t m = 0; m < count; ++m) per_array += mips[m].size;
-    const uint32_t mip = subresource % count, array = subresource / count;
-    uint64_t offset = per_array * array;
-    for (uint32_t m = 0; m < mip; ++m) offset += mips[m].size;
-    const MipLayout& l = mips[mip];
     if (dst_row < l.row || (l.depth > 1 && dst_slice < uint64_t{dst_row} * l.rows)) return E_INVALIDARG;
-    return guarded_rows(dst, dst_row, dst_slice, texels + offset, l) ? S_OK : E_POINTER;
+    return guarded_rows(dst, dst_row, dst_slice, const_cast<uint8_t*>(texels) + offset, l, false) ? S_OK : E_POINTER;
+}
+
+// Slot 8: copies one subresource into the texture's memory: (texel base, plane, subresource, src, src row pitch, src
+// slice pitch). Measured at +0x16f71fb, in a loop over the subresources of an upload: the texel base is the title's
+// texture memory, plane 0, the subresource index, the source the title's data at its running offset and its tight row
+// and slice pitches. Written in the linear layout slot 2 answers; another plane or a subresource past the description
+// is refused with nothing written.
+HRESULT __stdcall computer_copy_into_subresource(Computer* self, uint8_t* texels, UINT plane, UINT subresource,
+                                                 const uint8_t* src, UINT src_row, UINT src_slice) {
+    MipLayout l{};
+    uint64_t offset = 0;
+    if (!self || !texels || !src || plane || !subresource_at(*self, subresource, l, offset)) {
+        static std::atomic<bool> warned{false};
+        warn_once(warned, "texture computer slot ", 8, _ReturnAddress());
+        return kNotImpl;
+    }
+    if (src_row < l.row || (l.depth > 1 && src_slice < uint64_t{src_row} * l.rows)) return E_INVALIDARG;
+    return guarded_rows(const_cast<uint8_t*>(src), src_row, src_slice, texels + offset, l, true) ? S_OK : E_POINTER;
 }
 
 template <size_t... Slot>
@@ -267,6 +356,7 @@ constexpr auto make_vtable(std::index_sequence<Slot...>) {
         (Slot == 0    ? reinterpret_cast<void*>(&computer_add_ref)
          : Slot == 1  ? reinterpret_cast<void*>(&computer_release)
          : Slot == 2  ? reinterpret_cast<void*>(&computer_get_resource_layout)
+         : Slot == 8  ? reinterpret_cast<void*>(&computer_copy_into_subresource)
          : Slot == 9  ? reinterpret_cast<void*>(&computer_copy_from_subresource)
          : Slot == 10 ? reinterpret_cast<void*>(&computer_get_resource_tiling)
                       : reinterpret_cast<void*>(&computer_slot<Slot>))...};
