@@ -198,6 +198,19 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                     first = false;
                 }
                 f += "}";
+                // The host region of the registers that usually hold an object: its allocation base, state and type.
+                f += ",\"regions\":{";
+                first = true;
+                for (const auto& [name, value] : {regs[1], regs[2], regs[4], regs[5]}) {
+                    MEMORY_BASIC_INFORMATION m{};
+                    if (!VirtualQuery(reinterpret_cast<const void*>(value), &m, sizeof(m))) continue;
+                    f += (first ? "\"" : ",\"") + std::string(name) + "\":" +
+                         quote(hex(reinterpret_cast<uint64_t>(m.AllocationBase)) + " base " +
+                               hex(reinterpret_cast<uint64_t>(m.BaseAddress)) + " size " + hex(m.RegionSize) +
+                               " state " + hex(m.State) + " type " + hex(m.Type) + " protect " + hex(m.Protect));
+                    first = false;
+                }
+                f += "}";
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);

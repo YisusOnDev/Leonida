@@ -359,8 +359,31 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
+void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect);
+
+// gta6rt --trace FILE: every XMemVirtualAlloc goes to the startup trace as an "xmem_virtual_alloc" event (the request,
+// the result, the error). The measured title makes a few dozen calls, and a fault in the title's memory needs their
+// bases to say which region an address belongs to.
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+    void* const result = xmem_virtual_alloc(address, size, allocation_type, attributes, protect);
+    if (rt::startup_trace::enabled()) {
+        const DWORD error = GetLastError();
+        using rt::startup_trace::hex;
+        using rt::startup_trace::quote;
+        rt::startup_trace::event(
+            "xmem_virtual_alloc",
+            "\"address\":" + quote(hex(reinterpret_cast<uint64_t>(address))) + ",\"size\":" + quote(hex(size)) +
+                ",\"type\":" + quote(hex(allocation_type)) + ",\"attributes\":" + quote(hex(attributes)) +
+                ",\"protect\":" + quote(hex(protect)) + ",\"result\":" + quote(hex(reinterpret_cast<uint64_t>(result))) +
+                (result ? std::string() : ",\"error\":" + std::to_string(error)) + caller_field(_ReturnAddress()));
+        SetLastError(error);
+    }
+    return result;
+}
+
+void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    (void)attributes;
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
