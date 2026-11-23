@@ -3233,7 +3233,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
     // the title places a 768x768x6 R16_TYPELESS depth array with both and asserts at
     // game_scarlett_master.exe+0x14a6390 on the refusal.
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
-        without_depth_stencil_uav(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
+        without_refused_combinations(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     if (!buffer) initial_state = pc_initial_layout(static_cast<std::uint32_t>(pc_desc.Flags), initial_state);
