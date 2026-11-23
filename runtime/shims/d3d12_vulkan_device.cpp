@@ -1366,7 +1366,8 @@ struct DeviceState {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
         }
-        const unsigned sampled_class = g::multisampled(image.type) ? numeric_class(view_format) : 0;
+        const unsigned sampled_class =
+            g::multisampled(image.type) ? (stencil ? 1u : unsigned(numeric_class(view_format))) : 0u;
         if (g::multisampled(image.type) && !bindless->supports_ms_class(sampled_class)) {
             log_once("set 0 has no multisample binding for this numeric class:", int(sampled_class));
             return false;
@@ -4858,13 +4859,6 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     if (msaa) {
-        // The MS bindings expose typed colour SRVs. An MS view has one mip and can name an array slice range.
-        const Format format = texture_storage_format(desc.Format, false);
-        if (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || format.typeless ||
-            (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format)) {
-            log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
-            return false;
-        }
         // Four 3-bit selectors followed by D3D12's always-set bit.
         if ((view.mapping >> 12) != 1) {
             log_once("invalid multisample shader view component mapping:", int(view.mapping));
@@ -4917,6 +4911,28 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         if (!depth_format_fits) {
             log_once("incompatible depth shader-resource view format:", int(view.format));
             return false;
+        }
+    }
+    if (msaa && !stencil && !depth_plane) {
+        const Format resource_fmt = texture_storage_format(desc.Format, false);
+        if (view.format == DXGI_FORMAT_UNKNOWN) {
+            if (resource_fmt.typeless) {
+                log_once("typeless multisample texture requires an explicit typed shader view format:",
+                         int(desc.Format));
+                return false;
+            }
+        } else {
+            const Format view_fmt = texture_storage_format(view.format, false);
+            if (view_fmt.typeless) {
+                log_once("multisample shader view format cannot be typeless:", int(view.format));
+                return false;
+            }
+            const bool same_family =
+                resource_fmt.typeless ? (format_family(view.format) == desc.Format) : (view.format == desc.Format);
+            if (!same_family && !resource.lists_castable_format(view.format)) {
+                log_once("incompatible multisample shader view format:", int(view.format));
+                return false;
+            }
         }
     }
     if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane) {
@@ -6738,11 +6754,17 @@ public:
             case D3D12_SRV_DIMENSION_TEXTURE2DMS:
                 view.type = ImageType::image_2d_msaa;
                 view.layer_count = 1;
+                if (desc->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+                    desc->Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)
+                    view.plane = 1;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
                 view.type = ImageType::image_2d_msaa_array;
                 view.first_layer = desc->Texture2DMSArray.FirstArraySlice;
                 view.layer_count = desc->Texture2DMSArray.ArraySize;
+                if (desc->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+                    desc->Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)
+                    view.plane = 1;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE2D:
                 view.first_mip = desc->Texture2D.MostDetailedMip;

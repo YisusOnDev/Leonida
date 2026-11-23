@@ -2163,6 +2163,17 @@ if(TARGET Vulkan::Headers)
       message(STATUS "glslangValidator not found: d3d12_volume_srv_test skips its GPU readback shader")
     endif()
 
+    # Multisampled typeless color and depth/stencil SRVs (TEXTURE2DMS / TEXTURE2DMSARRAY), including
+    # native D24_UNORM_S8_UINT and emulated D24-as-D32_SFLOAT_S8_UINT, negative controls and GPU clears/barriers.
+    add_executable(d3d12_msaa_srv_test test/d3d12_msaa_srv_test.cpp)
+    target_link_libraries(d3d12_msaa_srv_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_msaa_srv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_msaa_srv_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_msaa_srv COMMAND d3d12_msaa_srv_test)
+    set_tests_properties(d3d12_msaa_srv PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     add_executable(d3d12_predicated_copy_test test/d3d12_predicated_copy_test.cpp)
     target_link_libraries(d3d12_predicated_copy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_predicated_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
