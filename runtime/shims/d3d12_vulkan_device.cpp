@@ -8265,6 +8265,19 @@ public:
         case compat::kFeaturePredication:
             return write_supported_feature<compat::FeatureSupportFlag>(
                 method, data, size, state_.info.conditional_rendering ? TRUE : FALSE);
+        case compat::kFeature17:
+        case compat::kFeature58:
+            return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);
+        case compat::kFeatureTightAlignment: {
+            if (size != sizeof(compat::FeatureDataTightAlignment)) return d3d12_trace::result(method, E_INVALIDARG);
+            static_cast<compat::FeatureDataTightAlignment*>(data)->SupportTier = 0;  // NOT_SUPPORTED
+            return d3d12_trace::result(method, S_OK);
+        }
+        case compat::kFeature55: {
+            if (size != sizeof(compat::FeatureData24Zero)) return d3d12_trace::result(method, E_INVALIDARG);
+            std::memset(data, 0, size);
+            return d3d12_trace::result(method, S_OK);
+        }
         case compat::kFeatureApplicationSpecificDriverState:
             return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);
         case compat::kFeatureBytecodeBypassHashSupported:

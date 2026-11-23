@@ -1990,6 +1990,14 @@ if(TARGET Vulkan::Headers)
         LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV="${LEONIDA_TEST_CS_R9G9B9E5_UAV}")
     endif()
 
+    # CheckFeatureSupport over every feature value and the sizes around each structure, compared with the host D3D12.
+    add_executable(d3d12_feature_query_test test/d3d12_feature_query_test.cpp)
+    target_link_libraries(d3d12_feature_query_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_feature_query_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_feature_query_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_feature_query COMMAND d3d12_feature_query_test)
+    set_tests_properties(d3d12_feature_query PROPERTIES SKIP_RETURN_CODE 77)
+
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
     target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)

@@ -10,6 +10,12 @@
 // where the header has it. That keeps the runtime and its tests building on every 10.0.26100 SDK.
 namespace rt::d3d12::compat {
 
+// 17, 55 and 58 are in no header this repository builds against. The host runtime answers each with the same bytes on
+// the RTX 4080 SUPER, the UHD 770 and WARP: all zero, in a structure of 4, 24 and 4 bytes, and refuses any other size.
+inline constexpr D3D12_FEATURE kFeature17 = static_cast<D3D12_FEATURE>(17);
+inline constexpr D3D12_FEATURE kFeatureTightAlignment = static_cast<D3D12_FEATURE>(54);  // D3D12_FEATURE_DATA_TIGHT_ALIGNMENT
+inline constexpr D3D12_FEATURE kFeature55 = static_cast<D3D12_FEATURE>(55);
+inline constexpr D3D12_FEATURE kFeature58 = static_cast<D3D12_FEATURE>(58);
 // Feature values introduced after Windows SDK 10.0.26100.0.
 inline constexpr D3D12_FEATURE kFeatureApplicationSpecificDriverState = static_cast<D3D12_FEATURE>(56);
 inline constexpr D3D12_FEATURE kFeatureBytecodeBypassHashSupported = static_cast<D3D12_FEATURE>(57);
@@ -79,5 +85,16 @@ static_assert(offsetof(FeatureDataOptions21, SampleCmpGradientAndBiasSupported) 
 static_assert(offsetof(FeatureDataOptions21, ExtendedCommandInfoSupported) ==
               offsetof(D3D12_FEATURE_DATA_D3D12_OPTIONS21, ExtendedCommandInfoSupported));
 #endif
+
+// D3D12_FEATURE_DATA_TIGHT_ALIGNMENT: the tier is D3D12_TIGHT_ALIGNMENT_TIER_NOT_SUPPORTED (0).
+struct FeatureDataTightAlignment {
+    UINT SupportTier;
+};
+
+struct FeatureData24Zero {
+    UINT words[6];
+};
+
+static_assert(sizeof(FeatureDataTightAlignment) == 4 && sizeof(FeatureData24Zero) == 24);
 
 }  // namespace rt::d3d12::compat
