@@ -719,7 +719,8 @@ int main() {
             }) == E_INVALIDARG);
 
             // Refused at execution, before anything is submitted: a buffer view of a texture, a texture view of a
-            // buffer, a mip the texture does not have, a buffer view past the end, a rectangle clear of a volume.
+            // buffer, a mip the texture does not have, a buffer view past the end. A rectangle clear of a volume is
+            // valid but unsupported: it is left out and the rest of its list is submitted (D3D-408).
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             desc.Width = desc.Height = 4;
@@ -766,7 +767,7 @@ int main() {
             }) == leonida::ReplayResult::invalid_subresource);
             EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, v_view, volume.p, values, 1, &rect);
-            }) == leonida::ReplayResult::unsupported);
+            }) == leonida::ReplayResult::skipped_unsupported);
         }
     }
 

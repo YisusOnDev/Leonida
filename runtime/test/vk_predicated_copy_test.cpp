@@ -90,17 +90,21 @@ int main() {
     std::memcpy(expected.data()+6003,expected.data()+7,33);
     std::memcpy(expected.data()+5003,input.data()+1,17);
     const CommandList* pointer=&list;
-    // A device without the helper must submit nothing, rather than run a transfer unconditionally.
-    EXPECT(queue.execute({&pointer,1})==ReplayResult::unsupported);
-    EXPECT(std::memcmp(dst_data,expected.data(),bytes)!=0); // expected includes the not-yet-executed copies
-    for(std::size_t i=0;i<bytes;++i) EXPECT(static_cast<unsigned char*>(dst_data)[i]==static_cast<unsigned char>(13*i+173));
+    // A device without the helper leaves the predicated copies out rather than run them unconditionally (D3D-408):
+    // the rest of the list runs, here the unpredicated copy at its end.
+    EXPECT(queue.execute({&pointer,1})==ReplayResult::skipped_unsupported);
+    EXPECT(queue.idle());
+    std::array<unsigned char,bytes> partial{};
+    for(std::size_t i=0;i<bytes;++i) partial[i]=static_cast<unsigned char>(13*i+173);
+    std::memcpy(partial.data()+5003,input.data()+1,17);
+    EXPECT(std::memcmp(dst_data,partial.data(),bytes)==0);
     context.configure_predicated_copy(d.device_proc,limits);
     const auto real_submit=context.vk.vkQueueSubmit;
     context.vk.vkQueueSubmit=+[](VkQueue,std::uint32_t,const VkSubmitInfo*,VkFence)->VkResult{return VK_ERROR_OUT_OF_HOST_MEMORY;};
     const auto rejected=queue.execute({&pointer,1});
     context.vk.vkQueueSubmit=real_submit;
     EXPECT(rejected==ReplayResult::unsupported);
-    for(std::size_t i=0;i<bytes;++i) EXPECT(static_cast<unsigned char*>(dst_data)[i]==static_cast<unsigned char>(13*i+173));
+    EXPECT(std::memcmp(dst_data,partial.data(),bytes)==0);
     queue.wait(gate.semaphore(),1);
     bool submitted=true;
     for(unsigned i=0;i<32;++i) if(queue.execute({&pointer,1})!=ReplayResult::success){submitted=false;break;}

@@ -28,7 +28,8 @@
 //   usage and binary occlusion resolves need resolve_binary_occlusion.
 // - predicated buffer copies need the byte-copy helper and buffers with STORAGE_BUFFER usage; helper descriptors
 //   must remain alive through submission completion (VulkanQueue owns them).
-// A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
+// A list that needs a missing function fails with ReplayResult::unsupported before anything is written, unless
+// skip_unsupported is set: then only that command is left out (PreparedList::skipped).
 
 #include "command_list.h"
 #include "depth24.h"
@@ -804,7 +805,9 @@ enum class ReplayResult {
     invalid_query,
     invalid_indirect_arguments,
     invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
-    unsupported
+    unsupported,
+    // VulkanQueue::execute submitted the lists without at least one command it could not prepare (unsupported).
+    skipped_unsupported
 };
 
 struct ReplayFunctions {
@@ -946,6 +949,10 @@ struct ReplayFunctions {
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
+    // ExecuteCommandLists (VulkanQueue::execute): a command prepare() refuses as unsupported is left out and listed
+    // in PreparedList::skipped, and the rest of the list runs, as the PC runtime runs a valid list the layer does not
+    // fully cover. Barriers, SetPredication and queries are never left out (skippable()). Off: the list is refused.
+    bool skip_unsupported = false;
 };
 
 namespace detail {
@@ -2270,6 +2277,39 @@ inline QueryRange query_range(const Command& command) {
     return {};
 }
 
+// The D3D12 call that records a command, for the log.
+inline const char* command_name(const Command& command) {
+    static constexpr const char* names[] = {
+        "ResourceBarrier (transition)", "ResourceBarrier (UAV)", "ResourceBarrier (aliasing)", "Barrier (global)",
+        "Barrier (buffer)", "Barrier (texture)", "ClearRenderTargetView", "ClearDepthStencilView", "CopyBufferRegion",
+        "CopyTextureRegion", "CopyResource", "ResolveSubresource", "SetPredication", "ClearUnorderedAccessView",
+        "DiscardResource", "WriteBufferImmediate", "AtomicCopyBuffer", "BeginQuery", "EndQuery", "ResolveQueryData",
+        "SetMarker/BeginEvent/EndEvent", "ExecuteIndirect", "BuildRaytracingAccelerationStructure", "Dispatch",
+        "DrawInstanced/DrawIndexedInstanced", "CopyRaytracingAccelerationStructure",
+        "EmitRaytracingAccelerationStructurePostbuildInfo",
+    };
+    static_assert(std::size(names) == std::variant_size_v<Command>, "a name for every command");
+    return names[command.index()];
+}
+
+// Whether prepare() may leave the command out when it is unsupported (ReplayFunctions::skip_unsupported). Barriers
+// keep the layout tracker and the ordering of what follows, SetPredication decides whether later commands run, and
+// queries are planned in pairs across the list: without one of them the rest would run wrong, so a list with one
+// of them unsupported is still refused whole. Every other command only writes its own destination.
+inline bool skippable(const Command& command) {
+    return !std::holds_alternative<TransitionBarrier>(command) && !std::holds_alternative<GlobalBarrier>(command) &&
+           !std::holds_alternative<BufferBarrier>(command) && !std::holds_alternative<TextureBarrier>(command) &&
+           !std::holds_alternative<Predication>(command) && !query_range(command).count;
+}
+
+// A command prepare() left out of its list (ReplayFunctions::skip_unsupported).
+struct SkippedCommand {
+    std::size_t list = 0;     // VulkanQueue::execute: its list in the submission
+    std::size_t command = 0;  // its index in the list
+    const char* kind = "";    // command_name()
+    const char* why = "";     // what the replay lacks for it
+};
+
 // A list checked against the current resources, ready to emit.
 class PreparedList {
 public:
@@ -2298,6 +2338,8 @@ public:
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
     std::size_t unpredicated_copies = 0;
+    // Unsupported commands left out, in list order (ReplayFunctions::skip_unsupported); emit() skips them.
+    std::vector<SkippedCommand> skipped;
     // Set when any command writes to a host_readable (READBACK) buffer so VulkanQueue only flushes to HOST_BIT when needed.
     bool wrote_readback = false;
     VkPipelineStageFlags2 readback_src_stages = 0;
@@ -2555,6 +2597,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.commands.assign(commands.size(), {});
     out.draw_count = 0;
     out.queries.clear();
+    out.skipped.clear();
     out.segment_pool = VK_NULL_HANDLE;
     out.segment_base = out.segment_count = 0;
     out.precise_segments = false;
@@ -2583,9 +2626,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.wrote_readback = false;
     out.readback_src_stages = 0;
 
-    for (std::size_t i = 0; i < commands.size(); ++i) {
-        const auto& command = commands[i];
-        auto& p = out.commands[i];
+    // Why the command being prepared is unsupported: the log line of a skipped one (PreparedList::skipped).
+    const char* why = nullptr;
+    const auto refuse = [&why](const char* reason) {
+        why = reason;
+        return ReplayResult::unsupported;
+    };
+    // Checks one command and fills `p`; the loop below decides what a refusal does to the list.
+    const auto prepare_command = [&](std::size_t i, const Command& command, detail::Prepared& p) -> ReplayResult {
         const auto bind = [&](ResourceId id) {
             const ResourceBinding* binding = resolve(id);
             if (binding) p.binding = *binding;
@@ -2593,7 +2641,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         };
         const auto rect_view = [&](std::span<const Rect> rects, const TargetView& target, VkImageAspectFlags view_aspects) {
             if (rects.empty()) return ReplayResult::success;
-            if (!rendering) return ReplayResult::unsupported;
+            if (!rendering) return refuse("rectangles need dynamic rendering, which the device lacks");
             detail::clip(rects, detail::mip_extent(p.binding, target.mip), target.layer_count, p.rects);
             if (p.rects.empty()) {
                 p.skip = true;
@@ -2609,7 +2657,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             ResourceBinding view_binding = p.binding;
             if (p.clear_format != VK_FORMAT_UNDEFINED) view_binding.format = p.clear_format;
             p.view = vk.image_view(view_binding, range);
-            return p.view ? ReplayResult::success : ReplayResult::unsupported;
+            return p.view ? ReplayResult::success : refuse("its attachment view could not be created");
         };
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
@@ -2650,7 +2698,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                             VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
             } else if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
                        r != ReplayResult::success) return r;
-            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return refuse("the device lacks vkCmdClearColorImage");
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
@@ -2669,26 +2717,32 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
                 return r;
-            if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
+            if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image)
+                return refuse("the device lacks vkCmdClearDepthStencilImage");
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
             if (!bind(view.resource)) return ReplayResult::unresolved_resource;
             if (view.buffer) {
-                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
+                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer)
+                    return refuse("the device lacks vkCmdFillBuffer, vkCmdUpdateBuffer or vkCmdCopyBuffer");
                 if (predicated) ++out.unpredicated_copies;  // fills and copies are transfer commands
-                if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) return r;
+                if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success)
+                    return r == ReplayResult::unsupported
+                               ? refuse("the values do not encode in the view's format, or a range of 8- or 16-byte "
+                                        "elements is not whole words")
+                               : r;
                 const bool short_fill = std::any_of(p.fills.begin(), p.fills.end(), [&](const auto& fill) {
                     return detail::buffer_fill_needs_scratch(p.element, fill[0], fill[1]);
                 });
                 if (short_fill && (!vk.copy_scratch ||
                     !vk.copy_scratch(8, p.fill_scratch, p.fill_scratch_offset) || !p.fill_scratch ||
                     p.fill_scratch_offset % 4 || p.fill_scratch_offset > UINT64_MAX - 8))
-                    return ReplayResult::unsupported;
+                    return refuse("no transfer scratch for a range with no whole aligned word");
                 if (!p.skip && !p.fills.empty() && p.binding.host_readable) {
                     out.wrote_readback = true;
                     out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
                 }
-                continue;
+                return ReplayResult::success;
             }
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             const TargetView target{view.resource, view.mip, view.first_layer, view.layer_count};
@@ -2702,10 +2756,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // bit-exact R32_UINT backing path.
             const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
             if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element))
-                return ReplayResult::unsupported;
+                return refuse("the values do not encode in the view's format");
             const auto* image_layout = uav_clear::layout(p.binding.format);
             if (!image_layout || image_layout->bytes != p.element.size)
-                return ReplayResult::unsupported;
+                return refuse("the image's format has no element of the view's size");
             const bool attachment = p.binding.color_attachment && !p.binding.volume;
             const bool view_attachable = vk.color_attachment_format
                                              ? vk.color_attachment_format(view_format)
@@ -2713,10 +2767,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
             const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
             if (!uav_clear::decode(clear_format, p.element, p.clear_color))
-                return ReplayResult::unsupported;
+                return refuse("the element does not decode in the image's format");
             if (reinterpret) p.clear_format = view_format;
             if (!uav->rects.empty() && !attachment)
-                return ReplayResult::unsupported;
+                return refuse("rectangles of a volume, or of a format that cannot be an attachment");
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
             // render targets are; otherwise vkCmdClearColorImage runs unconditionally and is counted.
             if (predicated && uav->rects.empty() && !attachment) ++out.unpredicated_copies;
@@ -2725,10 +2779,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                    : attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
             if (const auto r = rect_view(rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
                 return r;
-            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return refuse("the device lacks vkCmdClearColorImage");
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
-            if (!copies) return ReplayResult::unsupported;
+            if (!copies) return refuse("the device lacks a copy command");
             if (predicated && !std::holds_alternative<CopyBuffer>(command)) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
@@ -2756,10 +2810,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (predicated) {
                     if ((statistics_active && !statistics_helpers) || !vk.prepare_predicated_copy || !vk.emit_predicated_copy ||
                         !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, src, dst, buffer_copy->size, p.predicated_copy))
-                        return ReplayResult::unsupported;
+                        return refuse("a predicated buffer copy needs the predicated-copy helper (and, inside a "
+                                      "pipeline-statistics query, a statistics segment pool)");
                 } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
+                if (result == ReplayResult::unsupported)
+                    result = refuse("the footprint's row pitch or offset is not a multiple of the texel size");
                 if (result == ReplayResult::success && !p.staged_reads.empty()) {
                     // A block-compressed copy staged through transfer scratch (prepare_texture_copy): whole blocks of
                     // the read's row length and height, one region a copy.
@@ -2786,7 +2843,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 const bool rgb96_footprint = result == ReplayResult::success && image.rgb96 &&
                     !p.buffer_image_copies.empty();
                 // Without a segment pool, refuse before allocating conversion scratch/descriptors.
-                if (statistics_active && !statistics_helpers && (depth24_footprint || rgb96_footprint)) return ReplayResult::unsupported;
+                if (statistics_active && !statistics_helpers && (depth24_footprint || rgb96_footprint))
+                    return refuse("a converted footprint copy inside a pipeline-statistics query needs a statistics "
+                                  "segment pool");
                 if (depth24_footprint) {
                     const VkBufferImageCopy& region = p.buffer_image_copies[0];
                     const ResourceBinding& buffer = upload ? p.source : p.binding;
@@ -2800,7 +2859,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.slices = region.imageExtent.depth;
                     job.app_row_words = region.bufferRowLength ? region.bufferRowLength : job.width;
                     job.app_slice_words = job.app_row_words * (region.bufferImageHeight ? region.bufferImageHeight : job.height);
-                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
+                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts))
+                        return refuse("the D24 conversion pass is unavailable");
                     p.has_depth24 = true;
                 } else if (rgb96_footprint) {
                     // A footprint of a 96-bit texture: 12-byte texels, 16 in the image. The same pass and scratch.
@@ -2817,7 +2877,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.slices = region.imageExtent.depth;
                     job.app_row_words = p.rgb96_row_words;
                     job.app_slice_words = p.rgb96_slice_words;
-                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
+                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts))
+                        return refuse("the 96-bit repack pass is unavailable");
                     p.has_depth24 = true;
                 }
             } else {
@@ -2838,7 +2899,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
                 VkDeviceSize base = 0;
                 if (!texel || !vk.copy_scratch || !vk.copy_scratch(total, p.staged, base))
-                    return ReplayResult::unsupported;
+                    return refuse("a depth <-> colour copy needs transfer scratch, which is unavailable");
                 for (std::size_t r = 0; r < p.image_copies.size(); ++r) {
                     const VkImageCopy& c = p.image_copies[r];
                     VkBufferImageCopy region{};
@@ -2862,20 +2923,27 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
             }
         } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
-            if (!vk.resolve_image) return ReplayResult::unsupported;
+            if (!vk.resolve_image) return refuse("the device lacks vkCmdResolveImage");
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
             if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
-                return result;
+                return result == ReplayResult::unsupported
+                           ? refuse("the source and destination differ in format or plane, or the mode is not one "
+                                    "Vulkan resolves for that plane")
+                           : result;
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
-                if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) return ReplayResult::unsupported;
+                if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view)
+                    return refuse("a depth or stencil resolve needs dynamic rendering, which the device lacks");
                 p.view = vk.image_view(p.source, p.source_range);
                 p.resolve_view = vk.image_view(p.binding, p.range);
-                if (!p.view || !p.resolve_view) return ReplayResult::unsupported;
+                if (!p.view || !p.resolve_view) return refuse("its attachment views could not be created");
                 if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
-                    return result;
+                    return result == ReplayResult::unsupported
+                               ? refuse("keeping the texels around its rectangle needs transfer scratch, which is "
+                                        "unavailable")
+                               : result;
                 // D3D-417, a driver workaround: AMD's Windows driver (32.0.21042.62, Radeon RDNA2 iGPU) resolves a
                 // dynamic-rendering depth attachment from layer 0 of the image when the multisampled view starts at
                 // another layer (the resolve view's first layer it honours). The same two views in a framebuffer
@@ -2891,7 +2959,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         p.binding, p.resolve_view,
                         image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL), p.resolve_mode,
                         {std::min(from.width, to.width), std::min(from.height, to.height)}, p.resolve_pass);
-                    if (!p.resolve_framebuffer) return ReplayResult::unsupported;
+                    if (!p.resolve_framebuffer)
+                        return refuse("its render-pass resolve framebuffer (a depth source above layer 0) could not "
+                                      "be made");
                 }
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
@@ -2913,7 +2983,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
             }
         } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
-            if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
+            if (!vk.update_buffer || !vk.buffer_at) return refuse("the device lacks vkCmdUpdateBuffer or buffer addresses");
             std::uint64_t bytes = 4;
             if (!vk.buffer_at(write->address, bytes, p.write_buffer, p.write_offset) || bytes < 4)
                 return ReplayResult::unresolved_resource;
@@ -2922,7 +2992,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             out.wrote_readback = true;
             out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
-            if (!vk.copy_buffer) return ReplayResult::unsupported;
+            if (!vk.copy_buffer) return refuse("the device lacks vkCmdCopyBuffer");
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(atomic->src);
             if (!bind(atomic->dst) || !source) return ReplayResult::unresolved_resource;
@@ -2947,7 +3017,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* predication = std::get_if<Predication>(&command)) {
             predicated = predication->buffer != 0;
-            if (!predicated) continue;
+            if (!predicated) return ReplayResult::success;
             if (!conditional) return ReplayResult::unsupported;
             // Without physical segments the capture dispatch would pollute CSInvocations.
             if (statistics_active && !statistics_helpers) return ReplayResult::unsupported;
@@ -3025,31 +3095,33 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
                                                      p.source.buffer, p.source.buffer_offset + ind->count_offset,
                                                      ind->stride, ind->max_count, p.counted_dispatch))
-                        return ReplayResult::unsupported;
+                        return refuse("an indirect dispatch with a count buffer needs the counted-dispatch helper");
                 } else if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
                            (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count)) {
-                    return ReplayResult::unsupported;
+                    return refuse("the device lacks the indirect count command");
                 }
             } else {
                 if ((ind->kind == IndirectKind::draw && !vk.draw_indirect) ||
                     (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect) ||
                     (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect))
-                    return ReplayResult::unsupported;
+                    return refuse("the device lacks the indirect draw or dispatch command");
             }
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
-                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
+                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline)
+                    return refuse("the device lacks pipeline binding or push constants");
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
                 if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
-                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+                if (pipeline->bindless_set && !vk.bind_descriptor_sets)
+                    return refuse("the pipeline's bindless set needs vkCmdBindDescriptorSets");
                 p.pipeline = *pipeline;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
             if (vk.xdxr_check) {
-                if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
+                if (!vk.xdxr_check(*build)) return refuse("XDXR cannot build these inputs");
             } else {
                 if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
-                    return ReplayResult::unsupported;
+                    return refuse("the device lacks acceleration structure builds");
                 p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
                 if (!p.accel_dst) return ReplayResult::unresolved_resource;
                 if (build->update && build->src_va) {
@@ -3064,7 +3136,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
             // the destination's room bounds the copy, as the size is only known to the GPU.
-            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1) return ReplayResult::unsupported;
+            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1)
+                return refuse("only XDXR clone and compact copies are implemented");
             std::uint64_t room = ~std::uint64_t(0);
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
@@ -3077,7 +3150,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.xdxr_postbuild) {
                 p.skip = true;
             } else {
-                if (!vk.buffer_at || (info->type != 0 && info->type != 3)) return ReplayResult::unsupported;
+                if (!vk.buffer_at || (info->type != 0 && info->type != 3))
+                    return refuse("only compacted-size and current-size postbuild info is written");
                 std::uint64_t room = 8 * info->sources.size();
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
@@ -3086,10 +3160,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
-                return ReplayResult::unsupported;
+                return refuse("the device lacks pipeline binding, push constants or dispatch");
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
             if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
-            if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+            if (pipeline->bindless_set && !vk.bind_descriptor_sets)
+                return refuse("the pipeline's bindless set needs vkCmdBindDescriptorSets");
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
@@ -3097,8 +3172,28 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             prepared_draw.reset();
             p.draw = std::uint32_t(out.draw_count++);
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
-                return r;
+                return r == ReplayResult::unsupported
+                           ? refuse("a function, attachment view, pipeline variant or index format it needs is "
+                                    "unavailable")
+                           : r;
         }
+        return ReplayResult::success;
+    };
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+        const Command& command = commands[i];
+        auto& p = out.commands[i];
+        why = nullptr;
+        const std::size_t unpredicated_copies = out.unpredicated_copies;
+        const std::size_t draw_count = out.draw_count;
+        const ReplayResult result = prepare_command(i, command, p);
+        if (result == ReplayResult::success) continue;
+        if (result != ReplayResult::unsupported || !vk.skip_unsupported || !skippable(command)) return result;
+        // Left out whole: nothing it prepared is emitted, planned into a query segment or counted.
+        p = {};
+        p.skip = true;
+        out.unpredicated_copies = unpredicated_copies;
+        out.draw_count = draw_count;  // its draw slot is free again
+        out.skipped.push_back({0, i, command_name(command), why ? why : "the replay does not implement it"});
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
     out.statistics_overlaps = statistics_overlaps;
@@ -3378,6 +3473,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (p.skip) continue;  // nothing to write (every rectangle clipped away), or left out (PreparedList::skipped)
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;
@@ -3524,7 +3620,6 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.pipeline_barrier2(command_buffer, &dependency);
             if (tracker) tracker->set(id, range, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
-            if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
@@ -3557,7 +3652,6 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.end_rendering(command_buffer);
             });
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
-            if (p.skip) continue;
             // With separate layouts only the cleared planes move; otherwise both do.
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
@@ -3596,7 +3690,6 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.end_rendering(command_buffer);
             });
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
-            if (p.skip) continue;
             // The UAV state, widened to transfers: a later barrier from SYNC_CLEAR_UNORDERED_ACCESS_VIEW names the
             // clear stage, which is a transfer stage in the legacy masks.
             VulkanAccess state = vulkan_access(d3d12_state::unordered_access, false);
@@ -3967,8 +4060,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.xdxr_record(command_buffer, *xdxr_build);
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
-        } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
-                   postbuild && !p.skip) {
+        } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command)) {
             for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
                 vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {

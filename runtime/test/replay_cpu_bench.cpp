@@ -495,6 +495,7 @@ const char* result_name(ReplayResult r) {
         case ReplayResult::invalid_indirect_arguments: return "invalid_indirect_arguments";
         case ReplayResult::invalid_draw: return "invalid_draw";
         case ReplayResult::unsupported: return "unsupported";
+        case ReplayResult::skipped_unsupported: return "skipped_unsupported";
     }
     return "?";
 }

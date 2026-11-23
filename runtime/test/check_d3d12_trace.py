@@ -34,7 +34,8 @@ def main():
     for number, line in enumerate(trace, 1):
         if "synthetic-marker-argument" in line:
             raise SystemExit("D3D12 trace leaked the synthetic marker payload")
-        match = re.fullmatch(r"\[d3d12-trace\] #(\d+) ([A-Za-z_][\w:]* (?:called|ok|failed|unsupported|ignored))", line)
+        match = re.fullmatch(
+            r"\[d3d12-trace\] #(\d+) ([A-Za-z_][\w:]* (?:called|ok|failed|unsupported|ignored|partial))", line)
         if not match or int(match[1]) != number:
             raise SystemExit(f"Invalid trace sequence at entry {number}\n{line}")
         entries.append(match[2])

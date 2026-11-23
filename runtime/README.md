@@ -390,6 +390,8 @@ $env:LEONIDA_D3D12 = 'vulkan'
 
 Each trace line contains a sequence number, a fixed API name and an outcome. `called` marks a void API call
 whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
+`partial` marks an `ExecuteCommandLists` that left out commands the layer cannot replay yet and submitted the rest;
+the `[rt] d3d12: ExecuteCommandLists: left out an unsupported ...` line names each kind once, with the reason.
 Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
 
 ### Startup trace: `--trace FILE`

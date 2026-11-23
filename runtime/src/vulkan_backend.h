@@ -1962,24 +1962,28 @@ public:
     }
 
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
-    // the layout tracker as it was. Pending Wait()s are attached to this submission. When one of them (or an
+    // the layout tracker as it was. Pending Wait()s are attached to this submission. A command the replay does not
+    // support is left out instead (ReplayFunctions::skip_unsupported): the rest of its list runs in order, the result
+    // is skipped_unsupported and `skipped`, if given, lists what was left out. When one of the waits (or an
     // earlier held operation) waits for a fence value no Signal has been submitted for, the lists are copied and
     // held instead, and the call succeeds: the batch is replayed by the thread that submits the Signal (or the CPU
-    // Signal), which is also where its errors are reported (stderr, and take_held_failure()).
+    // Signal), which is also where its errors and left-out commands are reported (stderr, and take_held_failure()).
     //
     // `pin`, called only when the batch is held, returns what has to stay alive until the batch has run: the COM layer
     // passes the pipeline states and root signatures the lists named (the application may release them and Reset
     // the lists as soon as the call returns).
     using PinFn = std::function<std::shared_ptr<void>()>;
 
-    ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
+    ReplayResult execute(std::span<const CommandList* const> lists, std::vector<SkippedCommand>* skipped = nullptr,
+                         const PinFn& pin = {}) {
+        if (skipped) skipped->clear();
         ReplayResult result = ReplayResult::success;
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
             std::lock_guard state(state_mutex_);
             if (!must_hold()) {
-                result = execute_now(lists);
+                result = execute_now(lists, skipped);
             } else if (context_.is_device_lost()) {
                 result = ReplayResult::unsupported;
             } else {
@@ -2186,7 +2190,7 @@ private:
         return ReplayResult::success;
     }
 
-    ReplayResult execute_now(std::span<const CommandList* const> lists) {
+    ReplayResult execute_now(std::span<const CommandList* const> lists, std::vector<SkippedCommand>* skipped) {
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
@@ -2235,6 +2239,7 @@ private:
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
+        replay.skip_unsupported = true;
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;
@@ -2603,7 +2608,15 @@ private:
         // the queue (it keeps a single upload obligation).
         if (bindless_commit) bindless_commit(submitted);
         tracker_lock.unlock();
-        return submitted ? ReplayResult::success : ReplayResult::unsupported;
+        if (!submitted) return ReplayResult::unsupported;
+        bool left_out = false;
+        for (std::size_t i = 0; i < prepared.size(); ++i)
+            for (SkippedCommand command : prepared[i].skipped) {
+                left_out = true;
+                command.list = i;
+                if (skipped) skipped->push_back(command);
+            }
+        return left_out ? ReplayResult::skipped_unsupported : ReplayResult::success;
     }
 
     void marker_now(DebugMarker::Kind kind, const char* label) {
@@ -2715,8 +2728,13 @@ private:
             for (const CommandList& list : op.lists) lists.push_back(&list);
             // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
             // the batch has been recorded and then, with the fences, until its submission has completed (below).
-            const ReplayResult result = execute_now(lists);
-            if (result != ReplayResult::success) {
+            std::vector<SkippedCommand> skipped;
+            const ReplayResult result = execute_now(lists, &skipped);
+            if (result == ReplayResult::skipped_unsupported) {
+                for (const SkippedCommand& command : skipped)
+                    std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists left out an unsupported %s (%s) when "
+                                         "it was released; the rest was submitted\n", command.kind, command.why);
+            } else if (result != ReplayResult::success) {
                 int none = static_cast<int>(ReplayResult::success);
                 held_failure_.compare_exchange_strong(none, static_cast<int>(result));
                 std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released (result %d); "

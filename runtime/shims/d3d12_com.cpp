@@ -92,6 +92,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
     case leonida::ReplayResult::invalid_draw: return "draw kind does not match the pipeline (mesh or vertex)";
     case leonida::ReplayResult::unsupported: return "unsupported";
+    case leonida::ReplayResult::skipped_unsupported: return "submitted without its unsupported commands";
     }
     return "?";
 }
@@ -1678,7 +1679,17 @@ public:
             recorded.push_back(&list->commands());
             graphics.push_back(list);
         }
-        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
+        last_result_ = queue_.execute(recorded, &skipped_, [&graphics] { return pin_lists(graphics); });
+        if (last_result_ == leonida::ReplayResult::skipped_unsupported) {
+            // The PC runtime runs a valid list whole; the commands the layer cannot replay yet are left out (each kind
+            // and reason logged once) and the rest runs in order before the next Signal.
+            d3d12_trace::record(method, "partial");
+            for (const auto& command : skipped_)
+                note_once((std::string("ExecuteCommandLists: left out an unsupported ") + command.kind + " (" +
+                           command.why + "); the rest was submitted")
+                              .c_str());
+            return;
+        }
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
@@ -1949,6 +1960,7 @@ private:
     std::shared_ptr<void> queue_lease_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
+    std::vector<leonida::SkippedCommand> skipped_;  // what the last ExecuteCommandLists left out
     VkQueue vk_queue_;
     std::uint32_t family_;
     QueueClock clock_;

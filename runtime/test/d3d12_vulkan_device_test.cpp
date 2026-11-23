@@ -16,10 +16,12 @@
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
 #include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
+#include "../src/gfx10_descriptors.h"  // D3D-408: a volume UAV's T#, written as the game would
 
 #include <dxgi1_4.h>
 
 #include <dxgi1_4.h>
+#include <io.h>  // _dup/_dup2: the layer's stderr log, captured by check_partial_submission
 
 #include <algorithm>
 #include <array>
@@ -27,6 +29,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -2059,6 +2063,198 @@ bool clear_and_read_texel(ID3D12Device* device, DXGI_FORMAT format, const float 
     std::memcpy(texel.data(), mapped, texel.size());
     readback->Unmap(0, nullptr);
     return true;
+}
+
+// D3D-408: a valid list with one command the layer cannot replay yet. The list clears render target A red, clears a
+// rectangle of a 4x4x2 R32_UINT volume to 7 through a UAV (valid D3D12; the layer refuses rectangle clears of
+// volumes as unsupported: docs/d3d12_vulkan.md, "UAV clears"), clears render target B blue and copies all three into
+// a readback buffer; the fence signalled after it is waited for. `bytes` gets the readback buffer: A at 0, B at
+// partial_slot, the volume's two slices at 2 * partial_slot. Returns what failed, or nullptr.
+constexpr UINT partial_slot = 1024;
+
+const char* run_partial_submission(ID3D12Device* device, bool layer, std::vector<std::uint8_t>& bytes,
+                                   leonida::ReplayResult* result) {
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const D3D12_RESOURCE_DESC target =
+        texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    D3D12_RESOURCE_DESC volume_texture =
+        texture_desc(4, 4, DXGI_FORMAT_R32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, 1, 2);
+    volume_texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const D3D12_RESOURCE_DESC buffer = buffer_desc(4 * partial_slot);
+    const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2};
+    const D3D12_DESCRIPTOR_HEAP_DESC cpu_heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1};
+    const D3D12_DESCRIPTOR_HEAP_DESC gpu_heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Ref<ID3D12Resource> a, b, volume, readback;
+    Ref<ID3D12DescriptorHeap> rtvs, cpu_uavs, gpu_uavs;
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    if (FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &target,
+                                               D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&a.p))) ||
+        FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &target,
+                                               D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&b.p))) ||
+        FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &volume_texture,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                               IID_PPV_ARGS(&volume.p))) ||
+        FAILED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p))) ||
+        FAILED(device->CreateDescriptorHeap(&rtv_heap, IID_PPV_ARGS(&rtvs.p))) ||
+        FAILED(device->CreateDescriptorHeap(&cpu_heap, IID_PPV_ARGS(&cpu_uavs.p))) ||
+        FAILED(device->CreateDescriptorHeap(&gpu_heap, IID_PPV_ARGS(&gpu_uavs.p))) ||
+        FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                         IID_PPV_ARGS(&list.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
+        return "creating the resources, heaps, queue, list or fence failed";
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv_a = rtvs->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv_b{rtv_a.ptr +
+                                            device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+    device->CreateRenderTargetView(a.p, nullptr, rtv_a);
+    device->CreateRenderTargetView(b.p, nullptr, rtv_b);
+    const D3D12_CPU_DESCRIPTOR_HANDLE uav_cpu = cpu_uavs->GetCPUDescriptorHandleForHeapStart();
+    if (layer) {
+        // The layer reads the CPU slot as the GFX10 T# a shader would load (docs/d3d12_vulkan.md, "UAV clears"),
+        // the descriptor the game writes itself; its CreateUnorderedAccessView takes no TEXTURE3D description yet.
+        leonida::gfx10::Image image{};
+        image.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+        image.type = leonida::gfx10::ImageType::image_3d;
+        image.width = image.height = 4;
+        image.depth = 2;
+        const auto words = leonida::gfx10::encode(image);
+        std::memcpy(reinterpret_cast<void*>(uav_cpu.ptr), words.data(), sizeof(words));
+    } else {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = DXGI_FORMAT_R32_UINT;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        uav.Texture3D.WSize = UINT(-1);
+        device->CreateUnorderedAccessView(volume.p, nullptr, &uav, uav_cpu);
+        device->CreateUnorderedAccessView(volume.p, nullptr, &uav, gpu_uavs->GetCPUDescriptorHandleForHeapStart());
+    }
+
+    constexpr float red[4] = {1, 0, 0, 1}, blue[4] = {0, 0, 1, 1};
+    constexpr UINT values[4] = {7, 7, 7, 7};
+    const D3D12_RECT rect{0, 0, 2, 2};
+    list->ClearRenderTargetView(rtv_a, red, 0, nullptr);
+    ID3D12DescriptorHeap* heaps[] = {gpu_uavs.p};
+    list->SetDescriptorHeaps(1, heaps);
+    list->ClearUnorderedAccessViewUint(gpu_uavs->GetGPUDescriptorHandleForHeapStart(), uav_cpu, volume.p, values, 1,
+                                       &rect);
+    list->ClearRenderTargetView(rtv_b, blue, 0, nullptr);
+    const D3D12_RESOURCE_BARRIER to_copy[] = {
+        transition(a.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        transition(b.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        transition(volume.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+    };
+    list->ResourceBarrier(UINT(std::size(to_copy)), to_copy);
+    const struct {
+        ID3D12Resource* resource;
+        DXGI_FORMAT format;
+        UINT depth;
+    } copies[] = {
+        {a.p, DXGI_FORMAT_R8G8B8A8_UNORM, 1},
+        {b.p, DXGI_FORMAT_R8G8B8A8_UNORM, 1},
+        {volume.p, DXGI_FORMAT_R32_UINT, 2},
+    };
+    for (UINT slot = 0; slot < UINT(std::size(copies)); ++slot) {
+        const auto& copy = copies[slot];
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{slot * partial_slot, {copy.format, 4, 4, copy.depth, 256}};
+        const auto src = subresource(copy.resource, 0);
+        const auto dst = footprint(readback.p, placed);
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    if (list->Close() != S_OK) return "Close failed";
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    if (result) *result = rt::d3d12::last_execute_result(queue.p);
+    if (FAILED(queue->Signal(fence.p, 1)) || FAILED(fence->SetEventOnCompletion(1, nullptr)) ||
+        fence->GetCompletedValue() < 1)
+        return "the fence after the list did not complete";
+    void* mapped = nullptr;
+    if (FAILED(readback->Map(0, nullptr, &mapped)) || !mapped) return "Map of the readback buffer failed";
+    const auto* begin = static_cast<const std::uint8_t*>(mapped);
+    bytes.assign(begin, begin + 4 * partial_slot);
+    readback->Unmap(0, nullptr);
+    return nullptr;
+}
+
+// On the layer's PC-ABI device the unsupported clear is left out (skipped_unsupported, one log line naming it): the
+// clears before and after it land before the fence completes and the volume stays zero. WARP runs the list whole.
+int check_partial_submission(ID3D12Device* device) {
+    const auto texel = [](const std::vector<std::uint8_t>& bytes, UINT slot, UINT x, UINT y) {
+        return bytes.data() + slot * partial_slot + y * 256 + x * 4;
+    };
+    const auto word = [&](const std::vector<std::uint8_t>& bytes, UINT x, UINT y, UINT z) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, texel(bytes, 2, x, y) + z * 4 * 256, 4);
+        return value;
+    };
+    // The layer reports the skip on stderr: send it to a file for the call, then echo it.
+    const std::filesystem::path log_path = std::filesystem::temp_directory_path() / "leonida_d3d408_stderr.txt";
+    std::vector<std::uint8_t> ours;
+    leonida::ReplayResult result = leonida::ReplayResult::success;
+    std::fflush(stderr);
+    const int saved = _dup(2);
+    if (std::FILE* out = std::fopen(log_path.string().c_str(), "wb")) {
+        if (saved >= 0) _dup2(_fileno(out), 2);
+        std::fclose(out);
+    }
+    const char* failed = run_partial_submission(device, true, ours, &result);
+    std::fflush(stderr);
+    if (saved >= 0) {
+        _dup2(saved, 2);
+        _close(saved);
+    }
+    std::string log;
+    {
+        std::ifstream in(log_path, std::ios::binary);
+        log.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    std::error_code ignored;
+    std::filesystem::remove(log_path, ignored);
+    std::fputs(log.c_str(), stderr);
+    if (failed) std::fprintf(stderr, "partial submission on the layer: %s\n", failed);
+    EXPECT(!failed);
+    EXPECT(result == leonida::ReplayResult::skipped_unsupported);
+    EXPECT(log.find("ExecuteCommandLists: left out an unsupported ClearUnorderedAccessView (rectangles of a volume, "
+                    "or of a format that cannot be an attachment); the rest was submitted") != std::string::npos);
+    EXPECT(log.find("nothing was submitted") == std::string::npos);
+    constexpr std::uint8_t red[4] = {0xff, 0, 0, 0xff}, blue[4] = {0, 0, 0xff, 0xff};
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) {
+            EXPECT(std::memcmp(texel(ours, 0, x, y), red, 4) == 0);        // before the skipped command
+            EXPECT(std::memcmp(texel(ours, 1, x, y), blue, 4) == 0);       // after it
+            EXPECT(word(ours, x, y, 0) == 0 && word(ours, x, y, 1) == 0);  // left out: still zero-filled
+        }
+
+    // WARP, whatever the host adapter is: LEONIDA_HOST_ADAPTER is saved and restored, as for the placed casts.
+    char previous[128] = {};
+    const BOOL had = GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", previous, sizeof(previous));
+    SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", "warp");
+    copycmp::Ptr<ID3D12Device> warp;
+    std::string warp_name;
+    const bool have_warp = copycmp::try_create_host(warp, warp_name);
+    SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", had && previous[0] ? previous : nullptr);
+    if (have_warp) {
+        std::vector<std::uint8_t> theirs;
+        failed = run_partial_submission(warp.p, false, theirs, nullptr);
+        if (failed) std::fprintf(stderr, "partial submission on %s: %s\n", warp_name.c_str(), failed);
+        EXPECT(!failed);
+        for (UINT y = 0; y < 4; ++y)
+            for (UINT x = 0; x < 4; ++x) {
+                EXPECT(std::memcmp(texel(theirs, 0, x, y), texel(ours, 0, x, y), 4) == 0);
+                EXPECT(std::memcmp(texel(theirs, 1, x, y), texel(ours, 1, x, y), 4) == 0);
+                EXPECT(word(theirs, x, y, 0) == (x < 2 && y < 2 ? 7u : 0u));  // the host runs the UAV clear
+            }
+    }
+    std::printf("partial submission (D3D-408): the unsupported ClearUnorderedAccessView was left out and logged once, "
+                "the clears before and after it landed before the fence (skipped_unsupported)%s\n",
+                have_warp ? "; WARP ran the same list whole (rectangle = 7) and matched both render-target clears"
+                          : "; no WARP to compare");
+    return 0;
 }
 
 // Item 1 of the FORMAT_SUPPORT finding in #1380: formats the host creates that vulkan_format() didn't map. Each one
@@ -5393,6 +5589,7 @@ int main() {
             // The PC-ABI layer device: the proxy returns heap starts by value.
             EXPECT(new_format_round_trips(inner, info, r4g4b4a4) == 0);
         }
+        EXPECT(check_partial_submission(inner) == 0);  // D3D-408, on the PC-ABI device as well
 
         // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
         EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);

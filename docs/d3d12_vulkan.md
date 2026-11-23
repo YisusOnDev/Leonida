@@ -352,7 +352,7 @@ What is implemented (all of it testable without the game):
     and NaN payloads. A whole view is `vkCmdClearColorImage`; rectangles are `vkCmdClearAttachments` in a
     dynamic-rendering scope, so a texture created with `ALLOW_UNORDERED_ACCESS` also gets `COLOR_ATTACHMENT` usage
     when its format supports it. Both run in place in `GENERAL`, the UAV layout. Rectangle clears of volumes, or of
-    formats without attachment support, are refused as `unsupported`.
+    formats without attachment support, are refused as `unsupported` (left out of the submission).
   - The clear is fenced as the UAV state widened to transfers, so a following UAV barrier, transition, or enhanced
     barrier from `SYNC_CLEAR_UNORDERED_ACCESS_VIEW` sees it.
   - Under `SetPredication`, a whole-view texture clear runs as one rectangle through the attachment path, as
@@ -369,6 +369,21 @@ What is implemented (all of it testable without the game):
   `VulkanQueue` (`ExecuteCommandLists` prepares every list before writing any, so a bad list submits nothing and
   leaves the tracker as it was; `Signal`; `Wait`, which is attached to the next submission because a Vulkan wait
   only holds back its own batch) and `VulkanFence` (a timeline semaphore).
+  - A command the layer does not support yet is not a bad list (D3D-408, found by @kotorvr in #3574). The PC runtime
+    runs a valid list whole, so when `prepare()` refuses one command as `unsupported`, `ExecuteCommandLists` leaves
+    that command out (`ReplayFunctions::skip_unsupported`, `PreparedList::skipped`) and records and submits the
+    rest of the lists in order, so their work completes before the next `Signal` like any other. The left-out
+    command writes nothing, changes no tracked layout and splits no query; every command opens and closes its own
+    rendering scope, so nothing is left half begun. `last_execute_result` is `skipped_unsupported`, the first-boot
+    trace records the call as `partial`, and stderr gets one line per kind and reason:
+    `[rt] d3d12: ExecuteCommandLists: left out an unsupported ClearUnorderedAccessView (rectangles of a volume, or of
+    a format that cannot be an attachment); the rest was submitted`. Barriers, `SetPredication` and queries are never
+    left out: later commands depend on them (layouts, conditional rendering, query pairs), so a list where one of
+    them is unsupported is still refused whole, as are invalid lists (`invalid_*`, `unresolved_resource`,
+    `list_open`), with `ExecuteCommandLists failed: ...; nothing was submitted`. The single-list `replay()` helper
+    keeps refusing the whole list. `d3d12_vulkan_device_test` runs a list that clears render target A, clears a
+    rectangle of a volume UAV and clears render target B: A and B hold their colours after the fence, the volume
+    stays zero, the log names the clear, and WARP runs the same list whole (the volume's rectangle cleared).
 - **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList8` (the GCL7 chain plus
   `OMSetFrontAndBackStencilRef`), `ID3D12CommandQueue`, `ID3D12CommandAllocator` and `ID3D12Fence1` (with
   `SetEventOnCompletion` events). Every method they do not implement is a stub generated at build time from the
