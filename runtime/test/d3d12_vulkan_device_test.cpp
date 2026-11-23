@@ -5567,6 +5567,44 @@ int main() {
                 std::printf("B8G8R8X8: no host D3D12 device to compare with, skipped\n");
             }
         }
+        // D3D-466: typed sRGB and depth formats have no UAV view, yet the host creates their textures with
+        // ALLOW_UNORDERED_ACCESS (1D, 2D and 3D where the format allows the dimension).
+        {
+            Ref<ID3D12Device> host;
+            if (create_host_device(host)) {
+                const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+                int uav_mismatches = 0;
+                for (DXGI_FORMAT f : {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                                      DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT,
+                                      DXGI_FORMAT_D32_FLOAT_S8X24_UINT}) {
+                    for (auto dim : {D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                                     D3D12_RESOURCE_DIMENSION_TEXTURE3D})
+                    for (auto flags : {D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+                        D3D12_RESOURCE_DESC desc = texture_desc(64, 1, f, flags, 1);
+                        desc.Dimension = dim;
+                        if (dim != D3D12_RESOURCE_DIMENSION_TEXTURE1D) desc.Height = 64;
+                        Ref<ID3D12Resource> ours_resource, host_resource;
+                        const HRESULT ours_hr = device->CreateCommittedResource(
+                            &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                            IID_PPV_ARGS(&ours_resource.p));
+                        const HRESULT host_hr = host->CreateCommittedResource(
+                            &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                            IID_PPV_ARGS(&host_resource.p));
+                        const bool ours_sized = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX;
+                        const bool host_sized = host->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX;
+                        if (SUCCEEDED(ours_hr) != SUCCEEDED(host_hr) || ours_sized != host_sized)
+                            std::fprintf(stderr, "format %d dimension %d flags %d: ours %08lx (sized %d), host %08lx (sized %d)\n",
+                                         int(f), int(dim), int(flags), static_cast<unsigned long>(ours_hr), int(ours_sized),
+                                         static_cast<unsigned long>(host_hr), int(host_sized));
+                        uav_mismatches += SUCCEEDED(ours_hr) != SUCCEEDED(host_hr) || ours_sized != host_sized;
+                    }
+                }
+                EXPECT(uav_mismatches == 0);
+                std::printf("sRGB/depth with unordered access: resource creation and allocation match the host runtime\n");
+            } else {
+                std::printf("sRGB/depth with unordered access: no host D3D12 device to compare with, skipped\n");
+            }
+        }
 
         const int options_mismatches = compare_feature_options(device.p, info);
         EXPECT(options_mismatches == 0);

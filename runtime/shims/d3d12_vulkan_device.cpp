@@ -451,6 +451,19 @@ bool rgba8_any_order(DXGI_FORMAT format) {
     }
 }
 
+bool typed_depth(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D16_UNORM ||
+           format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+}
+
+// D3D-466: typed sRGB and depth-only formats have no UAV view in D3D12, and without a castable-format list no view
+// leaves the resource's format, so a UAV-flagged texture in them never needs storage usage (which these Vulkan formats
+// lack). The PC runtime creates such textures; it refuses unordered access on the depth-stencil formats.
+bool typed_without_uav(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+           format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D16_UNORM;
+}
+
 // The full mip chain's length for a texture this size.
 UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
@@ -515,12 +528,14 @@ UINT view_slices(const D3D12_RESOURCE_DESC& resource, UINT first_layer, UINT lay
 // Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
 // attachment_usable: the GPU can render to `format`. A UAV texture then also gets COLOR_ATTACHMENT usage, because
 // ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
+// castable_list: the texture has a castable-format list, which may name a format a UAV view can use.
 struct TextureCreateInfo {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
     std::array<VkFormat, 2> view_formats{};
 
-    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
+    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable,
+                      bool castable_list = false) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -537,7 +552,8 @@ struct TextureCreateInfo {
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
-        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format)) {
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format) &&
+            (castable_list || !typed_without_uav(desc.Format))) {
             info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
             if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -998,6 +1014,12 @@ struct DeviceState {
                 return alpha;
             }
         }
+        // The PC runtime has no volume texture in a depth format, whatever the flags, and no unordered access on the
+        // depth-stencil ones (D3D-466).
+        if (typed_depth(desc.Format) && (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
+                                         ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                                          !typed_without_uav(desc.Format))))
+            return {};
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
@@ -2070,7 +2092,7 @@ public:
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
-        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
+        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format), !castable.empty());
         VkImageCreateInfo& info = create.info;
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
