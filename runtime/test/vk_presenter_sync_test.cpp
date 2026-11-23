@@ -527,6 +527,408 @@ int main() {
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
 
     EXPECT(d.validation_errors() == 0);
+
+    // 4. PresentComposer (runtime/src/vulkan_present_compose.h) MockVk regressions:
+    //    missing function pointers, null device, partial-init cleanup on ready()/ensure_target() errors,
+    //    failed driver output handles, zero extents, memoryTypeCount clamp, record() guards, and dispatches.
+    {
+        struct ComposeMock {
+            std::uint64_t next_handle = 1;
+            unsigned create_set_layout_calls = 0;
+            unsigned created_set_layouts = 0;
+            unsigned destroyed_set_layouts = 0;
+            unsigned created_pools = 0;
+            unsigned destroyed_pools = 0;
+            unsigned created_pipeline_layouts = 0;
+            unsigned destroyed_pipeline_layouts = 0;
+            unsigned created_modules = 0;
+            unsigned destroyed_modules = 0;
+            unsigned create_pipeline_calls = 0;
+            unsigned created_pipelines = 0;
+            unsigned destroyed_pipelines = 0;
+            unsigned created_images = 0;
+            unsigned destroyed_images = 0;
+            unsigned allocated_memories = 0;
+            unsigned destroyed_memories = 0;
+            unsigned created_views = 0;
+            unsigned destroyed_views = 0;
+            unsigned update_sets_calls = 0;
+            unsigned barrier_calls = 0;
+            unsigned dispatch_calls = 0;
+            std::uint32_t last_dispatch[3]{};
+
+            bool fail_create_set_layout = false;
+            bool fail_create_pool = false;
+            bool fail_alloc_sets = false;
+            bool fail_create_pipe_layout = false;
+            bool fail_create_module = false;
+            bool fail_create_pipeline = false;
+            bool null_pipeline_on_success = false;
+            bool fail_create_image = false;
+            bool fail_alloc_mem = false;
+            bool fail_bind_mem = false;
+            bool fail_create_view = false;
+            std::uint32_t mem_type_bits = 1u;
+
+            VkPipeline garbage_pipeline = reinterpret_cast<VkPipeline>(std::uintptr_t(0xdead));
+            VkDeviceMemory garbage_memory = reinterpret_cast<VkDeviceMemory>(std::uintptr_t(0xbeef));
+            VkImageView garbage_view = reinterpret_cast<VkImageView>(std::uintptr_t(0xcafe));
+            bool destroyed_garbage_pipeline = false;
+            bool destroyed_garbage_memory = false;
+            bool destroyed_garbage_view = false;
+
+            static ComposeMock*& state() {
+                static ComposeMock* s = nullptr;
+                return s;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_set_layout(VkDevice, const VkDescriptorSetLayoutCreateInfo*,
+                                                                    const VkAllocationCallbacks*,
+                                                                    VkDescriptorSetLayout* out) {
+                ++state()->create_set_layout_calls;
+                if (state()->fail_create_set_layout) return VK_ERROR_OUT_OF_HOST_MEMORY;
+                *out = reinterpret_cast<VkDescriptorSetLayout>(state()->next_handle++);
+                ++state()->created_set_layouts;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_set_layout(VkDevice, VkDescriptorSetLayout l,
+                                                                 const VkAllocationCallbacks*) {
+                if (l) ++state()->destroyed_set_layouts;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_pool(VkDevice, const VkDescriptorPoolCreateInfo*,
+                                                              const VkAllocationCallbacks*, VkDescriptorPool* out) {
+                if (state()->fail_create_pool) return VK_ERROR_OUT_OF_HOST_MEMORY;
+                *out = reinterpret_cast<VkDescriptorPool>(state()->next_handle++);
+                ++state()->created_pools;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_pool(VkDevice, VkDescriptorPool p,
+                                                           const VkAllocationCallbacks*) {
+                if (p) ++state()->destroyed_pools;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL alloc_sets(VkDevice, const VkDescriptorSetAllocateInfo* info,
+                                                             VkDescriptorSet* out) {
+                if (state()->fail_alloc_sets) return VK_ERROR_OUT_OF_POOL_MEMORY;
+                for (std::uint32_t i = 0; i < info->descriptorSetCount; ++i)
+                    out[i] = reinterpret_cast<VkDescriptorSet>(state()->next_handle++);
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL update_sets(VkDevice, std::uint32_t, const VkWriteDescriptorSet*,
+                                                          std::uint32_t, const VkCopyDescriptorSet*) {
+                ++state()->update_sets_calls;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_pipe_layout(VkDevice, const VkPipelineLayoutCreateInfo*,
+                                                                     const VkAllocationCallbacks*,
+                                                                     VkPipelineLayout* out) {
+                if (state()->fail_create_pipe_layout) return VK_ERROR_OUT_OF_HOST_MEMORY;
+                *out = reinterpret_cast<VkPipelineLayout>(state()->next_handle++);
+                ++state()->created_pipeline_layouts;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_pipe_layout(VkDevice, VkPipelineLayout l,
+                                                                  const VkAllocationCallbacks*) {
+                if (l) ++state()->destroyed_pipeline_layouts;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_module(VkDevice, const VkShaderModuleCreateInfo*,
+                                                                const VkAllocationCallbacks*, VkShaderModule* out) {
+                if (state()->fail_create_module) return VK_ERROR_OUT_OF_HOST_MEMORY;
+                *out = reinterpret_cast<VkShaderModule>(state()->next_handle++);
+                ++state()->created_modules;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_module(VkDevice, VkShaderModule m,
+                                                             const VkAllocationCallbacks*) {
+                if (m) ++state()->destroyed_modules;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_pipelines(VkDevice, VkPipelineCache, std::uint32_t count,
+                                                                   const VkComputePipelineCreateInfo*,
+                                                                   const VkAllocationCallbacks*, VkPipeline* out) {
+                ++state()->create_pipeline_calls;
+                if (state()->fail_create_pipeline) {
+                    if (count > 0 && out) out[0] = state()->garbage_pipeline;
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                if (state()->null_pipeline_on_success) {
+                    if (count > 0 && out) out[0] = VK_NULL_HANDLE;
+                    return VK_SUCCESS;
+                }
+                for (std::uint32_t i = 0; i < count; ++i)
+                    out[i] = reinterpret_cast<VkPipeline>(state()->next_handle++);
+                state()->created_pipelines += count;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_pipeline(VkDevice, VkPipeline p,
+                                                               const VkAllocationCallbacks*) {
+                if (p == state()->garbage_pipeline) state()->destroyed_garbage_pipeline = true;
+                if (p) ++state()->destroyed_pipelines;
+            }
+            static VKAPI_ATTR void VKAPI_CALL cmd_bind_pipe(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {}
+            static VKAPI_ATTR void VKAPI_CALL cmd_bind_sets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout,
+                                                            std::uint32_t, std::uint32_t, const VkDescriptorSet*,
+                                                            std::uint32_t, const std::uint32_t*) {}
+            static VKAPI_ATTR void VKAPI_CALL cmd_push(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags,
+                                                       std::uint32_t, std::uint32_t, const void*) {}
+            static VKAPI_ATTR void VKAPI_CALL cmd_dispatch(VkCommandBuffer, std::uint32_t x, std::uint32_t y,
+                                                           std::uint32_t z) {
+                ++state()->dispatch_calls;
+                state()->last_dispatch[0] = x;
+                state()->last_dispatch[1] = y;
+                state()->last_dispatch[2] = z;
+            }
+            static VKAPI_ATTR void VKAPI_CALL cmd_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags,
+                                                          VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*,
+                                                          std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t,
+                                                          const VkImageMemoryBarrier*) {
+                ++state()->barrier_calls;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice, const VkImageCreateInfo*,
+                                                               const VkAllocationCallbacks*, VkImage* out) {
+                if (state()->fail_create_image) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                *out = reinterpret_cast<VkImage>(state()->next_handle++);
+                ++state()->created_images;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_image(VkDevice, VkImage img, const VkAllocationCallbacks*) {
+                if (img) ++state()->destroyed_images;
+            }
+            static VKAPI_ATTR void VKAPI_CALL img_mem_req(VkDevice, VkImage, VkMemoryRequirements* req) {
+                *req = {};
+                req->size = 4096;
+                req->alignment = 256;
+                req->memoryTypeBits = state()->mem_type_bits;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL alloc_mem(VkDevice, const VkMemoryAllocateInfo*,
+                                                            const VkAllocationCallbacks*, VkDeviceMemory* out) {
+                if (state()->fail_alloc_mem) {
+                    if (out) *out = state()->garbage_memory;
+                    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                }
+                *out = reinterpret_cast<VkDeviceMemory>(state()->next_handle++);
+                ++state()->allocated_memories;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL free_mem(VkDevice, VkDeviceMemory mem, const VkAllocationCallbacks*) {
+                if (mem == state()->garbage_memory) state()->destroyed_garbage_memory = true;
+                if (mem) ++state()->destroyed_memories;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL bind_img_mem(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) {
+                return state()->fail_bind_mem ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_view(VkDevice, const VkImageViewCreateInfo*,
+                                                              const VkAllocationCallbacks*, VkImageView* out) {
+                if (state()->fail_create_view) {
+                    if (out) *out = state()->garbage_view;
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                *out = reinterpret_cast<VkImageView>(state()->next_handle++);
+                ++state()->created_views;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_view(VkDevice, VkImageView v, const VkAllocationCallbacks*) {
+                if (v == state()->garbage_view) state()->destroyed_garbage_view = true;
+                if (v) ++state()->destroyed_views;
+            }
+            static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL gdpa(VkDevice, const char* name) {
+                const std::string_view n = name;
+                if (n == "vkCreateDescriptorSetLayout") return reinterpret_cast<PFN_vkVoidFunction>(create_set_layout);
+                if (n == "vkDestroyDescriptorSetLayout") return reinterpret_cast<PFN_vkVoidFunction>(destroy_set_layout);
+                if (n == "vkCreateDescriptorPool") return reinterpret_cast<PFN_vkVoidFunction>(create_pool);
+                if (n == "vkDestroyDescriptorPool") return reinterpret_cast<PFN_vkVoidFunction>(destroy_pool);
+                if (n == "vkAllocateDescriptorSets") return reinterpret_cast<PFN_vkVoidFunction>(alloc_sets);
+                if (n == "vkUpdateDescriptorSets") return reinterpret_cast<PFN_vkVoidFunction>(update_sets);
+                if (n == "vkCreatePipelineLayout") return reinterpret_cast<PFN_vkVoidFunction>(create_pipe_layout);
+                if (n == "vkDestroyPipelineLayout") return reinterpret_cast<PFN_vkVoidFunction>(destroy_pipe_layout);
+                if (n == "vkCreateShaderModule") return reinterpret_cast<PFN_vkVoidFunction>(create_module);
+                if (n == "vkDestroyShaderModule") return reinterpret_cast<PFN_vkVoidFunction>(destroy_module);
+                if (n == "vkCreateComputePipelines") return reinterpret_cast<PFN_vkVoidFunction>(create_pipelines);
+                if (n == "vkDestroyPipeline") return reinterpret_cast<PFN_vkVoidFunction>(destroy_pipeline);
+                if (n == "vkCmdBindPipeline") return reinterpret_cast<PFN_vkVoidFunction>(cmd_bind_pipe);
+                if (n == "vkCmdBindDescriptorSets") return reinterpret_cast<PFN_vkVoidFunction>(cmd_bind_sets);
+                if (n == "vkCmdPushConstants") return reinterpret_cast<PFN_vkVoidFunction>(cmd_push);
+                if (n == "vkCmdDispatch") return reinterpret_cast<PFN_vkVoidFunction>(cmd_dispatch);
+                if (n == "vkCmdPipelineBarrier") return reinterpret_cast<PFN_vkVoidFunction>(cmd_barrier);
+                if (n == "vkCreateImage") return reinterpret_cast<PFN_vkVoidFunction>(create_image);
+                if (n == "vkDestroyImage") return reinterpret_cast<PFN_vkVoidFunction>(destroy_image);
+                if (n == "vkGetImageMemoryRequirements") return reinterpret_cast<PFN_vkVoidFunction>(img_mem_req);
+                if (n == "vkAllocateMemory") return reinterpret_cast<PFN_vkVoidFunction>(alloc_mem);
+                if (n == "vkFreeMemory") return reinterpret_cast<PFN_vkVoidFunction>(free_mem);
+                if (n == "vkBindImageMemory") return reinterpret_cast<PFN_vkVoidFunction>(bind_img_mem);
+                if (n == "vkCreateImageView") return reinterpret_cast<PFN_vkVoidFunction>(create_view);
+                if (n == "vkDestroyImageView") return reinterpret_cast<PFN_vkVoidFunction>(destroy_view);
+                return nullptr;
+            }
+        };
+
+        const VkDevice fake_dev = reinterpret_cast<VkDevice>(std::uintptr_t(1));
+        const VkCommandBuffer fake_cb = reinterpret_cast<VkCommandBuffer>(std::uintptr_t(0x400));
+        const VkImageView fake_plane = reinterpret_cast<VkImageView>(std::uintptr_t(0x500));
+        VkPhysicalDeviceMemoryProperties mem{};
+        mem.memoryTypeCount = 1;
+        mem.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+        // 4a: missing any of the 11 previously unchecked function pointers or null device must fail ready().
+        {
+            ComposeMock mock{};
+            ComposeMock::state() = &mock;
+            {
+                VulkanContext ctx(&ComposeMock::gdpa, fake_dev, false);
+                ctx.vk.vkGetImageMemoryRequirements = nullptr;
+                PresentComposer c(ctx, mem);
+                EXPECT(!c.ready());
+                EXPECT(mock.create_set_layout_calls == 0);
+            }
+            for (int which = 0; which < 11; ++which) {
+                VulkanContext ctx(&ComposeMock::gdpa, fake_dev, false);
+                switch (which) {
+                    case 0: ctx.vk.vkGetImageMemoryRequirements = nullptr; break;
+                    case 1: ctx.vk.vkBindImageMemory = nullptr; break;
+                    case 2: ctx.vk.vkCmdPipelineBarrier = nullptr; break;
+                    case 3: ctx.vk.vkDestroyImageView = nullptr; break;
+                    case 4: ctx.vk.vkDestroyImage = nullptr; break;
+                    case 5: ctx.vk.vkFreeMemory = nullptr; break;
+                    case 6: ctx.vk.vkDestroyPipeline = nullptr; break;
+                    case 7: ctx.vk.vkDestroyPipelineLayout = nullptr; break;
+                    case 8: ctx.vk.vkDestroyDescriptorPool = nullptr; break;
+                    case 9: ctx.vk.vkDestroyDescriptorSetLayout = nullptr; break;
+                    case 10: ctx.vk.vkDestroyShaderModule = nullptr; break;
+                }
+                PresentComposer c(ctx, mem);
+                EXPECT(!c.ready());
+                bool changed = true;
+                EXPECT(!c.ensure_target({64, 64}, changed) && !changed);
+                EXPECT(mock.create_set_layout_calls == 0 && mock.created_images == 0);
+            }
+            {
+                VulkanContext null_ctx(&ComposeMock::gdpa, VK_NULL_HANDLE, false);
+                PresentComposer c(null_ctx, mem);
+                EXPECT(!c.ready());
+                EXPECT(mock.create_set_layout_calls == 0);
+            }
+            ComposeMock::state() = nullptr;
+        }
+
+        // 4b: partial-init cleanup on ready() failure + failed vkCreateComputePipelines garbage handle guard.
+        {
+            ComposeMock mock{};
+            ComposeMock::state() = &mock;
+            VulkanContext ctx(&ComposeMock::gdpa, fake_dev, false);
+            for (int mode = 0; mode < 6; ++mode) {
+                mock.fail_create_pool = (mode == 0);
+                mock.fail_alloc_sets = (mode == 1);
+                mock.fail_create_pipe_layout = (mode == 2);
+                mock.fail_create_module = (mode == 3);
+                mock.fail_create_pipeline = (mode == 4);
+                mock.null_pipeline_on_success = (mode == 5);
+                {
+                    PresentComposer c(ctx, mem);
+                    EXPECT(!c.ready());
+                    EXPECT(!c.ready());  // stays State::failed without re-creating
+                    // Cleanup must happen immediately inside ready(), not wait for ~PresentComposer().
+                    EXPECT(mock.destroyed_set_layouts == mock.created_set_layouts);
+                    EXPECT(mock.destroyed_pools == mock.created_pools);
+                    EXPECT(mock.destroyed_pipeline_layouts == mock.created_pipeline_layouts);
+                    EXPECT(mock.destroyed_modules == mock.created_modules);
+                    EXPECT(mock.created_pipelines == 0 && !mock.destroyed_garbage_pipeline);
+                }
+                EXPECT(!mock.destroyed_garbage_pipeline);
+            }
+            ComposeMock::state() = nullptr;
+        }
+
+        // 4c & 4d: ensure_target() guards, memoryTypeCount clamp, failure cleanup, and record() dispatches.
+        {
+            ComposeMock mock{};
+            ComposeMock::state() = &mock;
+            {
+                VulkanContext ctx(&ComposeMock::gdpa, fake_dev, false);
+                PresentComposer c(ctx, mem);
+
+                // Untried composer cannot ensure_target or record.
+                bool changed = true;
+                EXPECT(!c.ensure_target({64, 64}, changed) && !changed && mock.created_images == 0);
+                c.record(fake_cb, 0, fake_plane, VK_IMAGE_LAYOUT_GENERAL, fake_plane, VK_IMAGE_LAYOUT_GENERAL,
+                         PresentComposePush{});
+                EXPECT(mock.update_sets_calls == 0 && mock.barrier_calls == 0 && mock.dispatch_calls == 0);
+
+                EXPECT(c.ready());
+                // Ready composer with no target yet cannot record.
+                c.record(fake_cb, 0, fake_plane, VK_IMAGE_LAYOUT_GENERAL, fake_plane, VK_IMAGE_LAYOUT_GENERAL,
+                         PresentComposePush{});
+                EXPECT(mock.update_sets_calls == 0 && mock.barrier_calls == 0 && mock.dispatch_calls == 0);
+
+                // Active 64x64 target; zero-dimension ensure_target() calls must fail cleanly and keep it.
+                EXPECT(c.ensure_target({64, 64}, changed) && changed);
+                const unsigned imgs_before = mock.created_images;
+                EXPECT(!c.ensure_target({0, 64}, changed) && !changed);
+                EXPECT(!c.ensure_target({64, 0}, changed) && !changed);
+                EXPECT(!c.ensure_target({0, 0}, changed) && !changed);
+                EXPECT(mock.created_images == imgs_before && c.target() != VK_NULL_HANDLE &&
+                       c.extent().width == 64 && c.extent().height == 64);
+
+                // Calling ensure_target with the same extent does not recreate.
+                EXPECT(c.ensure_target({64, 64}, changed) && !changed && mock.created_images == imgs_before);
+
+                // Allocation failures release prior target cleanly and never free/destroy driver garbage handles.
+                mock.fail_alloc_mem = true;
+                EXPECT(!c.ensure_target({32, 32}, changed));
+                EXPECT(c.target() == VK_NULL_HANDLE && mock.destroyed_images == mock.created_images &&
+                       !mock.destroyed_garbage_memory);
+                mock.fail_alloc_mem = false;
+
+                mock.fail_bind_mem = true;
+                EXPECT(!c.ensure_target({32, 32}, changed));
+                EXPECT(c.target() == VK_NULL_HANDLE && mock.destroyed_images == mock.created_images &&
+                       mock.destroyed_memories == mock.allocated_memories);
+                mock.fail_bind_mem = false;
+
+                mock.fail_create_view = true;
+                EXPECT(!c.ensure_target({32, 32}, changed));
+                EXPECT(c.target() == VK_NULL_HANDLE && mock.destroyed_images == mock.created_images &&
+                       mock.destroyed_memories == mock.allocated_memories && !mock.destroyed_garbage_view);
+                mock.fail_create_view = false;
+
+                // memoryTypeCount > VK_MAX_MEMORY_TYPES (64) must clamp safely without OOB reads/UB.
+                VkPhysicalDeviceMemoryProperties large_mem{};
+                large_mem.memoryTypeCount = 64;
+                large_mem.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                PresentComposer clamped(ctx, large_mem);
+                EXPECT(clamped.ready());
+                mock.mem_type_bits = 0;
+                EXPECT(!clamped.ensure_target({16, 16}, changed));
+                EXPECT(mock.destroyed_images == mock.created_images);
+                mock.mem_type_bits = 1u;
+                EXPECT(clamped.ensure_target({16, 16}, changed) && changed);
+
+                // Recover original composer to 128x96 and verify record() guards & dispatch counts.
+                EXPECT(c.ensure_target({128, 96}, changed) && changed);
+                c.record(VK_NULL_HANDLE, 0, fake_plane, VK_IMAGE_LAYOUT_GENERAL, fake_plane,
+                         VK_IMAGE_LAYOUT_GENERAL, PresentComposePush{});
+                EXPECT(mock.update_sets_calls == 0 && mock.barrier_calls == 0 && mock.dispatch_calls == 0);
+
+                c.record(fake_cb, 0, fake_plane, VK_IMAGE_LAYOUT_GENERAL, fake_plane, VK_IMAGE_LAYOUT_GENERAL,
+                         PresentComposePush{});
+                EXPECT(mock.update_sets_calls == 1 && mock.barrier_calls == 2 && mock.dispatch_calls == 1);
+                EXPECT(mock.last_dispatch[0] == 16 && mock.last_dispatch[1] == 12 && mock.last_dispatch[2] == 1);
+
+                EXPECT(c.ensure_target({13, 9}, changed) && changed);
+                c.record(fake_cb, 1, fake_plane, VK_IMAGE_LAYOUT_GENERAL, fake_plane, VK_IMAGE_LAYOUT_GENERAL,
+                         PresentComposePush{});
+                EXPECT(mock.dispatch_calls == 2);
+                EXPECT(mock.last_dispatch[0] == 2 && mock.last_dispatch[1] == 2 && mock.last_dispatch[2] == 1);
+            }
+            EXPECT(!mock.destroyed_garbage_pipeline && !mock.destroyed_garbage_memory && !mock.destroyed_garbage_view);
+            EXPECT(mock.destroyed_set_layouts == mock.created_set_layouts);
+            EXPECT(mock.destroyed_pools == mock.created_pools);
+            EXPECT(mock.destroyed_pipeline_layouts == mock.created_pipeline_layouts);
+            EXPECT(mock.destroyed_modules == mock.created_modules);
+            EXPECT(mock.destroyed_pipelines == mock.created_pipelines);
+            EXPECT(mock.destroyed_images == mock.created_images);
+            EXPECT(mock.destroyed_memories == mock.allocated_memories);
+            EXPECT(mock.destroyed_views == mock.created_views);
+            ComposeMock::state() = nullptr;
+        }
+        std::printf("presenter sync: PresentComposer hardening ok\n");
+    }
+
     std::printf("vk_presenter_sync_test: ok\n");
     return 0;
 }
