@@ -1196,31 +1196,7 @@ bool is_child_proxy(const void* object) {
     return object && *reinterpret_cast<void* const*>(object) == reinterpret_cast<void*>(get_child_vtable<K>());
 }
 
-constexpr unsigned kListSlots = 160;
-constexpr unsigned kConsoleSetDescriptorHeaps = 32;
-constexpr unsigned kConsoleExecuteBundle = 31;
-constexpr unsigned kConsoleBarrier = 146;
-
-struct ListProxy {
-    void** vtable;                      // +0x00
-    ID3D12GraphicsCommandList* real;    // +0x08
-    DeviceProxy* device;                // +0x10: keeps the Xbox-ABI device alive; GetDevice returns it
-    // +0x18..: the console object body a title's inline writers read. +0x18 holds the write cursor, +0x28 and
-    // +0x30 the record limits; the rest is room for the measured flags, header table and pipeline record.
-    alignas(8) std::uint8_t console_fields[0x600];
-    std::atomic<unsigned long> refs;    // past the console body
-    unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
-
-    void pin_cursor_at_limit() {
-        const std::uint64_t at_limit = static_cast<std::uint64_t>(
-            reinterpret_cast<std::uintptr_t>(this) + 0x18 + 0x500);
-        for (const size_t offset : {0x18, 0x28, 0x30})
-            std::memcpy(reinterpret_cast<std::uint8_t*>(this) + offset, &at_limit, sizeof(at_limit));
-    }
-};
-static_assert(offsetof(ListProxy, console_fields) == 0x18, "the console fields start at +0x18");
-
-// The real object behind a heap, queue, fence or list proxy, or null when `object` is none of them.
+// The real object behind a heap, queue or fence proxy, or null when `object` is none of them.
 IUnknown* proxy_real_object(const void* object) {
     if (!object) return nullptr;
     void* const vtable = *reinterpret_cast<void* const*>(object);
@@ -1234,7 +1210,7 @@ IUnknown* proxy_real_object(const void* object) {
 }
 
 // `object` with a proxy replaced by its real object; anything else (a real object, null) unchanged.
-inline std::uint64_t unwrap_object(std::uint64_t object) {
+std::uint64_t unwrap_object(std::uint64_t object) {
     IUnknown* real = proxy_real_object(reinterpret_cast<const void*>(object));
     return real ? reinterpret_cast<std::uint64_t>(real) : object;
 }
@@ -1267,190 +1243,6 @@ private:
     std::unique_ptr<std::uint64_t[]> heap_;
     std::uint64_t* data_ = nullptr;
 };
-
-struct ListStats {
-    static inline std::atomic<std::uint64_t> hits[kListSlots];
-    static inline std::atomic<bool> first[kListSlots];
-};
-
-inline void note_list_slot(unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2 = 0, std::uint64_t a3 = 0, std::uint64_t a4 = 0) {
-    if (slot >= kListSlots) return;
-    ListStats::hits[slot].fetch_add(1, std::memory_order_relaxed);
-    bool expected = false;
-    if (ListStats::first[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] d3d12_xs: list slot %u first call (args 0x%llx 0x%llx 0x%llx 0x%llx)\n", slot,
-                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                     static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
-}
-
-inline bool is_list_iid(const IID& iid) {
-    return IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
-           IsEqualIID(iid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList1)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList2)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList3)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList4)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList5)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList6)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList7)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList8));
-}
-
-inline unsigned long list_add_ref(ListProxy* self) { return self->refs.fetch_add(1, std::memory_order_relaxed) + 1; }
-
-inline void destroy_list(ListProxy* self) {
-    IUnknown* real = self->real;
-    DeviceProxy* device = self->device;
-    delete self;
-    if (real) real->Release();
-    if (device) proxy_release(device);
-}
-
-inline unsigned long list_release(ListProxy* self) {
-    const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (refs == 0) destroy_list(self);
-    return refs;
-}
-
-inline HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
-    note_list_slot(0, reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out), 0, 0);
-    if (!out) return E_POINTER;
-    *out = nullptr;
-    if (!riid) return E_POINTER;
-    if (!is_list_iid(*riid)) {
-        if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
-        return E_NOINTERFACE;
-    }
-    if (!supports_iid(self->real, *riid)) return E_NOINTERFACE;
-    *out = self;
-    list_add_ref(self);
-    return S_OK;
-}
-
-inline unsigned detect_list_slot_count(IUnknown* real) {
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList8))) return 82;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList7))) return 81;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList6))) return 80;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList5))) return 79;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList4))) return 77;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList3))) return 68;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList2))) return 67;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList1))) return 66;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList))) return 60;
-    return 9;
-}
-
-template <unsigned Slot>
-std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
-                               std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
-                               std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
-                               std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
-    if constexpr (Slot == 0) {
-        return hr_to_u64(list_query_interface(self, reinterpret_cast<const IID*>(a1),
-                                              reinterpret_cast<void**>(a2)));
-    } else if constexpr (Slot == 1) {
-        return list_add_ref(self);
-    } else if constexpr (Slot == 2) {
-        return list_release(self);
-    } else if constexpr (Slot == 7) {  // GetDevice
-        note_list_slot(7, a1, a2, 0, 0);
-        if (a2) *reinterpret_cast<void**>(a2) = nullptr;
-        if (!a1) return hr_to_u64(E_POINTER);
-        if (!a2) {
-            using Fn = HRESULT(WINAPI*)(IUnknown*, const IID*, void**);
-            return hr_to_u64(reinterpret_cast<Fn>((*reinterpret_cast<void***>(self->real))[7])(
-                self->real, reinterpret_cast<const IID*>(a1), nullptr));
-        }
-        return hr_to_u64(proxy_query_interface(self->device, reinterpret_cast<const IID*>(a1),
-                                               reinterpret_cast<void**>(a2)));
-    } else {
-        note_list_slot(Slot, a1, a2, a3, a4);
-        constexpr unsigned pc = console_to_pc_list_slot(Slot);
-        if constexpr (pc == kListNotForwarded) {
-            if constexpr (Slot == 148) {
-                static std::atomic<bool> logged{false};
-                if (!logged.exchange(true, std::memory_order_relaxed))
-                    std::fprintf(stderr,
-                                 "[rt] d3d12_xs: console list slot 148 AllocateUploadMemory stub called (size %llu, align %llu)\n",
-                                 static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2));
-            }
-            return 0;
-        } else {
-            if (pc >= self->pc_slot_count) {
-                static std::atomic<bool> beyond_warned[kListSlots];
-                bool expected = false;
-                if (beyond_warned[Slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
-                    std::fprintf(stderr,
-                                 "[rt] d3d12_xs: list slot %u maps to PC slot %u, beyond the real list's %u "
-                                 "slots; returning E_NOTIMPL\n",
-                                 Slot, pc, self->pc_slot_count);
-                return hr_to_u64(E_NOTIMPL);
-            }
-            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t);
-            auto** const real_vtable = *reinterpret_cast<void***>(self->real);
-            UnwrappedArray heaps;
-            if constexpr (Slot == 10) {
-                a1 = unwrap_object(a1);
-                self->pin_cursor_at_limit();
-            } else if constexpr (Slot == kConsoleExecuteBundle) {
-                a1 = unwrap_object(a1);
-            } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {
-                if (!heaps.fill(a2, a1)) return 0;
-                if (heaps.data()) a2 = heaps.data();
-            }
-            return reinterpret_cast<ForwardFn>(real_vtable[pc])(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9,
-                                                              a10, a11, a12, a13, a14);
-        }
-    }
-}
-
-template <std::size_t... I>
-void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
-    ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>)), ...);
-}
-
-void** get_list_vtable() {
-    static void** vtable = [] {
-        static void* storage[kListSlots];
-        fill_list_vtable(storage, std::make_index_sequence<kListSlots>{});
-        return storage;
-    }();
-    return vtable;
-}
-
-HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
-    if (out) *out = nullptr;
-    if (!created) return E_FAIL;
-    auto* proxy = new (std::nothrow) ListProxy();
-    if (!proxy) {
-        created->Release();
-        return E_OUTOFMEMORY;
-    }
-    proxy->vtable = get_list_vtable();
-    proxy->real = static_cast<ID3D12GraphicsCommandList*>(created);
-    proxy->device = device;
-    proxy->refs.store(1, std::memory_order_relaxed);
-    proxy->pc_slot_count = detect_list_slot_count(created);
-    proxy->pin_cursor_at_limit();
-    proxy_add_ref(device);
-
-    const HRESULT hr = list_query_interface(proxy, riid, out);
-    if (FAILED(hr)) {
-        destroy_list(proxy);
-        return hr;
-    }
-    static std::atomic<bool> logged{false};
-    if (!d3d12_trace::enabled() && (!logged.exchange(true, std::memory_order_relaxed) || trace_enabled()))
-        std::fprintf(stderr, "[rt] d3d12_xs: list proxy %p wraps %p (%u PC vtable slots)\n",
-                     static_cast<void*>(proxy), static_cast<void*>(created), proxy->pc_slot_count);
-    proxy->refs.fetch_sub(1, std::memory_order_relaxed);
-    return S_OK;
-}
 
 // The vtable read for a slot past a table faults in the reservation behind it; name the slot. Only reads the
 // exception record and writes with WriteFile, so it is safe whatever the faulting thread holds.
@@ -2840,6 +2632,8 @@ HRESULT proxy_check_feature_support(DeviceProxy* self, std::uint64_t feature, st
                      static_cast<unsigned long>(hr), used ? ":" : "", answer, bytes > 64 && used ? " ..." : "");
     }
     return hr;
+}
+
 static bool readable_range(const void* ptr, std::size_t bytes) {
     if (!ptr || !bytes) return false;
     const auto* p = static_cast<const std::uint8_t*>(ptr);
@@ -2868,29 +2662,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
     void* created = nullptr;
-    HRESULT hr = E_INVALIDARG;
-    bool console_extended = false;
-    if (desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
-        (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
-        const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
-        const void* tail = bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
-        if (readable_range(tail, sizeof(std::uint64_t) * 2)) {
-            std::uint64_t address = 0;
-            std::uint64_t size = 0;
-            std::memcpy(&address, tail, sizeof(address));
-            std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
-                console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
-            }
-        }
-    }
-    if (!console_extended)
-        hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+    HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
@@ -4424,11 +4196,6 @@ ID3D12GraphicsCommandList* command_list_proxy_real_list(const void* list) {
 }
 
 unsigned command_list_proxy_table_size() { return kListSlots; }
-
-std::uint64_t list_slot_hits(unsigned slot) {
-    start_hit_counts();
-    return slot < kListSlots ? ListStats::hits[slot].load(std::memory_order_relaxed) : 0;
-}
 
 bool list_slot_first_call_seen(unsigned slot) {
     return slot < kListSlots && ListStats::first[slot].load(std::memory_order_relaxed);

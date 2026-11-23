@@ -10529,29 +10529,5 @@ void set_global_realtime_privilege_override_for_test(int state) {
     g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
 }
 
-HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
-                                       D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
-                                       REFIID riid, void** out) {
-    if (out) *out = nullptr;
-    if (!device || !desc) return E_INVALIDARG;
-    // No output: a capability check, as CreateDescriptorHeap does.
-    if (!out) return S_FALSE;
-    if ((desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc->NodeMask > 1 ||
-        ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
-         (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
-        return E_INVALIDARG;
-    }
-    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
-    auto* d = Device::from<Device>(real ? real : device);
-    if (!d) return E_INVALIDARG;
-
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
-    if (!heap->ok()) {
-        heap->Release();
-        return E_OUTOFMEMORY;
-    }
-    return hand_out(heap, riid, out);
-}
 
 }  // namespace rt::d3d12

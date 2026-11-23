@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // Frame pacing for the Xbox presentation path (docs/d3d12_vulkan.md section 4.5): what SetFrameIntervalX,
 // ScheduleFrameEventX, WaitFrameEventX and GetFrameStatisticsX do, and the token check and flip bookkeeping that
@@ -29,7 +29,7 @@
 //     (decide_present_sync).
 //
 // Uncapped (set_uncapped; LEONIDA_PRESENT_UNCAP in the shim): the registration calls keep working and waits keep
-// handing out one token each, but a wait never blocks — no vblank grid, no latency throttle — and a presented
+// handing out one token each, but a wait never blocks â€” no vblank grid, no latency throttle â€” and a presented
 // frame counts as shown at once. The frame rate is then the title's own; the error surface (nothing registered,
 // suspended) is unchanged.
 
@@ -441,7 +441,7 @@ private:
             const std::uint64_t now = clock_.now_us();
             retire_locked(now);
             if (uncapped_) {  // no vblank grid and no latency throttle: a token at once, due now
-                *token = ++issued_;
+                *token = tokens_->issue();
                 Record record;
                 record.token = *token;
                 record.origin_us = now;

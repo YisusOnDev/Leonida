@@ -828,6 +828,8 @@ void run_checks(const std::filesystem::path& root) {
         };
         race(false, L"f", "a creating CreateFileW");
         race(true, L"d", "CreateDirectoryW");
+    }
+
     // Recreating a removed package directory clears its own marker, but not nested deletion markers.
     {
         std::filesystem::create_directories(package / "recreate_dir");
