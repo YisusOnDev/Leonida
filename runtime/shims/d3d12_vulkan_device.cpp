@@ -638,6 +638,79 @@ struct DeviceState {
     };
     SubgroupFacts subgroups;
     std::once_flag subgroups_once;
+
+    // Shader modules shared by content. The driver keeps a copy of the SPIR-V in every VkShaderModule, and a title
+    // creates tens of thousands of PSOs over a few thousand programs (51,000 graphics PSOs at a retail boot), so one
+    // module per PSO held the same translated program many times over: more than 20 GB of driver heap before the
+    // first frame. PSOs whose final words are equal now hold one module, counted, destroyed with its last PSO.
+    struct SharedModuleKey {
+        std::uint64_t a, b;
+        std::size_t words;
+        bool operator<(const SharedModuleKey& o) const {
+            return a != o.a ? a < o.a : b != o.b ? b < o.b : words < o.words;
+        }
+    };
+    struct SharedModule {
+        VkShaderModule module = VK_NULL_HANDLE;
+        unsigned refs = 0;
+    };
+    std::mutex shared_modules_mutex;
+    std::map<SharedModuleKey, SharedModule> shared_modules;
+    std::map<VkShaderModule, SharedModuleKey> shared_module_keys;
+
+    static SharedModuleKey shared_module_key(const std::vector<std::uint32_t>& words) {
+        std::uint64_t a = 0x9E3779B97F4A7C15ull, b = 0xC2B2AE3D27D4EB4Full;
+        for (const std::uint32_t w : words) {
+            a = (a ^ w) * 0x100000001B3ull;
+            a ^= a >> 29;
+            b = (b + w) * 0xFF51AFD7ED558CCDull;
+            b = (b << 31) | (b >> 33);
+        }
+        return {a, b, words.size()};
+    }
+
+    // A module for `words`, created on first use; VK_NULL_HANDLE when the driver refuses it.
+    // The driver call is made outside the lock: it copies and hashes up to a few MiB, and PSOs are created from many
+    // threads at once (a title's hang watchdog fired while they queued behind it). Two threads that race on a new
+    // program both create a module; the second destroys its own and takes the first.
+    VkShaderModule acquire_shared_module(const std::vector<std::uint32_t>& words) {
+        const SharedModuleKey key = shared_module_key(words);
+        {
+            std::lock_guard lock(shared_modules_mutex);
+            const auto it = shared_modules.find(key);
+            if (it != shared_modules.end()) {
+                ++it->second.refs;
+                return it->second.module;
+            }
+        }
+        VkShaderModuleCreateInfo create{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        create.codeSize = words.size() * 4;
+        create.pCode = words.data();
+        VkShaderModule made = VK_NULL_HANDLE;
+        if (context->vk.vkCreateShaderModule(info.device, &create, nullptr, &made) != VK_SUCCESS) return VK_NULL_HANDLE;
+        std::lock_guard lock(shared_modules_mutex);
+        const auto [it, inserted] = shared_modules.try_emplace(key, SharedModule{made, 0});
+        if (inserted) {
+            shared_module_keys[made] = key;
+        } else {
+            context->vk.vkDestroyShaderModule(info.device, made, nullptr);
+        }
+        ++it->second.refs;
+        return it->second.module;
+    }
+
+    void release_shared_module(VkShaderModule module) {
+        if (!module) return;
+        std::lock_guard lock(shared_modules_mutex);
+        const auto key = shared_module_keys.find(module);
+        if (key == shared_module_keys.end()) return;
+        const auto it = shared_modules.find(key->second);
+        if (it != shared_modules.end() && --it->second.refs == 0) {
+            context->vk.vkDestroyShaderModule(info.device, module, nullptr);
+            shared_modules.erase(it);
+            shared_module_keys.erase(key);
+        }
+    }
     // VkPhysicalDeviceMeshShaderPropertiesEXT, read on first use by a mesh PSO; zeros when it cannot be asked.
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     bool mesh_properties_read = false;
@@ -3315,11 +3388,12 @@ public:
         if (registered_) device_.context->remove_pipeline(id());
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
-        if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
+        device_.release_shared_module(module_);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
+        for (VkShaderModule module : shared_modules_) device_.release_shared_module(module);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
     }
 
@@ -3644,12 +3718,9 @@ public:
                     stage.words = std::move(patched);
                 }
             }
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = stage.words.size() * 4;
-            module_info.pCode = stage.words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
-            modules_.push_back(module);
+            const VkShaderModule module = device_.acquire_shared_module(stage.words);
+            if (!module) return E_FAIL;
+            shared_modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = stage.bit;
             info.module = module;
@@ -4084,10 +4155,8 @@ public:
             return S_OK;
         }
 
-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module_info.codeSize = words.size() * 4;
-        module_info.pCode = words.data();
-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+        module_ = device_.acquire_shared_module(words);
+        if (!module_) return E_FAIL;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -4257,8 +4326,9 @@ private:
     Recipe recipe_;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
-    VkShaderModule module_ = VK_NULL_HANDLE;
-    std::vector<VkShaderModule> modules_;
+    VkShaderModule module_ = VK_NULL_HANDLE;  // shared (DeviceState::acquire_shared_module)
+    std::vector<VkShaderModule> modules_;         // this PSO's own
+    std::vector<VkShaderModule> shared_modules_;  // DeviceState::acquire_shared_module
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
     bool registered_ = false;
