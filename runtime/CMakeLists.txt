@@ -132,6 +132,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/process.cpp
     shims/dstorage.cpp
     shims/appnotify.cpp
+    shims/com_shim.cpp
+    shims/bcrypt_rng.cpp
   )
   # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
   # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file
@@ -377,6 +379,27 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(appnotify_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(appnotify_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(appnotify_test PRIVATE /OPT:NOREF)
+  # COM lifecycle and helper shims for api-ms-win-core-com-l1-1-*.dll.
+  add_executable(com_shim_test
+    test/com_shim_test.cpp
+    shims/com_shim.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(com_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(com_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(com_shim_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(com_shim_test PRIVATE /OPT:NOREF)
+
+  # BCrypt RNG and algorithm provider shims.
+  add_executable(bcrypt_rng_test
+    test/bcrypt_rng_test.cpp
+    shims/bcrypt_rng.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(bcrypt_rng_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(bcrypt_rng_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(bcrypt_rng_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(bcrypt_rng_test PRIVATE /OPT:NOREF)
 
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
@@ -638,6 +661,17 @@ if(BUILD_TESTING)
     target_compile_options(tiny_exe PRIVATE /W4 /permissive- /utf-8 /GS-)
     set_target_properties(tiny_exe PROPERTIES
       OUTPUT_NAME tiny_exe
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+
+    # An EXE built with /GA reads its TLS at index 0 without _tls_index; loader_tls_test maps it and reads it from
+    # threads that existed before load() and from ones that did not.
+    add_executable(tiny_ga_tls test/fixtures/tiny_ga_tls.cpp)
+    target_compile_definitions(tiny_ga_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_ga_tls PRIVATE /W4 /permissive- /utf-8 /GS- /GA)
+    set_target_properties(tiny_ga_tls PROPERTIES
+      OUTPUT_NAME tiny_ga_tls
       RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
@@ -939,7 +973,7 @@ if(BUILD_TESTING)
     )
     target_compile_definitions(loader_tls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(loader_tls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only gta6rt_tls_host)
+    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only tiny_ga_tls gta6rt_tls_host)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
@@ -1352,6 +1386,14 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET appnotify_test)
     add_test(NAME appnotify COMMAND appnotify_test)
+  endif()
+  if(WIN32 AND TARGET com_shim_test)
+    add_test(NAME com_shim COMMAND com_shim_test)
+  endif()
+  if(WIN32 AND TARGET bcrypt_rng_test)
+    add_test(NAME bcrypt_rng COMMAND bcrypt_rng_test)
+    add_test(NAME bcrypt_rng_seeded COMMAND bcrypt_rng_test --seeded)
+    set_tests_properties(bcrypt_rng_seeded PROPERTIES ENVIRONMENT "LEONIDA_RNG_SEED=0x123456789abcdef0")
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)

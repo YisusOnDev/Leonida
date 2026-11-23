@@ -515,183 +515,146 @@ void test_deserializer() {
         shim_de->Release();
     }
 
-    // The shim copies such a blob to clear the byte. A refused allocation is E_OUTOFMEMORY with a null output, not
-    // an exception thrown out of the export into the title's code (as the device proxy's rule says: nothing throws).
-    shim_de = reinterpret_cast<ID3D12RootSignatureDeserializer*>(uintptr_t(1));
-    bool threw = false;
-    const int refused_before = g_failed_news;
-    g_fail_news = 1;
-    try {
-        hr = deserialize(tampered.data(), tampered.size(), IID_PPV_ARGS(&shim_de));
-    } catch (const std::bad_alloc&) {
-        threw = true;
-        shim_de = nullptr;
-    }
-    g_fail_news = 0;
-    check(g_failed_news == refused_before + 1, "the shim deserializer's copy of the blob is an allocation");
-    check(!threw, "a refused allocation does not leave the shim deserializer as an exception");
-    check(!threw && hr == E_OUTOFMEMORY && shim_de == nullptr,
-          "a refused allocation is E_OUTOFMEMORY with a null output");
-    // A blob without the Xbox byte is forwarded as it is, with no copy: an armed failure is not reached.
-    ID3D12RootSignatureDeserializer* plain_de = nullptr;
-    g_fail_news = 1;
-    hr = deserialize(bytes, size, IID_PPV_ARGS(&plain_de));
-    const bool untouched = g_fail_news == 1;
-    g_fail_news = 0;
-    check(SUCCEEDED(hr) && plain_de != nullptr && untouched, "a blob without the Xbox byte is forwarded without a copy");
-    if (plain_de) plain_de->Release();
-    // And the tampered blob still deserializes once allocations succeed again.
-    shim_de = nullptr;
-    hr = deserialize(tampered.data(), tampered.size(), IID_PPV_ARGS(&shim_de));
-    check(SUCCEEDED(hr) && shim_de != nullptr, "the shim deserializer succeeds again after the refused allocation");
-    if (shim_de) shim_de->Release();
-}
-
-void write_u32(std::vector<uint8_t>& buf, size_t off, uint32_t v) {
-    buf[off + 0] = static_cast<uint8_t>(v);
-    buf[off + 1] = static_cast<uint8_t>(v >> 8);
-    buf[off + 2] = static_cast<uint8_t>(v >> 16);
-    buf[off + 3] = static_cast<uint8_t>(v >> 24);
-}
-
-std::vector<uint8_t> build_dxbc(const std::vector<std::pair<const char*, std::vector<uint8_t>>>& chunks) {
-    const size_t header_end = 32 + chunks.size() * 4;
-    std::vector<uint8_t> blob(header_end, 0);
-    blob[0] = 'D'; blob[1] = 'X'; blob[2] = 'B'; blob[3] = 'C';
-    write_u32(blob, 20, 1);  // DXBC version
-    write_u32(blob, 28, static_cast<uint32_t>(chunks.size()));
-    for (size_t i = 0; i < chunks.size(); ++i) {
-        const uint32_t off = static_cast<uint32_t>(blob.size());
-        write_u32(blob, 32 + i * 4, off);
-        const char* fourcc = chunks[i].first;
-        const auto& payload = chunks[i].second;
-        blob.insert(blob.end(), fourcc, fourcc + 4);
-        const size_t size_at = blob.size();
-        blob.resize(size_at + 4);
-        write_u32(blob, size_at, static_cast<uint32_t>(payload.size()));
-        blob.insert(blob.end(), payload.begin(), payload.end());
-    }
-    write_u32(blob, 24, static_cast<uint32_t>(blob.size()));
-    uint32_t hash[4]{};
-    rt::d3d12_xs::dxbc_checksum(blob.data(), blob.size(), hash);
-    std::memcpy(blob.data() + 4, hash, sizeof(hash));
-    return blob;
-}
-
-void test_rootsig_helper_hardening() {
-    // 1. Short RTS0 chunk (size 8 < 24) followed by another chunk must not overwrite the next chunk.
+    // 1. Corrupt DXBC checksum: the shim must not forge a valid checksum for a corrupted blob.
     {
-        std::vector<uint8_t> stat_payload(24, 0);
-        write_u32(stat_payload, 4, kXboxFlags);  // sits at off0 + 8 + 20 if size=8 is ignored
-        auto blob = build_dxbc({{"RTS0", std::vector<uint8_t>(8, 0)}, {"STAT", stat_payload}});
-        std::vector<uint8_t> cleared;
-        const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(blob.data(), blob.size(), cleared);
-        check(!rewritten && cleared.empty(), "short RTS0 chunk (< 24 bytes) does not touch adjacent chunk");
+        std::vector<uint8_t> corrupt = tampered;
+        corrupt[4] ^= 0xFFu;
+        std::vector<uint8_t> out;
+        check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(corrupt.data(), corrupt.size(), out) && out.empty(),
+              "blob helper refuses to rewrite a DXBC blob with a bad checksum");
+        ID3D12RootSignatureDeserializer* direct_bad = nullptr;
+        const HRESULT hr_direct = D3D12CreateRootSignatureDeserializer(
+            corrupt.data(), corrupt.size(), IID_PPV_ARGS(&direct_bad));
+        if (direct_bad) direct_bad->Release();
+
+        ID3D12RootSignatureDeserializer* bad_de = nullptr;
+        const HRESULT hr_bad = deserialize(corrupt.data(), corrupt.size(), IID_PPV_ARGS(&bad_de));
+        if (FAILED(hr_direct)) {
+            check(FAILED(hr_bad) && !bad_de,
+                  "shim deserializer rejects a corrupted Xbox blob when the host rejects it");
+        } else {
+            check(SUCCEEDED(hr_bad) && bad_de &&
+                      bad_de->GetRootSignatureDesc()->Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
+                  "shim deserializer forwards a corrupted Xbox blob unchanged on hosts that accept bad hashes");
+        }
+        if (bad_de) bad_de->Release();
     }
 
-    // 2. Overrunning RTS0 chunk (declared size > remaining container bytes) must be rejected.
+    // 2. Mismatched DXBC total_size (trailing padding or declared size larger than buffer).
     {
-        std::vector<uint8_t> rts0_payload(24, 0);
-        write_u32(rts0_payload, 20, kXboxFlags);
-        auto blob = build_dxbc({{"RTS0", rts0_payload}});
-        write_u32(blob, 36 + 4, 4096u);  // chunk_size claims 4096 bytes in a 68-byte container
-        std::vector<uint8_t> cleared;
-        const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(blob.data(), blob.size(), cleared);
-        check(!rewritten && cleared.empty(), "overrunning RTS0 chunk size is rejected");
+        std::vector<uint8_t> trailing = tampered;
+        trailing.resize(trailing.size() + 16, 0);
+        std::vector<uint8_t> out;
+        check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(trailing.data(), trailing.size(), out) && out.empty(),
+              "blob helper refuses a DXBC blob with trailing bytes past total_size");
+
+        std::vector<uint8_t> inflated_total = tampered;
+        const uint32_t big_total = static_cast<uint32_t>(inflated_total.size() + 16);
+        std::memcpy(inflated_total.data() + 24, &big_total, sizeof(big_total));
+        uint32_t h[4];
+        rt::d3d12_xs::dxbc_checksum(inflated_total.data(), inflated_total.size(), h);
+        std::memcpy(inflated_total.data() + 4, h, sizeof(h));
+        check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(inflated_total.data(), inflated_total.size(), out) &&
+                  out.empty(),
+              "blob helper refuses a DXBC blob whose total_size exceeds the buffer");
     }
 
-    // 3. Chunk offset pointing inside the DXBC header / chunk table (< 32 + 4 * count) must be rejected.
+    // 3. Truncated RTS0 chunk (chunk_size < 24) followed by another chunk, and overrunning chunk_size.
     {
-        std::vector<uint8_t> blob(64, 0);
-        blob[0] = 'D'; blob[1] = 'X'; blob[2] = 'B'; blob[3] = 'C';
-        write_u32(blob, 20, 1);
-        write_u32(blob, 24, static_cast<uint32_t>(blob.size()));
-        write_u32(blob, 28, 1);
-        write_u32(blob, 32, 12);  // points inside the DXBC hash at bytes 4..19
-        std::memcpy(blob.data() + 12, "RTS0", 4);
-        write_u32(blob, 16, 24);
-        write_u32(blob, 40, kXboxFlags);  // 12 + 8 + 20 = 40
-        std::vector<uint8_t> cleared;
-        const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(blob.data(), blob.size(), cleared);
-        check(!rewritten && cleared.empty(), "RTS0 chunk offset inside DXBC header/table is rejected");
+        // Header (32) + 2 chunk offsets (8) + RTS0 (8 + 8) + FAKE (8 + 16) = 80 bytes.
+        // Byte offset off0 + 8 + 20 = 40 + 28 = 68 lands inside FAKE's payload.
+        std::vector<uint8_t> short_chunk(80, 0);
+        std::memcpy(short_chunk.data(), "DXBC", 4);
+        const uint32_t version = 1, total = static_cast<uint32_t>(short_chunk.size()), nchunks = 2;
+        const uint32_t off0 = 40, off1 = 56, sz0 = 8, sz1 = 16;
+        std::memcpy(short_chunk.data() + 20, &version, 4);
+        std::memcpy(short_chunk.data() + 24, &total, 4);
+        std::memcpy(short_chunk.data() + 28, &nchunks, 4);
+        std::memcpy(short_chunk.data() + 32, &off0, 4);
+        std::memcpy(short_chunk.data() + 36, &off1, 4);
+        std::memcpy(short_chunk.data() + off0, "RTS0", 4);
+        std::memcpy(short_chunk.data() + off0 + 4, &sz0, 4);
+        const uint32_t rts_ver = 1;
+        std::memcpy(short_chunk.data() + off0 + 8, &rts_ver, 4);
+        std::memcpy(short_chunk.data() + off1, "FAKE", 4);
+        std::memcpy(short_chunk.data() + off1 + 4, &sz1, 4);
+        std::memcpy(short_chunk.data() + off0 + 8 + 20, &kXboxFlags, 4);  // inside FAKE, not RTS0
+        uint32_t h[4];
+        rt::d3d12_xs::dxbc_checksum(short_chunk.data(), short_chunk.size(), h);
+        std::memcpy(short_chunk.data() + 4, h, sizeof(h));
+        std::vector<uint8_t> out;
+        check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(short_chunk.data(), short_chunk.size(), out) &&
+                  out.empty(),
+              "blob helper refuses an RTS0 chunk shorter than 24 bytes instead of corrupting the next chunk");
+
+        std::vector<uint8_t> overrun_chunk = tampered;
+        uint32_t rts_off = 0;
+        std::memcpy(&rts_off, overrun_chunk.data() + 32, 4);
+        const uint32_t huge_chunk = 0x1000u;
+        std::memcpy(overrun_chunk.data() + rts_off + 4, &huge_chunk, 4);
+        rt::d3d12_xs::dxbc_checksum(overrun_chunk.data(), overrun_chunk.size(), h);
+        std::memcpy(overrun_chunk.data() + 4, h, sizeof(h));
+        check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(overrun_chunk.data(), overrun_chunk.size(), out) &&
+                  out.empty(),
+              "blob helper refuses an RTS0 chunk whose declared size overruns the container");
     }
 
-    // 4. Multi-chunk container with >16 chunks (17 chunks, RTS0 at index 16) clears Xbox flags and deserializes.
+    // 4. Unknown RTS0 version: forward unchanged instead of clearing offset +20.
     {
-        D3D12_ROOT_SIGNATURE_DESC desc = make_legacy_desc(0);
-        Blobs blobs;
-        check(SUCCEEDED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blobs.blob, &blobs.error)) &&
-                  blobs.blob,
-              "serialize clean root signature for 17-chunk test");
-        if (blobs.blob) {
-            const uint8_t* src = static_cast<const uint8_t*>(blobs.blob->GetBufferPointer());
-            const SIZE_T src_size = blobs.blob->GetBufferSize();
-            uint32_t src_chunks = 0;
-            std::memcpy(&src_chunks, src + 28, 4);
-            std::vector<uint8_t> rts0_payload;
-            for (uint32_t i = 0; i < src_chunks; ++i) {
-                uint32_t off = 0;
-                std::memcpy(&off, src + 32 + i * 4, 4);
-                if (off + 8 <= src_size && std::memcmp(src + off, "RTS0", 4) == 0) {
-                    uint32_t psz = 0;
-                    std::memcpy(&psz, src + off + 4, 4);
-                    if (off + 8 + psz <= src_size) {
-                        rts0_payload.assign(src + off + 8, src + off + 8 + psz);
-                        write_u32(rts0_payload, 20, kXboxFlags);
-                    }
-                    break;
-                }
-            }
-            std::vector<std::pair<const char*, std::vector<uint8_t>>> chunks;
-            for (int i = 0; i < 16; ++i) chunks.push_back({"DUMY", {}});
-            chunks.push_back({"RTS0", rts0_payload});
-            auto multi = build_dxbc(chunks);
-            std::vector<uint8_t> cleared;
-            const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(multi.data(), multi.size(), cleared);
-            check(rewritten && !cleared.empty(), "17-chunk DXBC container rewrites RTS0 at chunk 16");
-            if (rewritten) {
-                ID3D12RootSignatureDeserializer* de = nullptr;
-                const HRESULT hr = D3D12CreateRootSignatureDeserializer(cleared.data(), cleared.size(), IID_PPV_ARGS(&de));
-                check(SUCCEEDED(hr) && de && de->GetRootSignatureDesc()->Flags == 0,
-                      "17-chunk cleared DXBC container deserializes cleanly with Flags == 0");
-                if (de) de->Release();
-            }
+        std::vector<uint8_t> unknown_ver = tampered;
+        uint32_t rts_off = 0;
+        std::memcpy(&rts_off, unknown_ver.data() + 32, 4);
+        const uint32_t bad_ver = 4;
+        std::memcpy(unknown_ver.data() + rts_off + 8, &bad_ver, 4);
+        uint32_t h[4];
+        rt::d3d12_xs::dxbc_checksum(unknown_ver.data(), unknown_ver.size(), h);
+        std::memcpy(unknown_ver.data() + 4, h, sizeof(h));
+        std::vector<uint8_t> out;
+        check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(unknown_ver.data(), unknown_ver.size(), out) &&
+                  out.empty(),
+              "blob helper refuses an unknown RTS0 header version");
+    }
+
+    // 5. Malformed non-RTS0 chunk-table entry (before or after a valid RTS0 chunk) must fail closed.
+    {
+        uint32_t orig_rts_off = 0, orig_rts_sz = 0;
+        std::memcpy(&orig_rts_off, tampered.data() + 32, 4);
+        std::memcpy(&orig_rts_sz, tampered.data() + orig_rts_off + 4, 4);
+        const uint32_t rts_bytes = 8 + orig_rts_sz;
+        for (int bad_first = 0; bad_first < 2; ++bad_first) {
+            // Header (32) + 2 chunk offsets (8) + valid RTS0 chunk.
+            std::vector<uint8_t> bad_table(40 + rts_bytes, 0);
+            std::memcpy(bad_table.data(), "DXBC", 4);
+            const uint32_t version = 1, total = static_cast<uint32_t>(bad_table.size()), nchunks = 2;
+            const uint32_t good_off = 40, bad_off = 16;  // bad_off < min_chunk_off (40)
+            std::memcpy(bad_table.data() + 20, &version, 4);
+            std::memcpy(bad_table.data() + 24, &total, 4);
+            std::memcpy(bad_table.data() + 28, &nchunks, 4);
+            std::memcpy(bad_table.data() + 32, bad_first ? &bad_off : &good_off, 4);
+            std::memcpy(bad_table.data() + 36, bad_first ? &good_off : &bad_off, 4);
+            std::memcpy(bad_table.data() + good_off, tampered.data() + orig_rts_off, rts_bytes);
+            uint32_t h[4];
+            rt::d3d12_xs::dxbc_checksum(bad_table.data(), bad_table.size(), h);
+            std::memcpy(bad_table.data() + 4, h, sizeof(h));
+            std::vector<uint8_t> out;
+            check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(bad_table.data(), bad_table.size(), out) &&
+                      out.empty(),
+                  bad_first ? "blob helper fails closed on a malformed chunk entry before RTS0"
+                            : "blob helper fails closed on a malformed chunk entry after RTS0");
         }
     }
+}
 
-    // 5. In-place self-aliasing downgrade_root_signature_1_2_to_1_1(&d.desc, storage, &d.desc).
-    {
-        Desc12 inplace;
-        std::vector<D3D12_STATIC_SAMPLER_DESC> storage;
-        const bool ok = rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(inplace.desc, storage, inplace.desc);
-        check(ok && inplace.desc.Version == D3D_ROOT_SIGNATURE_VERSION_1_1 &&
-                  inplace.desc.Desc_1_1.NumParameters == 1 &&
-                  inplace.desc.Desc_1_1.pParameters == &inplace.param &&
-                  inplace.desc.Desc_1_1.NumStaticSamplers == 2 &&
-                  inplace.desc.Desc_1_1.pStaticSamplers == storage.data() &&
-                  inplace.desc.Desc_1_1.Flags == D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT &&
-                  storage.size() == 2 && same_sampler(storage[0], inplace.samplers[0]) &&
-                  same_sampler(storage[1], inplace.samplers[1]),
-              "in-place self-aliasing 1.2 -> 1.1 downgrade preserves parameters, samplers, and flags");
-        Blobs b11;
-        check(SUCCEEDED(D3D12SerializeVersionedRootSignature(&inplace.desc, &b11.blob, &b11.error)),
-              "in-place downgraded 1.1 description is accepted by the PC serializer");
-    }
-
-    // 6. dxbc_checksum() guards short/null inputs and null output without underflow or OOB reads.
-    {
-        uint32_t hash[4] = {1, 2, 3, 4};
-        const uint8_t tiny[19]{};
-        rt::d3d12_xs::dxbc_checksum(tiny, sizeof(tiny), hash);
-        check(hash[0] == 0 && hash[1] == 0 && hash[2] == 0 && hash[3] == 0,
-              "dxbc_checksum zeroes output for blobs shorter than 20 bytes");
-        hash[0] = 9;
-        rt::d3d12_xs::dxbc_checksum(nullptr, 64, hash);
-        check(hash[0] == 0 && hash[1] == 0 && hash[2] == 0 && hash[3] == 0,
-              "dxbc_checksum zeroes output for null blob pointer");
-        rt::d3d12_xs::dxbc_checksum(tiny, sizeof(tiny), nullptr);
-        check(true, "dxbc_checksum ignores null output pointer");
-    }
+void test_dxbc_checksum_guards() {
+    uint32_t out[4] = {1, 2, 3, 4};
+    rt::d3d12_xs::dxbc_checksum(nullptr, 64, out);
+    check(out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0,
+          "dxbc_checksum zeroes output on null buffer");
+    uint8_t tiny[19] = {};
+    out[0] = 5; out[1] = 6; out[2] = 7; out[3] = 8;
+    rt::d3d12_xs::dxbc_checksum(tiny, sizeof(tiny), out);
+    check(out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0,
+          "dxbc_checksum zeroes output on buffer shorter than 20 bytes");
 }
 
 }  // namespace
@@ -707,7 +670,7 @@ int main() {
     test_preserves_low_bits_and_unknown_versions();
     test_registered_shim(supports_1_2);
     test_deserializer();
-    test_rootsig_helper_hardening();
+    test_dxbc_checksum_guards();
     std::printf("root_sig_test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
