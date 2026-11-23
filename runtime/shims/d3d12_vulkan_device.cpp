@@ -5952,8 +5952,12 @@ public:
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
         state_.context->set_before_execute([this] { state_.refresh_shadows(); });
-        if (const char* mb = std::getenv("LEONIDA_TITLE_WINDOWS_MB"); mb && *mb)
-            state_.title_window_cap = std::strtoull(mb, nullptr, 10) << 20;
+        {
+            char text[16] = {};
+            size_t length = 0;
+            if (getenv_s(&length, text, "LEONIDA_TITLE_WINDOWS_MB") == 0 && length > 1)
+                state_.title_window_cap = std::strtoull(text, nullptr, 10) << 20;
+        }
         leonida::title_va_aliases().set_hooks(
             &state_,
             [](void* device, std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
