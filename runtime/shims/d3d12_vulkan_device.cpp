@@ -8177,7 +8177,10 @@ private:
         if (!heap || !desc) return finish(E_INVALIDARG);
         if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
                                                          acceleration_structures(), state_.uma)) {
-            log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")
+            log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), flags 0x" +
+                      [](UINT f) { char b[16]; std::snprintf(b, sizeof b, "%x", f); return std::string(b); }(
+                          UINT(desc->Flags)) +
+                      ", format " + std::to_string(int(desc->Format)) + ", dimension")
                          .c_str(),
                      int(desc->Dimension));
             log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), flags")

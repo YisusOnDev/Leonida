@@ -3229,8 +3229,11 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
 
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
+    // Without unordered access on a depth-stencil texture, which the PC refuses with it (without_depth_stencil_uav):
+    // the title places a 768x768x6 R16_TYPELESS depth array with both and asserts at
+    // game_scarlett_master.exe+0x14a6390 on the refusal.
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
-        without_refused_combinations(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
+        without_depth_stencil_uav(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     if (!buffer) initial_state = pc_initial_layout(static_cast<std::uint32_t>(pc_desc.Flags), initial_state);
@@ -3253,7 +3256,12 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
         SUCCEEDED(self->real->QueryInterface(__uuidof(ID3D12Device10), &device10)) && device10) {
         D3D12_RESOURCE_DESC1 desc1{};
         std::memcpy(&desc1, &pc_desc, sizeof(pc_desc));  // DESC1 is DESC plus SamplerFeedbackMipRegion (zero)
-        const std::uint32_t layout = buffer ? 0xFFFFFFFFu : initial_state;  // a buffer is created UNDEFINED
+        std::uint32_t layout = buffer ? 0xFFFFFFFFu : initial_state;  // a buffer is created UNDEFINED
+        // The depth-stencil texture made without its unordered access (above) cannot start in the UNORDERED_ACCESS
+        // layout (3): it starts COMMON (0), which any texture may.
+        if (layout == 3 && (xbox_flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            !(pc_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            layout = 0;
         using Fn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC1*,
                                     std::uint32_t, const D3D12_CLEAR_VALUE*, void*, UINT, const DXGI_FORMAT*,
                                     const IID*, void**);
