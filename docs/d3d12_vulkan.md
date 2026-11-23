@@ -2822,6 +2822,12 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   validation error the unheld path could hit); the pipeline states and root signatures of its lists (copied from the
   recording before the application may `Reset` it, so releasing a PSO right after `ExecuteCommandLists` is fine).
   Resources are not kept: a resource released while a batch that names it is held fails that batch at release.
+  A fence released with no queue keeping it (an unheld `Signal` the GPU has not reached yet, nothing waiting for it
+  on a queue) still has submitted work that names its semaphore, so the semaphore goes through the deferred-deletion
+  tickets once every submission made before the release has completed (D3D-486), not `vkDestroySemaphore` at once
+  (`VUID-vkDestroySemaphore-semaphore-05149`). Case "fences released while queues use them" of
+  `d3d12_queue_handover_test` checks it behind a GPU gate of 64 MiB copies: A, a Signal and a Wait in flight; B, a
+  Wait not yet attached; C, a held Signal; D, a Signal alone in flight; readbacks exact and validation silent.
   Order against other work: a held `Signal(F, v)` released after an unheld `Signal(F, w)` with `w >= v` leaves the
   Vulkan signal out (timelines only increase; waits for `v` already pass), decided under the submit lock so the
   order of the checks is the order of the submissions, and the value counts as submitted only once the

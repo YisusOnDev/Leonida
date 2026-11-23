@@ -413,6 +413,7 @@ public:
         image,
         sparse_resource,
         buffer,
+        semaphore,  // a released fence's timeline semaphore (D3D-486)
         device_memory,
         acceleration_structure,
         framebuffer,
@@ -495,6 +496,9 @@ public:
                 break;
             case Kind::buffer:
                 vk.vkDestroyBuffer(device, reinterpret_cast<VkBuffer>(item.handle), nullptr);
+                break;
+            case Kind::semaphore:
+                vk.vkDestroySemaphore(device, reinterpret_cast<VkSemaphore>(item.handle), nullptr);
                 break;
             case Kind::device_memory:
                 vk.vkFreeMemory(device, reinterpret_cast<VkDeviceMemory>(item.handle), nullptr);
@@ -1739,10 +1743,15 @@ public:
             semaphore_ = VK_NULL_HANDLE;
         if (semaphore_) context.holds().add_fence(semaphore_, initial);
     }
+    // The fence is released, but submissions made so far may still signal or wait for its semaphore (D3D12 lets an
+    // application release a fence it has just asked a queue to Signal, and a D3D12 queue only pins the fences of its
+    // held operations and pending Waits). remove_fence drops what the queues still hold on it, and the semaphore goes
+    // through the deletion queue once every submission made before has completed (D3D-486), not at once
+    // (VUID-vkDestroySemaphore-semaphore-05149).
     ~VulkanFence() {
         if (!semaphore_) return;
-        context_.holds().remove_fence(semaphore_);  // batches held on it can never run: dropped and reported
-        context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
+        context_.holds().remove_fence(semaphore_);
+        context_.defer_destroy(DeferredDeletionQueue::Kind::semaphore, semaphore_);
     }
     VulkanFence(const VulkanFence&) = delete;
     VulkanFence& operator=(const VulkanFence&) = delete;

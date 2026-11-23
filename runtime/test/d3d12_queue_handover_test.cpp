@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -385,6 +386,140 @@ bool cpu_gate(Rig& rig, Type producer, Type consumer, bool signal_first, int see
     return c.wait_fence(2, 1) && c.verify();
 }
 
+// Fences released while queues still use them (D3D-486). The COPY queue runs a gate of 64 MiB copies (about 300 ms,
+// sized from a timed run) before each Signal below, so the GPU has not reached it when the fence goes:
+//   A. Signal(f, 1) submitted behind the gate and a DIRECT Wait(f, 1) submitted before stage[0] -> readback; f is
+//      released at once. Its semaphore must outlive both submissions (VUID-vkDestroySemaphore-semaphore-05149).
+//   B. A DIRECT Wait(f, 1) not yet attached to a batch when f is released; the next ExecuteCommandLists then runs
+//      after the gate (the queue keeps f alive for its pending Wait) and must not name a destroyed semaphore.
+//   C. A Signal(f, 1) the DIRECT queue holds behind a batch that waits for a fence the CPU signals later; f is
+//      released, then the CPU Signal releases the batch and the Signal, which must not name a destroyed semaphore.
+//   D. Signal(f, 1) submitted behind the gate with no Wait for it; f is released at once. No queue pins f, so only
+//      the deferred destruction of its semaphore keeps it alive until the Signal has run.
+// Every readback is compared with the data, and validation (LEONIDA_VK_VALIDATION=1) must stay silent.
+bool fence_released_in_flight(Rig& rig, int seed) {
+    arm("fences released while queues use them", 30000);
+    constexpr UINT64 gate_bytes = 64ull << 20;
+    ComPtr<ID3D12Resource> gate_src, gate_dst;
+    const D3D12_HEAP_PROPERTIES up{D3D12_HEAP_TYPE_UPLOAD}, def{D3D12_HEAP_TYPE_DEFAULT};
+    const auto gate_desc = buffer_desc(gate_bytes);
+    const auto generic_read = D3D12_RESOURCE_STATE_GENERIC_READ;
+    if (FAILED(rig.device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &gate_desc, generic_read, nullptr,
+                                                   IID_PPV_ARGS(&gate_src))) ||
+        FAILED(rig.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &gate_desc, D3D12_RESOURCE_STATE_COMMON,
+                                                   nullptr, IID_PPV_ARGS(&gate_dst)))) {
+        std::fprintf(stderr, "fence release case: gate buffers\n");
+        return false;
+    }
+    std::vector<ComPtr<ID3D12CommandAllocator>> allocators;
+    std::vector<ComPtr<ID3D12GraphicsCommandList>> lists;
+    ID3D12CommandQueue* copy = rig.queues[copy_q][0].Get();
+    ID3D12CommandQueue* direct = rig.queues[direct_q][0].Get();
+    // `copies` 64 MiB copies on the COPY queue, each between COMMON -> COPY_DEST and back.
+    const auto gate = [&](UINT copies) {
+        ComPtr<ID3D12CommandAllocator> alloc;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        if (FAILED(rig.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&alloc))) ||
+            FAILED(rig.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, alloc.Get(), nullptr,
+                                                 IID_PPV_ARGS(&list))))
+            return false;
+        const auto in = transition(gate_dst.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        const auto out = transition(gate_dst.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        for (UINT i = 0; i < copies; ++i) {
+            list->ResourceBarrier(1, &in);
+            list->CopyBufferRegion(gate_dst.Get(), 0, gate_src.Get(), 0, gate_bytes);
+            list->ResourceBarrier(1, &out);
+        }
+        if (FAILED(list->Close())) return false;
+        allocators.push_back(alloc);
+        lists.push_back(list);
+        ID3D12CommandList* batch[] = {list.Get()};
+        copy->ExecuteCommandLists(1, batch);
+        return true;
+    };
+    const auto make_fence = [&] {
+        ComPtr<ID3D12Fence> f;
+        if (FAILED(rig.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f)))) return ComPtr<ID3D12Fence>();
+        return f;
+    };
+
+    // Two copies, timed, size the gate.
+    UINT copies = 2;
+    {
+        Case c(rig, seed);
+        const auto start = std::chrono::steady_clock::now();
+        if (!gate(2) || FAILED(copy->Signal(c.fence(0), 1)) || !c.wait_fence(0, 1))
+            return c.fail("gate calibration", __LINE__);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        copies = std::clamp(UINT(600 / std::max(std::chrono::duration<double, std::milli>(elapsed).count(), 0.5)) + 1,
+                            2u, 400u);
+    }
+
+    {  // A
+        Case c(rig, seed);
+        if (!c.make_resources() || !c.submit({copy_q, 0, nullptr, &c.stage[0], 3, {}, 0}) || !c.wait_fence(0, 1))
+            return false;
+        ComPtr<ID3D12Fence> f = make_fence();
+        ID3D12GraphicsCommandList* read = c.make_list(direct_q, &c.stage[0], nullptr, 3);
+        if (!f || !read || !gate(copies) || FAILED(copy->Signal(f.Get(), 1)) || FAILED(direct->Wait(f.Get(), 1)))
+            return c.fail("A: setup", __LINE__);
+        ID3D12CommandList* batch[] = {read};
+        direct->ExecuteCommandLists(1, batch);
+        if (FAILED(direct->Signal(c.fence(2), 1))) return c.fail("A: Signal", __LINE__);
+        if (f->GetCompletedValue() != 0) return c.fail("A: the gate opened before the release", __LINE__);
+        f.Reset();
+        ++cases_run;
+        if (!c.wait_fence(2, 1) || !c.verify()) return false;
+    }
+    {  // B
+        Case c(rig, seed + 1);
+        if (!c.make_resources() || !c.submit({copy_q, 0, nullptr, &c.stage[0], 3, {}, 0}) || !c.wait_fence(0, 1))
+            return false;
+        ComPtr<ID3D12Fence> f = make_fence();
+        ID3D12GraphicsCommandList* read = c.make_list(direct_q, &c.stage[0], nullptr, 3);
+        if (!f || !read || !gate(copies) || FAILED(copy->Signal(f.Get(), 1)) || FAILED(direct->Wait(f.Get(), 1)))
+            return c.fail("B: setup", __LINE__);
+        f.Reset();
+        ID3D12CommandList* batch[] = {read};
+        direct->ExecuteCommandLists(1, batch);
+        if (FAILED(direct->Signal(c.fence(2), 1))) return c.fail("B: Signal", __LINE__);
+        ++cases_run;
+        if (!c.wait_fence(2, 1) || !c.verify()) return false;
+    }
+    {  // C
+        Case c(rig, seed + 2);
+        if (!c.make_resources() || !c.submit({copy_q, 0, nullptr, &c.stage[0], 3, {}, 0}) || !c.wait_fence(0, 1))
+            return false;
+        ComPtr<ID3D12Fence> f = make_fence();
+        ID3D12GraphicsCommandList* read = c.make_list(direct_q, &c.stage[0], nullptr, 3);
+        if (!f || !read || FAILED(direct->Wait(c.fence(3), 1))) return c.fail("C: setup", __LINE__);
+        ID3D12CommandList* batch[] = {read};
+        direct->ExecuteCommandLists(1, batch);  // held on the layer: fence 3 has no Signal yet
+        if (FAILED(direct->Signal(f.Get(), 1)) || FAILED(direct->Signal(c.fence(2), 1)))
+            return c.fail("C: Signal", __LINE__);
+        f.Reset();
+        if (FAILED(c.fence(3)->Signal(1))) return c.fail("C: CPU Signal", __LINE__);
+        ++cases_run;
+        if (!c.wait_fence(2, 1) || !c.verify()) return false;
+    }
+    {  // D
+        Case c(rig, seed + 3);
+        ComPtr<ID3D12Fence> f = make_fence();
+        if (!f || !gate(copies) || FAILED(copy->Signal(f.Get(), 1))) return c.fail("D: setup", __LINE__);
+        if (f->GetCompletedValue() != 0) return c.fail("D: the gate opened before the release", __LINE__);
+        f.Reset();
+        if (FAILED(copy->Signal(c.fence(2), 1))) return c.fail("D: Signal", __LINE__);
+        ++cases_run;
+        if (!c.wait_fence(2, 1)) return false;
+    }
+    // Let the last gate finish before its lists go.
+    Case end(rig, seed);
+    if (FAILED(copy->Signal(end.fence(0), 1)) || !end.wait_fence(0, 1)) return end.fail("end", __LINE__);
+    std::printf("fences released while in use (gate of %u copies): A Signal and Wait in flight, B Wait not yet "
+                "attached, C held Signal, D Signal alone in flight: every readback exact\n", copies);
+    return true;
+}
+
 // Runs `body` with stderr redirected to a file and returns what it wrote.
 std::string capture_stderr(const std::function<void()>& body) {
     char dir[MAX_PATH], path[MAX_PATH];
@@ -693,6 +828,7 @@ bool run_all(ID3D12Device* device, bool layer) {
     for (int p = 0; p < 3; ++p)
         for (int q = 0; q < 3; ++q)
             for (bool first : {true, false}) ok &= cpu_gate(rig, Type(p), Type(q), first, ++seed);
+    ok &= fence_released_in_flight(rig, ++seed);
     ok &= concurrent_signalling(rig, 200, seed += 1000);
     if (layer) {
         // The layer hands out a limited number of VkQueues: give the spare ones back for the two cases below.
