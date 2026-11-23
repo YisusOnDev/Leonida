@@ -135,6 +135,14 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
 }
 
 void test_virtual_query(XMemVirtualQueryFn query) {
+    alignas(64) uint8_t null_out[64]{};
+    const SIZE_T null_written = query(nullptr, nullptr, null_out);
+    MEMORY_BASIC_INFORMATION null_info{};
+    std::memcpy(&null_info, null_out, sizeof(null_info));
+    check(null_written != 0 && null_info.State == MEM_FREE,
+          "XMemVirtualQuery at address zero reports free memory");
+    check(query(nullptr, nullptr, nullptr) == 0, "XMemVirtualQuery rejects a null output buffer");
+
     uint8_t local = 0;
     const void* const local_address = &local;
 

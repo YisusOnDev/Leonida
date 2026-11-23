@@ -113,7 +113,6 @@ static_assert(sizeof(MEMORY_BASIC_INFORMATION) <= kVirtualQueryOutSize,
 SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out) {
     if (!out) return 0;
     std::memset(out, 0, kVirtualQueryOutSize);
-    if (!address) return 0;
 
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true, std::memory_order_relaxed)) {
