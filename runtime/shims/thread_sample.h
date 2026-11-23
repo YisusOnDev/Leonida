@@ -14,11 +14,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <algorithm>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "startup_trace.h"
+#include "write_watch.h"
 
 namespace rt::thread_sample {
 
@@ -51,6 +54,45 @@ inline int capture(HANDLE thread, uint64_t (&frames)[kFrames]) {
     }
     ResumeThread(thread);
     return n;
+}
+
+// LEONIDA_PEEK="<hex addr>[@]:<hex len>,...": memory printed at every sample; a trailing @ reads the qword at the
+// address and dumps the memory it points to instead.
+inline void peek(double t) {
+    static const std::string spec = [] {
+        char buf[512]{};
+        return GetEnvironmentVariableA("LEONIDA_PEEK", buf, sizeof(buf)) ? std::string(buf) : std::string();
+    }();
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        size_t end = spec.find(',', pos);
+        if (end == std::string::npos) end = spec.size();
+        const std::string item = spec.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t colon = item.find(':');
+        if (colon == std::string::npos) continue;
+        std::string a = item.substr(0, colon);
+        const bool deref = !a.empty() && a.back() == '@';
+        if (deref) a.pop_back();
+        uint64_t at = std::strtoull(a.c_str(), nullptr, 16);
+        const size_t len = std::min<size_t>(std::strtoull(item.c_str() + colon + 1, nullptr, 16), 0x400);
+        SIZE_T got = 0;
+        if (deref && !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), &at, 8, &got)) at = 0;
+        std::vector<uint8_t> bytes(len);
+        const bool ok = at && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), bytes.data(),
+                                                len, &got) && got == len;
+        std::string line = "[rt] peek t=" + std::to_string(static_cast<int>(t)) + " " + item + " -> " +
+                           startup_trace::hex(at) + ":";
+        if (!ok) line += " unreadable";
+        for (size_t i = 0; ok && i < len; i += 8) {
+            uint64_t q = 0;
+            std::memcpy(&q, bytes.data() + i, std::min<size_t>(8, len - i));
+            char b[24];
+            std::snprintf(b, sizeof(b), "%s%016llx", i % 64 ? " " : "\n   ", static_cast<unsigned long long>(q));
+            line += b;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
 }
 
 inline void sample(double t) {
@@ -97,6 +139,8 @@ inline void start() {
             p = *end == ',' ? end + 1 : end;
         }
     }
+    if (GetEnvironmentVariableA("LEONIDA_WATCH_ADDR", buf, sizeof(buf)))
+        write_watch::watch_absolute(std::strtoull(buf, nullptr, 16));
     std::thread([at] {
         const auto t0 = std::chrono::steady_clock::now();
         size_t next = 0;
@@ -104,7 +148,7 @@ inline void start() {
             std::this_thread::sleep_until(t0 + std::chrono::seconds(tick));
             const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (tick % 5 == 0) std::fprintf(stderr, "[rt] tick t=%d s\n", tick);
-            while (next < at.size() && t >= at[next]) detail::sample(t), ++next;
+            while (next < at.size() && t >= at[next]) detail::peek(t), detail::sample(t), ++next;
         }
     }).detach();
 }

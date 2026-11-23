@@ -187,4 +187,15 @@ inline void note_region(void* result) {
     if (t) CloseHandle(t);
 }
 
+// LEONIDA_WATCH_ADDR=<hex address> (diagnostic): the same watchpoint on an absolute address, such as a global of the
+// title's image (mapped at its preferred base).
+inline void watch_absolute(uint64_t at) {
+    if (!at) return;
+    detail::address.store(at);
+    AddVectoredExceptionHandler(1, &detail::handler);
+    std::fprintf(stderr, "[rt] watch: watching writes to %llx\n", static_cast<unsigned long long>(at));
+    const HANDLE t = CreateThread(nullptr, 0, &detail::armer, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+}
+
 }  // namespace rt::write_watch
