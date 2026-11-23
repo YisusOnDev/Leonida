@@ -14,6 +14,7 @@
 // locally at a title's call sites (each function says which). The page functions are built on the Windows placeholder
 // APIs (VirtualAlloc2, MapViewOfFile3), whose flags the title's own XMemVirtualAlloc calls already use.
 #include <windows.h>
+#include "xmem_placeholder.h"
 #include <intrin.h>
 #include <malloc.h>
 #include <psapi.h>
@@ -294,7 +295,7 @@ bool isolate_placeholder(void* address, SIZE_T size) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return false;
     }
-    if (info.AllocationBase == address && info.RegionSize == size) return true;
+    if (xmem_placeholder_exact(info, address, size)) return true;
     return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
 }
 

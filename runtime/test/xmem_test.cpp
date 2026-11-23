@@ -21,6 +21,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "xmem_placeholder.h"
 
 namespace {
 
@@ -368,6 +369,40 @@ struct PhysicalApi {
     XMemMapPhysicalPagesScatterFn scatter;
 };
 
+void test_two_page_placeholder(const PhysicalApi& api) {
+    MEMORY_BASIC_INFORMATION tail{};
+    tail.AllocationBase = reinterpret_cast<void*>(uintptr_t{0x10000});
+    tail.BaseAddress = reinterpret_cast<void*>(uintptr_t{0x20000});
+    tail.RegionSize = kPage64k;
+    check(xmem_placeholder_exact(tail, tail.BaseAddress, kPage64k),
+          "a split tail placeholder is already isolated despite its allocation base");
+    auto* window = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    const bool allocated = api.allocate(0x280, &count, pages) && count == 2;
+    check(window && allocated, "two-page regression setup succeeds");
+    if (!window || !allocated) return;
+    SetLastError(ERROR_SUCCESS);
+    const bool mapped = api.map(window, 2, pages) == window;
+    check(mapped, "two physical pages map into a 128 KiB window");
+    if (mapped) {
+        window[0] = 0x51;
+        window[kPage64k] = 0xa7;
+        check(window[0] == 0x51 && window[kPage64k] == 0xa7, "both mapped pages are writable and readable");
+    } else {
+        check(false, "both mapped pages are writable and readable");
+    }
+    void* outside = VirtualAlloc(nullptr, kPage64k, MEM_RESERVE, PAGE_NOACCESS);
+    SetLastError(ERROR_SUCCESS);
+    const bool rejected = outside && !api.map(outside, 1, pages) && GetLastError() == ERROR_INVALID_ADDRESS;
+    check(rejected, "mapping outside a window fails with ERROR_INVALID_ADDRESS");
+    if (outside) VirtualFree(outside, 0, MEM_RELEASE);
+    api.map(window, 2, nullptr);
+    api.free_pages(2, pages);
+    VirtualFree(window, 0, MEM_RELEASE);
+}
+
 // Physical pages in a 64 KiB-page window, as the measured callers use them: reserve a window, allocate pages, map them,
 // remap them elsewhere and in another order, unmap, free.
 void test_physical_pages(const PhysicalApi& api) {
@@ -392,7 +427,9 @@ void test_physical_pages(const PhysicalApi& api) {
     }
     check(numbers_ok, "page numbers are distinct non-zero multiples of 16 below 2^25");
 
-    check(api.map(window, kPages, pages) == window, "XMemMapPhysicalPages returns the address it mapped");
+    const bool mapped = api.map(window, kPages, pages) == window;
+    check(mapped, "XMemMapPhysicalPages returns the address it mapped");
+    if (!mapped) return;
     for (uint64_t i = 0; i < kPages; ++i) fill_page(window + i * kPage64k, 0x1000u * static_cast<uint32_t>(i + 1));
     {
         MEMORY_BASIC_INFORMATION info{};
@@ -775,6 +812,7 @@ int main() {
     if (alloc_default && free_default) test_default_alloc(alloc, free_mem, alloc_default, free_default);
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
+        test_two_page_placeholder(physical);
         test_physical_pages(physical);
         test_placeholders(physical);
         test_write_combine_window(physical);
