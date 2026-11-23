@@ -486,7 +486,33 @@ void test_physical_pages(const PhysicalApi& api) {
     const uint64_t bogus = 0x1fffff0;  // the highest page number, far above the few this test allocates
     check(api.map(window, 1, &bogus) == nullptr, "mapping a page number that was never allocated fails");
 
+    // A call that fails on a bad entry changes nothing, even where the entries before it were good.
+    // Page 0 holds the word written above; a read through an unmapped page would fault, so look first.
+    const auto marked = [&] { return !reserved_only(window) && read_u32(window, 4) == 0xfeedf00d; };
+    check(api.map(window, 1, &pages[0]) == window, "map page 0 back into the first window");
+    const uint64_t good_then_bad[2] = {pages[1], bogus};
+    SetLastError(ERROR_SUCCESS);
+    check(api.map(window, 2, good_then_bad) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "a map with an unknown page number after a good one fails");
+    check(marked(), "and the page it would have replaced is still mapped");
+    void* const scatter_at[2] = {window + kPage64k, window};
+    const uint64_t scatter_bad[2] = {pages[1], bogus};
+    check(api.scatter(scatter_at, 2, scatter_bad) == FALSE && GetLastError() == ERROR_INVALID_PARAMETER,
+          "a scatter with an unknown page number fails");
+    check(reserved_only(window + kPage64k) && marked(), "and maps or unmaps none of its entries");
+    void* const scatter_misaligned[2] = {window, window + kPage64k + 0x1000};
+    check(api.scatter(scatter_misaligned, 2, nullptr) == FALSE && marked(),
+          "an unaligned scatter entry fails before the unmap of the entries before it");
+    check(api.map(window, 1, nullptr) == window, "unmap the first window");
+
     check(api.map(second, kPages, nullptr) == second, "unmap the second window");
+    const uint64_t free_bad[2] = {pages[0], bogus};
+    check(api.free_pages(2, free_bad) == FALSE && GetLastError() == ERROR_INVALID_PARAMETER,
+          "freeing a live page with an unknown one fails");
+    const uint64_t free_twice[2] = {pages[0], pages[0]};
+    check(api.free_pages(2, free_twice) == FALSE, "freeing one page twice in a call fails");
+    check(api.map(window, 1, &pages[0]) == window && api.map(window, 1, nullptr) == window,
+          "and neither failed call freed the live page");
     check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees the pages");
     check(api.free_pages(1, pages) == FALSE, "freeing a page twice fails");
 

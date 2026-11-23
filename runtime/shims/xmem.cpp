@@ -31,6 +31,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -572,6 +573,10 @@ DWORD view_protect(const Window& window) {
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
 
+// With g_phys_mutex held: 0 (unmap) or a live page number. Checked for a whole call before it changes anything, since
+// map_page unmaps the address before it maps the new page.
+bool known_page(uint64_t page) { return page == 0 || g_pages.count(page) != 0; }
+
 // gta6rt --trace FILE: the first XMemAllocatePhysicalPages for each distinct attribute word goes to the startup trace
 // as an "xmem_physical_pages" event with the page count and the caller.
 void note_physical_attributes(uint64_t attributes, uint64_t count, const void* caller) {
@@ -647,21 +652,24 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
 
 // BOOL XMemFreePhysicalPages(UINT64 pageCount, UINT64* pageArray). Measured at three call sites: RCX is the count (the
 // one XMemAllocatePhysicalPages returned, or the sum of several allocations), RDX the array. The callers unmap the
-// pages first; a page that is still mapped keeps its memory until it is unmapped. FALSE, with the entries before it
-// freed, for a number that is not a live page.
+// pages first; a page that is still mapped keeps its memory until it is unmapped. FALSE, with nothing freed, when an
+// entry is not a live page or appears twice.
 BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_array) {
     if (page_count && !page_array) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     const std::lock_guard lock(g_phys_mutex);
+    std::unordered_set<uint64_t> seen;
+    seen.reserve(static_cast<size_t>(page_count));
     for (uint64_t i = 0; i < page_count; ++i) {
-        const auto it = g_pages.find(page_array[i]);
-        if (it == g_pages.end()) {
+        if (page_array[i] == 0 || !known_page(page_array[i]) || !seen.insert(page_array[i]).second) {
             SetLastError(ERROR_INVALID_PARAMETER);
             return FALSE;
         }
-        g_pages.erase(it);
+    }
+    for (uint64_t i = 0; i < page_count; ++i) {
+        g_pages.erase(page_array[i]);
         g_free_slots.push_back(page_array[i] / kFramesPerPage);
     }
     return TRUE;
@@ -673,7 +681,8 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // success. A page number of 0 in the array unmaps that one page.
 //
 // Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
-// without touching its neighbours. A failure part-way leaves the pages before it mapped.
+// without touching its neighbours. An unknown page number fails the call before any page changes; a host failure
+// part-way leaves the pages before it mapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
@@ -697,6 +706,12 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         SetLastError(ERROR_INVALID_ADDRESS);
         return nullptr;
     }
+    for (uint64_t i = 0; i < page_count; ++i) {
+        if (!known_page(page_array[i])) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+    }
     const DWORD protect = view_protect(*window);
     for (uint64_t i = 0; i < page_count; ++i) {
         if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
@@ -707,7 +722,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
 // BOOL XMemMapPhysicalPagesScatter(PVOID* addresses, UINT32 pageCount, UINT64* pageArray). Measured at two call sites:
 // RCX is an array of addresses, EDX a 32-bit count, R8 the page for each address (an entry of 0, or a null array,
 // unmaps). The result is tested as a 32-bit BOOL. Like MapUserPhysicalPagesScatter: entry i maps pageArray[i] at
-// addresses[i].
+// addresses[i]. Every entry is checked before any page changes.
 BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_count, const uint64_t* page_array) {
     if (page_count && !addresses) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -718,23 +733,29 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
         return FALSE;
     }
     const std::lock_guard lock(g_phys_mutex);
+    std::vector<const Window*> windows(page_count);
     for (uint32_t i = 0; i < page_count; ++i) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
-        if (!aligned_page_address(address)) {
+        const uint64_t page = page_array ? page_array[i] : 0;
+        if (!aligned_page_address(address) || !known_page(page)) {
             SetLastError(ERROR_INVALID_PARAMETER);
             return FALSE;
         }
+        if (page == 0) continue;
+        windows[i] = find_window(address, kPhysicalPageSize);
+        if (!windows[i]) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return FALSE;
+        }
+    }
+    for (uint32_t i = 0; i < page_count; ++i) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
         const uint64_t page = page_array ? page_array[i] : 0;
         if (page == 0) {
             if (!unmap_page(address)) return FALSE;
             continue;
         }
-        const Window* const window = find_window(address, kPhysicalPageSize);
-        if (!window) {
-            SetLastError(ERROR_INVALID_ADDRESS);
-            return FALSE;
-        }
-        if (!map_page(address, page, view_protect(*window))) return FALSE;
+        if (!map_page(address, page, view_protect(*windows[i]))) return FALSE;
     }
     return TRUE;
 }
