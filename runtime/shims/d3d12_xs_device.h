@@ -151,6 +151,11 @@ using ResourceByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither. Without a provider slot
 // 70 writes only the null view.
 bool set_device_resource_provider(void* device, ResourceByVaProvider provider);
+// Private-data key (8 bytes, a console virtual address) that device slot 133 puts on a texture it creates. On the
+// console a placed texture's GetGPUVirtualAddress is the address it was placed at, which the title also reads as a
+// CPU pointer (it clears textures through it). The PC answer for a texture is 0, so a backend that honours this key
+// returns the stored address for a texture instead. {5d0f8a3c-2b71-4e96-9c4a-7e1b3d58a2f6}
+constexpr GUID kConsoleTextureVaGuid{0x5d0f8a3c, 0x2b71, 0x4e96, {0x9c, 0x4a, 0x7e, 0x1b, 0x3d, 0x58, 0xa2, 0xf6}};
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
 void* device_proxy_from_dxgi_device(void* dxgi_device);
 // The device proxy itself, given the proxy or its DXGI pointer; null for anything else.

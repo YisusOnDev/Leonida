@@ -3194,6 +3194,31 @@ D3D12_RESOURCE_STATES legacy_state_for_layout(std::uint32_t layout, bool buffer)
     }
 }
 
+// On the console a placed texture's GetGPUVirtualAddress is the address it was placed at, and the title reads that
+// back as a CPU pointer: game_scarlett_master.exe+0x2913410 stores it (through +0x4fd2940, resource slot 11) and
+// +0x5ebea10 clears w*h*4 bytes through it every frame. The PC answer for a texture is 0, which became a null memset.
+// The created texture keeps `va` under kConsoleTextureVaGuid; a backend that honours the key (the Vulkan layer)
+// answers it from GetGPUVirtualAddress. What the title writes there stays in its memory: nothing reaches the image.
+void tag_console_texture_va(void* object, std::uint64_t va) {
+    if (!object || !va) return;
+    ID3D12Object* tagged = nullptr;
+    if (FAILED(static_cast<IUnknown*>(object)->QueryInterface(__uuidof(ID3D12Object),
+                                                              reinterpret_cast<void**>(&tagged))) ||
+        !tagged)
+        return;
+    tagged->SetPrivateData(kConsoleTextureVaGuid, sizeof(va), &va);
+    tagged->Release();
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+        MEMORY_BASIC_INFORMATION info{};
+        const bool known = VirtualQuery(reinterpret_cast<const void*>(va), &info, sizeof(info)) != 0;
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 texture keeps its console address 0x%llx for GetGPUVirtualAddress "
+                     "(state=0x%lx protect=0x%lx)\n",
+                     static_cast<unsigned long long>(va), known ? info.State : 0ul, known ? info.Protect : 0ul);
+    }
+}
+
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
                                        std::uint32_t initial_state, const D3D12_CLEAR_VALUE* clear_value,
                                        const IID* riid, void** out) {
@@ -3219,7 +3244,6 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
                      "created committed, not backed by the VA\n",
                      static_cast<int>(pc_desc.Dimension), xbox_flags, static_cast<unsigned>(pc_desc.Flags),
                      initial_state);
-    (void)va;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
     const D3D12_CLEAR_VALUE* const clear = clearable ? clear_value : nullptr;
@@ -3239,6 +3263,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
                                   riid, out);
         static_cast<IUnknown*>(device10)->Release();
         if (FAILED(hr)) log_refused_resource(133, hr, pc_desc, xbox_flags);
+        else if (!buffer) tag_console_texture_va(*out, va);
         return hr;
     }
 #endif
@@ -3246,6 +3271,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
                                                            legacy_state_for_layout(initial_state, buffer), clear,
                                                            *riid, out);
     if (FAILED(hr)) log_refused_resource(133, hr, pc_desc, xbox_flags);
+    else if (!buffer) tag_console_texture_va(*out, va);
     return hr;
 }
 

@@ -2177,7 +2177,26 @@ public:
     // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors). An acceleration
     // structure reports its real device address (instance descriptors and builds hand it to the driver); other
     // buffers report their console VA into the GPU address arena.
-    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+    // A texture the console path created at a title address (device slot 133, rt::d3d12_xs::kConsoleTextureVaGuid)
+    // reports that address, as the console does: the title reads it back as a CPU pointer to clear the texture
+    // (game_scarlett_master.exe+0x4fd2940 -> memset at +0x5ebea33). The CPU writes land in the title's memory, not in
+    // the image: nothing copies them over yet.
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        if (accel_) return gpu_va_;
+        if (va_ || desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return va_;
+        std::uint64_t console_va = 0;
+        UINT size = sizeof(console_va);
+        if (FAILED(GetPrivateData(rt::d3d12_xs::kConsoleTextureVaGuid, &size, &console_va)) ||
+            size != sizeof(console_va))
+            console_va = 0;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12: GetGPUVirtualAddress on a texture (%ux%u format %d) -> 0x%llx%s\n",
+                         unsigned(desc_.Width), desc_.Height, int(desc_.Format),
+                         static_cast<unsigned long long>(console_va),
+                         console_va ? " (console address from slot 133)" : " (none: D3D12 answers 0)");
+        return console_va;
+    }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
