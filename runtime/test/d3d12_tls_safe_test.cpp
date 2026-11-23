@@ -217,7 +217,9 @@ bool exercise_queue_holds() {
     holds.pump_ready();
     CHECK(holder.release_calls == 1);
     CHECK(barrier_runs == 1);
-    CHECK(holder.discard_calls == 0);
+    // remove_fence(2) from inside release_ready is seen as in_pump(): the queues forget the fence right there
+    // (queue_holds.h, D3D-496), once, instead of waiting for the pump lock this thread holds.
+    CHECK(holder.discard_calls == 1);
 
     holds.remove_fence(1);
     holds.detach(&holder);

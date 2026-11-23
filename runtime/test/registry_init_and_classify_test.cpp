@@ -109,8 +109,8 @@ int main() {
     check(rt::shims::classify_import("dstorage.dll", "DStorageGetFactory") == ReturnClass::HResult &&
               rt::shims::classify_import("dstorage_xs.dll", "DStorageGetFactory") == ReturnClass::HResult,
           "dstorage.dll and dstorage_xs.dll DStorageGetFactory stay HResult");
-    check(rt::shims::classify_import("acphal.dll", "AcpHalCreate") == ReturnClass::Other &&
-              rt::shims::classify_import("xg_xs.dll", "XGCreateTexture2DComputer") == ReturnClass::Other,
+    // acphal.dll is measured here (registry.cpp classifies its HRESULT exports); xg_xs.dll is not.
+    check(rt::shims::classify_import("xg_xs.dll", "XGCreateTexture2DComputer") == ReturnClass::Other,
           "unmeasured console DLLs remain ReturnClass::Other");
 
     // 3. Unimplemented thunk execution under Fail policy verifies E_NOTIMPL for XCRDAPI.dll!DStorageGetFactory.

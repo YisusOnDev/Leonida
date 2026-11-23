@@ -312,9 +312,10 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 out.push_back(x);
             }
         } else if (type == 1) {  // fixed Huffman
-inline constexpr std::uint8_t kRev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
-
-inline constexpr bool build_huffman(Huffman& h, const std::int16_t* lengths, int n) {
+            if (const ZlibError e = detail::inflate_codes(reader, out, detail::kFixedHuffmanTables.litlen,
+                                                          detail::kFixedHuffmanTables.dist, limit);
+                e != ZlibError::none)
+                return fail(e);
         } else if (type == 2) {  // dynamic Huffman
             const int literal_count = int(reader.bits(5)) + 257, distance_count = int(reader.bits(5)) + 1;
             const int code_count = int(reader.bits(4)) + 4;
