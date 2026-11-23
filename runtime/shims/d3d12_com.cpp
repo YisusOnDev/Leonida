@@ -26,6 +26,19 @@
 
 namespace rt::d3d12 {
 
+// LEONIDA_DEBUG_CLEAR=1 (docs/boot.md): a bring-up switch that turns every all-zero ClearRenderTargetView into opaque
+// magenta, so a target the frame's draws leave black can be told apart from one no draw reached. Read when a command
+// list is made; the first list made with it says so.
+static bool debug_clear_setting() {
+    char text[8] = {};
+    std::size_t length = 0;
+    const bool on = getenv_s(&length, text, sizeof(text), "LEONIDA_DEBUG_CLEAR") == 0 && length > 1 && text[0] != '0';
+    static std::atomic<bool> logged{false};
+    if (on && !logged.exchange(true))
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_DEBUG_CLEAR: all-zero render-target clears are opaque magenta\n");
+    return on;
+}
+
 struct TileGrid {
     std::uint64_t columns = 0;
     std::uint64_t rows = 0;
@@ -199,7 +212,7 @@ class GraphicsCommandList final
 public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
-    explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
+    explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type), debug_clear_(debug_clear_setting()) {}
     ~GraphicsCommandList() override {
         stop_recording();
         release_held();
@@ -732,8 +745,11 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        const bool magenta = debug_clear_ && !color[0] && !color[1] && !color[2] && !color[3];
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
-                                        {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
+                                        magenta ? leonida::ClearColor{1, 0, 1, 1}
+                                                : leonida::ClearColor{color[0], color[1], color[2], color[3]},
+                                        to_rects(count, rects)));
     }
 
     void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
@@ -1288,6 +1304,7 @@ private:
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
+    bool debug_clear_ = false;  // LEONIDA_DEBUG_CLEAR, read when the list was made
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
