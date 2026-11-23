@@ -391,6 +391,23 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                          D3D12_RESOURCE_STATE_PRESENT, nullptr,
                                                          IID_PPV_ARGS(&back_buffer.p))));
+        // Unsupported image shapes must be refused before Vulkan acquires or blits an image.
+        Ref<ID3D12Resource> msaa, volume;
+        D3D12_RESOURCE_DESC unsupported = desc;
+        unsupported.SampleDesc.Count = 4;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &unsupported,
+                                                         D3D12_RESOURCE_STATE_PRESENT, nullptr,
+                                                         IID_PPV_ARGS(&msaa.p))));
+        unsupported = desc;
+        unsupported.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        unsupported.DepthOrArraySize = 2;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &unsupported,
+                                                         D3D12_RESOURCE_STATE_PRESENT, nullptr,
+                                                         IID_PPV_ARGS(&volume.p))));
+        EXPECT(FAILED(presenter->present(msaa.p, 0)));
+        EXPECT(FAILED(presenter->present(volume.p, 0)));
+        EXPECT(presenter->presented() == 0);
+
         device->CreateRenderTargetView(back_buffer.p, nullptr, rtv);
 
         D3D12_RESOURCE_BARRIER barrier{};
