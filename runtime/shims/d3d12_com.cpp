@@ -80,6 +80,14 @@ void note_once(const char* what) {
     if (seen.insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
 }
 
+// Every ReplayResult needs a case: a missing one is a compile error (MSVC C4062, clang -Wswitch), not a "?" in the log.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4062)
+#endif
 const char* name(leonida::ReplayResult result) {
     switch (result) {
     case leonida::ReplayResult::success: return "success";
@@ -88,6 +96,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_subresource: return "invalid subresource";
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
+    case leonida::ReplayResult::invalid_predication: return "invalid predication buffer or offset";
     case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
     case leonida::ReplayResult::invalid_draw: return "draw kind does not match the pipeline (mesh or vertex)";
@@ -96,6 +105,11 @@ const char* name(leonida::ReplayResult result) {
     }
     return "?";
 }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 // The label of a SetMarker/BeginEvent call, as UTF-8. Metadata says what the data is (WinPixEventRuntime's
 // pix3_win.h: PIX_EVENT_UNICODE_VERSION 0, a UTF-16 string; PIX_EVENT_ANSI_VERSION 1, an ANSI string;
