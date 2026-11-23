@@ -296,6 +296,9 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
   are refused with `E_INVALIDARG`. Also slot 67 with all four pairs (picked by kind 0), refused pairs, and the
   pipeline's console slot 11.
+- `d3d12_stub_compute_words_test` — `LEONIDA_STUB_COMPUTE_WORDS` (`docs/boot.md`): the same compute PSO is a
+  registered pipeline when unset, at a limit equal to its module's word count, at `0` and at values that are not a
+  word count, and an unregistered no-op stub at a limit below it; an untranslated program is still `E_INVALIDARG`.
 - `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
   bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
   the bindless set the layer binds.

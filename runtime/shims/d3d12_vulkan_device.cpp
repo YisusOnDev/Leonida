@@ -3987,6 +3987,22 @@ public:
         return S_OK;
     }
 
+    // LEONIDA_STUB_COMPUTE_WORDS=<n> (diagnostic): a compute pipeline whose translated module is over n SPIR-V words
+    // is created without a Vulkan pipeline, like a pipeline with no translated shader under LEONIDA_STUB_PIPELINES.
+    // Without a pipeline cache the driver compiles the largest translated modules for minutes on the title's threads,
+    // and loading waits behind them. Read at each call; 0 when unset, 0 or not a decimal number (off).
+    static std::size_t stub_compute_words() {
+        wchar_t v[20] = {};  // up to 19 digits, which fit in 64 bits
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_COMPUTE_WORDS", v, 20);
+        if (n == 0 || n >= 20) return 0;
+        std::size_t words = 0;
+        for (DWORD i = 0; i < n; ++i) {
+            if (v[i] < L'0' || v[i] > L'9') return 0;
+            words = words * 10 + std::size_t(v[i] - L'0');
+        }
+        return words;
+    }
+
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
@@ -4057,6 +4073,16 @@ public:
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
             return E_FAIL;
         }
+        // The stub is never registered, so SetPipelineState binds no compute pipeline with it: a dispatch with it is
+        // dropped (and invalidates its list) as any dispatch without one is. No shader module or layout is made.
+        if (const std::size_t limit = stub_compute_words(); limit && words.size() > limit) {
+            static std::atomic<unsigned> stubbed{0};
+            const unsigned n = ++stubbed;
+            if (n == 1 || (n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_STUB_COMPUTE_WORDS=%zu: compute module of %zu SPIR-V words "
+                                     "is a no-op stub (%u so far)\n", limit, words.size(), n);
+            return S_OK;
+        }
 
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module_info.codeSize = words.size() * 4;
@@ -4082,9 +4108,16 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
-            return E_FAIL;
+        const ULONGLONG compile_start = GetTickCount64();
+        const VkResult created =
+            vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline);
+        // One line per compile over 2 s, named by its program's hash: on a cold cache a single translated module can
+        // hold the driver for minutes (the threshold for LEONIDA_STUB_COMPUTE_WORDS is read off these lines).
+        if (const ULONGLONG ms = GetTickCount64() - compile_start; ms > 2000)
+            std::fprintf(stderr, "[rt] d3d12: slow compute pipeline compile: %llu ms, %zu SPIR-V words, program "
+                                 "sha256 %s, VkResult %d\n", ms, words.size(),
+                         leonida::sha256_hex(program.bytes).c_str(), int(created));
+        if (created != VK_SUCCESS) return E_FAIL;
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).

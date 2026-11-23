@@ -78,6 +78,13 @@ Useful switches:
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
+* `LEONIDA_STUB_COMPUTE_WORDS=<n>` creates a compute pipeline whose translated SPIR-V module is over `n` 32-bit words
+  as a no-op stub instead of compiling it. On a cold pipeline cache the driver can spend minutes on one of the
+  largest translated modules, on the thread that asked for it, and loading waits. The stub is never registered, so
+  `SetPipelineState` binds no compute pipeline: a dispatch with it is dropped and, like any dispatch without a
+  pipeline, makes that list's `Close` return `E_INVALIDARG`. Diagnostic only: what those shaders compute is missing. Each stub is logged with a power-of-two count, and every compute pipeline compile
+  over 2 s is logged with its time, word count and program hash, which is where a value for `n` comes from. Unset,
+  `0` or not a number is off.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
