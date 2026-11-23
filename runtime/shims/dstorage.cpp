@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -211,6 +212,40 @@ DSTORAGE_PRIORITY_STATS& priority_stats(DSTORAGE_STATS& s, DSTORAGE_PRIORITY p) 
 void count_error() {
     std::lock_guard lock(stats().mutex);
     ++stats().s.ErrorCount;
+}
+
+// Diagnostic counters (with --trace): entries enqueued and run per type, enqueues that waited for space and bytes
+// moved, printed every 5 s by a heartbeat thread when they changed, so a loading stall shows whether the title stops
+// asking, or asks and never sees an entry run.
+struct Heartbeat {
+    std::atomic<uint64_t> enqueued[4]{}, done[4]{}, waited{0}, failed{0}, bytes{0}, unsubmitted_calls{0};
+};
+Heartbeat& heartbeat() {
+    static auto* h = new Heartbeat;
+    return *h;
+}
+void start_heartbeat() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            uint64_t last[10]{};
+            for (int t = 5;; t += 5) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                Heartbeat& h = heartbeat();
+                const uint64_t now[10] = {h.enqueued[0], h.done[0], h.enqueued[1], h.done[1], h.enqueued[2],
+                                          h.done[2],     h.enqueued[3], h.done[3], h.waited,     h.failed};
+                if (std::memcmp(now, last, sizeof(now)) == 0) continue;
+                std::memcpy(last, now, sizeof(now));
+                std::fprintf(stderr,
+                             "[rt] dstorage: heartbeat +%d s: requests %llu/%llu run, status %llu/%llu, signal %llu/%llu, "
+                             "event %llu/%llu, enqueue waits %llu, failures %llu, %llu MiB written\n",
+                             t, (unsigned long long)now[0], (unsigned long long)now[1], (unsigned long long)now[2],
+                             (unsigned long long)now[3], (unsigned long long)now[4], (unsigned long long)now[5],
+                             (unsigned long long)now[6], (unsigned long long)now[7], (unsigned long long)now[8],
+                             (unsigned long long)now[9], (unsigned long long)(h.bytes.load() >> 20));
+            }
+        }).detach();
+    });
 }
 
 // ---- Live objects ---------------------------------------------------------------------------------------------------
@@ -664,8 +699,10 @@ private:
     size_t used_locked() const { return entries_.size() + (in_flight_ ? 1 : 0); }
 
     void enqueue(Entry&& e) {
+        heartbeat().enqueued[static_cast<int>(e.type)]++;
         {
             std::unique_lock lock(mutex_);
+            if (!(closing_ || used_locked() < usable())) heartbeat().waited++;
             // A full queue waits for the worker to free a slot. With auto-submit on, half the queue is always
             // submitted by then; with it off, only a Submit from another thread frees one (as the reference warns).
             space_.wait(lock, [&] { return closing_ || used_locked() < usable(); });
@@ -734,6 +771,8 @@ private:
     // Runs on the worker. since_notify_ is the first failure since the last status entry or fence signal: the
     // HRESULT a status entry reports.
     void process(Entry& e) {
+        heartbeat().done[static_cast<int>(e.type)]++;
+        if (e.type == Entry::Type::Request) heartbeat().bytes += e.request.DestinationSize;
         HRESULT hr = e.enqueue_error;
         switch (e.type) {
             case Entry::Type::Request:
@@ -764,6 +803,7 @@ private:
                 break;
         }
         if (FAILED(hr)) {
+            heartbeat().failed++;
             DSTORAGE_ERROR_FIRST_FAILURE f{};
             f.HResult = hr;
             describe(e, f);
@@ -1088,6 +1128,7 @@ private:
     HRESULT create_queue(const DSTORAGE_QUEUE_DESC1& desc, REFIID riid, void** ppv, const char* caller) {
         if (const HRESULT hr = validate_queue_desc(desc); FAILED(hr)) return bad_call(caller, hr, "invalid queue desc");
         if (!iid_policy().accept_creating(riid, Kind::Queue, caller)) return E_NOINTERFACE;
+        start_heartbeat();
         auto* q = new (std::nothrow) Queue(desc);
         if (!q) return E_OUTOFMEMORY;
         if (!q->start()) {

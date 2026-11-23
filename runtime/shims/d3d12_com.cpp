@@ -253,8 +253,20 @@ public:
     // reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
-        if (list_.queries_open()) invalid_ = true;
-        if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
+        if (list_.queries_open()) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: ID3D12GraphicsCommandList::Close with a query begun and not ended: "
+                                     "E_INVALIDARG (logged once)\n");
+            invalid_ = true;
+        }
+        if (!list_.close()) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: ID3D12GraphicsCommandList::Close on a list that is not recording "
+                                     "(already closed): E_FAIL (logged once)\n");
+            return d3d12_trace::result(method, E_FAIL);
+        }
         stop_recording();
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
     }

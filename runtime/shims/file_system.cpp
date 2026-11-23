@@ -26,6 +26,8 @@
 #include <intrin.h>
 
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -672,6 +674,20 @@ HANDLE open_file(const char* api, const void* caller, LPCWSTR name, DWORD access
         const DWORD error = GetLastError();
         note_open_failure(api, name, error, caller);
         SetLastError(error);
+    } else if (rt::startup_trace::enabled()) {
+        // Diagnostic: the first 4,000 successful opens, with their time, so a loading stall shows the last file.
+        static std::atomic<int> left{4000};
+        if (left.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            std::string utf8;
+            if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
+                utf8.resize(static_cast<size_t>(n) - 1);
+                WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+            }
+            rt::startup_trace::event("file_open", std::string("\"path\":") + rt::startup_trace::quote(utf8) +
+                                                      ",\"caller\":" +
+                                                      rt::startup_trace::quote(rt::startup_trace::where(
+                                                          reinterpret_cast<uint64_t>(caller))));
+        }
     }
     return h;
 }
@@ -1350,13 +1366,37 @@ using namespace rt::fs;
 // The title's reads into its own memory. The kernel writes the destination, which raises no fault in it: xmem's
 // physical pages, committed on the title's first touch, would fail the read with ERROR_NOACCESS while not committed
 // yet. So the destination is prepared first (rt::kernel_write::before; xmem commits its pages there).
+// Diagnostic (with --trace): ReadFile calls and bytes asked, as a "file_reads" trace event every 5 s when they changed.
+std::atomic<uint64_t> g_reads{0}, g_read_bytes{0};
+void count_read(DWORD bytes) {
+    if (!rt::startup_trace::enabled()) return;
+    g_reads.fetch_add(1, std::memory_order_relaxed);
+    g_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            uint64_t last = 0;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                const uint64_t n = g_reads.load();
+                if (n == last) continue;
+                last = n;
+                rt::startup_trace::event("file_reads", "\"calls\":" + std::to_string(n) + ",\"mib\":" +
+                                                           std::to_string(g_read_bytes.load() >> 20));
+            }
+        }).detach();
+    });
+}
+
 BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped) {
+    count_read(bytes);
     rt::kernel_write::before(buffer, bytes);
     return ::ReadFile(file, buffer, bytes, read, overlapped);
 }
 
 BOOL WINAPI read_file_ex(HANDLE file, LPVOID buffer, DWORD bytes, LPOVERLAPPED overlapped,
                          LPOVERLAPPED_COMPLETION_ROUTINE routine) {
+    count_read(bytes);
     rt::kernel_write::before(buffer, bytes);
     return ::ReadFileEx(file, buffer, bytes, overlapped, routine);
 }

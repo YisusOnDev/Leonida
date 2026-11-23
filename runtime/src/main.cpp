@@ -37,6 +37,7 @@
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
+#include "../shims/thread_sample.h"
 
 namespace {
 
@@ -163,6 +164,7 @@ int wmain(int argc, wchar_t** argv) {
                                                    : "error: cannot create the trace file\n");
         return 2;
     }
+    if (!trace_file.empty()) rt::thread_sample::start();
     // The console's Zen 2 instructions this CPU may lack (docs/cpu_features.md): emulated on #UD. Installed after the
     // trace's handler so it runs first, and an emulated instruction is not recorded as an exception.
     if (const auto host = rt::cpu_emulation::detect_host(); !host.sse4a || !host.clzero || !host.monitorx || !host.clwb)
