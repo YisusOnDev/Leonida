@@ -603,10 +603,10 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
         std::vector<leonida::Command> commands;
         CHECK(rt::d3d12::recorded_commands(direct.p, commands));
         const auto* draw = commands.empty() ? nullptr : std::get_if<leonida::Draw>(&commands.back());
-        CHECK(draw && draw->vertex_buffers[0].va == r.upload_va + vb_quad &&
-              draw->vertex_buffers[30].va == r.upload_va + vb_quad &&
-              draw->vertex_buffers[31].va == r.upload_va + vb_other &&
-              draw->vertex_buffers[29].va == 0);
+        CHECK(draw && draw->views && draw->views->vertex_buffers[0].va == r.upload_va + vb_quad &&
+              draw->views->vertex_buffers[30].va == r.upload_va + vb_quad &&
+              draw->views->vertex_buffers[31].va == r.upload_va + vb_other &&
+              draw->views->vertex_buffers[29].va == 0);
 
         auto* bundle = r.bundle(r.pso_a.p, [&](ID3D12GraphicsCommandList* b) {
             b->IASetPrimitiveTopology(strip);
@@ -633,10 +633,10 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
         draw = nullptr;
         for (const auto& command : commands)
             if (const auto* d = std::get_if<leonida::Draw>(&command)) draw = d;
-        CHECK(draw && draw->vertex_buffers[0].va == r.upload_va + vb_quad &&
-              draw->vertex_buffers[30].va == r.upload_va + vb_quad &&
-              draw->vertex_buffers[31].va == r.upload_va + vb_other &&
-              draw->vertex_buffers[29].va == 0);
+        CHECK(draw && draw->views && draw->views->vertex_buffers[0].va == r.upload_va + vb_quad &&
+              draw->views->vertex_buffers[30].va == r.upload_va + vb_quad &&
+              draw->views->vertex_buffers[31].va == r.upload_va + vb_other &&
+              draw->views->vertex_buffers[29].va == 0);
     }
     // The parent's commands hold the bundle's markers and draws where the bundle made them, between the parent's own.
     {

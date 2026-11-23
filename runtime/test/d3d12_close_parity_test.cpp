@@ -302,7 +302,7 @@ std::vector<Case> cases() {
         {"ResolveSubresource with the destination as the source", false, match,
          CALLS(e.list->ResolveSubresource(e.msaa.p, 0, e.msaa.p, 0, rgba))},
         // Input assembler, rasterizer, output merger
-        {"IASetVertexBuffers(30, 4): slots past 31", true, stricter,
+        {"IASetVertexBuffers(30, 4): slots past 31", true, match,
          CALLS(const D3D12_VERTEX_BUFFER_VIEW v[4] = {}; e.list->IASetVertexBuffers(30, 4, v))},
         {"IASetVertexBuffers(0, 0, nullptr)", true, match, CALLS(e.list->IASetVertexBuffers(0, 0, nullptr))},
         {"IASetIndexBuffer(nullptr)", true, match, CALLS(e.list->IASetIndexBuffer(nullptr))},
