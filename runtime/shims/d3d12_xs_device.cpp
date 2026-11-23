@@ -34,6 +34,7 @@
 #ifdef LEONIDA_VULKAN_DEVICE
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
 // WindowPresenter. Other builds of this file (mock and COM tests) keep the refused-slot behaviour.
+#include "title_window.h"
 #include "xbox_present.h"
 #endif
 
@@ -1303,9 +1304,11 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 
 struct PresentState {
     ~PresentState() {
-        if (window) DestroyWindow(window);  // the presentation and its window die with the device proxy
+        xbox.reset();                                     // the presenter's surface goes before its window
+        if (window && own_window) DestroyWindow(window);  // the title's own window is never ours to destroy
     }
     HWND window = nullptr;
+    bool own_window = false;  // true only for the fallback window made here when the title has none
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
 };
@@ -1326,20 +1329,36 @@ PresentState* present_state_for(DeviceProxy* device) {
     if (!state) return nullptr;
     device->present_state = state;
     state->tried = true;
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = present_window_proc;
-    window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
-        return state;
-    }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
-                                  window_class.hInstance, nullptr);
-    if (!state->window) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
-        return state;
+    // The title's own top-level window (shims/title_window.h, #8591) is where the frames belong; the fallback window
+    // below is only for a title that has none by its first PresentX.
+    state->window = rt::d3d12::find_title_window(GetCurrentProcessId());
+    if (state->window) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX presents into the title's window %p\n",
+                     static_cast<void*>(state->window));
+    } else {
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc = present_window_proc;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.lpszClassName = L"LeonidaPresentX";
+        if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW,
+                                        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+                                        window_class.hInstance, nullptr);
+        if (!state->window) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->own_window = true;
+        // Shown, or the frames go to a window nobody sees. LEONIDA_WINDOW_NO_ACTIVATE (window_placement.h) keeps the
+        // focus where it is; this file does not link window_placement.cpp, so the flag is read here.
+        wchar_t flag[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_WINDOW_NO_ACTIVATE", flag, 8);
+        const bool no_activate = n > 0 && n < 8 && flag[0] != L'0';
+        ShowWindow(state->window, no_activate ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL);
+        std::fprintf(stderr, "[rt] d3d12_xs: no visible title window at the first PresentX; showing a fallback window\n");
     }
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
