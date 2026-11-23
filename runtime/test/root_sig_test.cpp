@@ -491,6 +491,153 @@ void test_deserializer() {
     }
 }
 
+void write_u32(std::vector<uint8_t>& buf, size_t off, uint32_t v) {
+    buf[off + 0] = static_cast<uint8_t>(v);
+    buf[off + 1] = static_cast<uint8_t>(v >> 8);
+    buf[off + 2] = static_cast<uint8_t>(v >> 16);
+    buf[off + 3] = static_cast<uint8_t>(v >> 24);
+}
+
+std::vector<uint8_t> build_dxbc(const std::vector<std::pair<const char*, std::vector<uint8_t>>>& chunks) {
+    const size_t header_end = 32 + chunks.size() * 4;
+    std::vector<uint8_t> blob(header_end, 0);
+    blob[0] = 'D'; blob[1] = 'X'; blob[2] = 'B'; blob[3] = 'C';
+    write_u32(blob, 20, 1);  // DXBC version
+    write_u32(blob, 28, static_cast<uint32_t>(chunks.size()));
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const uint32_t off = static_cast<uint32_t>(blob.size());
+        write_u32(blob, 32 + i * 4, off);
+        const char* fourcc = chunks[i].first;
+        const auto& payload = chunks[i].second;
+        blob.insert(blob.end(), fourcc, fourcc + 4);
+        const size_t size_at = blob.size();
+        blob.resize(size_at + 4);
+        write_u32(blob, size_at, static_cast<uint32_t>(payload.size()));
+        blob.insert(blob.end(), payload.begin(), payload.end());
+    }
+    write_u32(blob, 24, static_cast<uint32_t>(blob.size()));
+    uint32_t hash[4]{};
+    rt::d3d12_xs::dxbc_checksum(blob.data(), blob.size(), hash);
+    std::memcpy(blob.data() + 4, hash, sizeof(hash));
+    return blob;
+}
+
+void test_rootsig_helper_hardening() {
+    // 1. Short RTS0 chunk (size 8 < 24) followed by another chunk must not overwrite the next chunk.
+    {
+        std::vector<uint8_t> stat_payload(24, 0);
+        write_u32(stat_payload, 4, kXboxFlags);  // sits at off0 + 8 + 20 if size=8 is ignored
+        auto blob = build_dxbc({{"RTS0", std::vector<uint8_t>(8, 0)}, {"STAT", stat_payload}});
+        std::vector<uint8_t> cleared;
+        const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(blob.data(), blob.size(), cleared);
+        check(!rewritten && cleared.empty(), "short RTS0 chunk (< 24 bytes) does not touch adjacent chunk");
+    }
+
+    // 2. Overrunning RTS0 chunk (declared size > remaining container bytes) must be rejected.
+    {
+        std::vector<uint8_t> rts0_payload(24, 0);
+        write_u32(rts0_payload, 20, kXboxFlags);
+        auto blob = build_dxbc({{"RTS0", rts0_payload}});
+        write_u32(blob, 36 + 4, 4096u);  // chunk_size claims 4096 bytes in a 68-byte container
+        std::vector<uint8_t> cleared;
+        const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(blob.data(), blob.size(), cleared);
+        check(!rewritten && cleared.empty(), "overrunning RTS0 chunk size is rejected");
+    }
+
+    // 3. Chunk offset pointing inside the DXBC header / chunk table (< 32 + 4 * count) must be rejected.
+    {
+        std::vector<uint8_t> blob(64, 0);
+        blob[0] = 'D'; blob[1] = 'X'; blob[2] = 'B'; blob[3] = 'C';
+        write_u32(blob, 20, 1);
+        write_u32(blob, 24, static_cast<uint32_t>(blob.size()));
+        write_u32(blob, 28, 1);
+        write_u32(blob, 32, 12);  // points inside the DXBC hash at bytes 4..19
+        std::memcpy(blob.data() + 12, "RTS0", 4);
+        write_u32(blob, 16, 24);
+        write_u32(blob, 40, kXboxFlags);  // 12 + 8 + 20 = 40
+        std::vector<uint8_t> cleared;
+        const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(blob.data(), blob.size(), cleared);
+        check(!rewritten && cleared.empty(), "RTS0 chunk offset inside DXBC header/table is rejected");
+    }
+
+    // 4. Multi-chunk container with >16 chunks (17 chunks, RTS0 at index 16) clears Xbox flags and deserializes.
+    {
+        D3D12_ROOT_SIGNATURE_DESC desc = make_legacy_desc(0);
+        Blobs blobs;
+        check(SUCCEEDED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blobs.blob, &blobs.error)) &&
+                  blobs.blob,
+              "serialize clean root signature for 17-chunk test");
+        if (blobs.blob) {
+            const uint8_t* src = static_cast<const uint8_t*>(blobs.blob->GetBufferPointer());
+            const SIZE_T src_size = blobs.blob->GetBufferSize();
+            uint32_t src_chunks = 0;
+            std::memcpy(&src_chunks, src + 28, 4);
+            std::vector<uint8_t> rts0_payload;
+            for (uint32_t i = 0; i < src_chunks; ++i) {
+                uint32_t off = 0;
+                std::memcpy(&off, src + 32 + i * 4, 4);
+                if (off + 8 <= src_size && std::memcmp(src + off, "RTS0", 4) == 0) {
+                    uint32_t psz = 0;
+                    std::memcpy(&psz, src + off + 4, 4);
+                    if (off + 8 + psz <= src_size) {
+                        rts0_payload.assign(src + off + 8, src + off + 8 + psz);
+                        write_u32(rts0_payload, 20, kXboxFlags);
+                    }
+                    break;
+                }
+            }
+            std::vector<std::pair<const char*, std::vector<uint8_t>>> chunks;
+            for (int i = 0; i < 16; ++i) chunks.push_back({"DUMY", {}});
+            chunks.push_back({"RTS0", rts0_payload});
+            auto multi = build_dxbc(chunks);
+            std::vector<uint8_t> cleared;
+            const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(multi.data(), multi.size(), cleared);
+            check(rewritten && !cleared.empty(), "17-chunk DXBC container rewrites RTS0 at chunk 16");
+            if (rewritten) {
+                ID3D12RootSignatureDeserializer* de = nullptr;
+                const HRESULT hr = D3D12CreateRootSignatureDeserializer(cleared.data(), cleared.size(), IID_PPV_ARGS(&de));
+                check(SUCCEEDED(hr) && de && de->GetRootSignatureDesc()->Flags == 0,
+                      "17-chunk cleared DXBC container deserializes cleanly with Flags == 0");
+                if (de) de->Release();
+            }
+        }
+    }
+
+    // 5. In-place self-aliasing downgrade_root_signature_1_2_to_1_1(&d.desc, storage, &d.desc).
+    {
+        Desc12 inplace;
+        std::vector<D3D12_STATIC_SAMPLER_DESC> storage;
+        const bool ok = rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(inplace.desc, storage, inplace.desc);
+        check(ok && inplace.desc.Version == D3D_ROOT_SIGNATURE_VERSION_1_1 &&
+                  inplace.desc.Desc_1_1.NumParameters == 1 &&
+                  inplace.desc.Desc_1_1.pParameters == &inplace.param &&
+                  inplace.desc.Desc_1_1.NumStaticSamplers == 2 &&
+                  inplace.desc.Desc_1_1.pStaticSamplers == storage.data() &&
+                  inplace.desc.Desc_1_1.Flags == D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT &&
+                  storage.size() == 2 && same_sampler(storage[0], inplace.samplers[0]) &&
+                  same_sampler(storage[1], inplace.samplers[1]),
+              "in-place self-aliasing 1.2 -> 1.1 downgrade preserves parameters, samplers, and flags");
+        Blobs b11;
+        check(SUCCEEDED(D3D12SerializeVersionedRootSignature(&inplace.desc, &b11.blob, &b11.error)),
+              "in-place downgraded 1.1 description is accepted by the PC serializer");
+    }
+
+    // 6. dxbc_checksum() guards short/null inputs and null output without underflow or OOB reads.
+    {
+        uint32_t hash[4] = {1, 2, 3, 4};
+        const uint8_t tiny[19]{};
+        rt::d3d12_xs::dxbc_checksum(tiny, sizeof(tiny), hash);
+        check(hash[0] == 0 && hash[1] == 0 && hash[2] == 0 && hash[3] == 0,
+              "dxbc_checksum zeroes output for blobs shorter than 20 bytes");
+        hash[0] = 9;
+        rt::d3d12_xs::dxbc_checksum(nullptr, 64, hash);
+        check(hash[0] == 0 && hash[1] == 0 && hash[2] == 0 && hash[3] == 0,
+              "dxbc_checksum zeroes output for null blob pointer");
+        rt::d3d12_xs::dxbc_checksum(tiny, sizeof(tiny), nullptr);
+        check(true, "dxbc_checksum ignores null output pointer");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -504,6 +651,7 @@ int main() {
     test_preserves_low_bits_and_unknown_versions();
     test_registered_shim(supports_1_2);
     test_deserializer();
+    test_rootsig_helper_hardening();
     std::printf("root_sig_test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;

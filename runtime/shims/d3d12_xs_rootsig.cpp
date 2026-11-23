@@ -42,6 +42,11 @@ void md5_block(uint32_t state[4], const uint32_t m[16]) {
 }  // namespace
 
 void dxbc_checksum(const uint8_t* blob, size_t size, uint32_t out[4]) {
+    if (!out) return;
+    if (!blob || size < 20 || size - 20 > UINT32_MAX) {
+        std::memset(out, 0, 16);
+        return;
+    }
     // MD5 with the DXBC tail: the bit count goes first in the last block and (bits >> 2) | 1 last, in place of
     // MD5's 64-bit length (the d3dcompiler container hash; vkd3d-shader and Wine use the same).
     const uint8_t* data = blob + 20;
@@ -109,13 +114,14 @@ bool downgrade_root_signature_1_2_to_1_1(const D3D12_VERSIONED_ROOT_SIGNATURE_DE
                        s.ComparisonFunc, s.BorderColor, s.MinLOD, s.MaxLOD, s.ShaderRegister, s.RegisterSpace,
                        s.ShaderVisibility};
     }
-    out = {};
-    out.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    out.Desc_1_1.NumParameters = desc.NumParameters;
-    out.Desc_1_1.pParameters = desc.pParameters;  // D3D12_ROOT_PARAMETER1 in both versions
-    out.Desc_1_1.NumStaticSamplers = desc.NumStaticSamplers;
-    out.Desc_1_1.pStaticSamplers = samplers.empty() ? nullptr : samplers.data();
-    out.Desc_1_1.Flags = desc.Flags;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC rewritten{};
+    rewritten.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    rewritten.Desc_1_1.NumParameters = desc.NumParameters;
+    rewritten.Desc_1_1.pParameters = desc.pParameters;  // D3D12_ROOT_PARAMETER1 in both versions
+    rewritten.Desc_1_1.NumStaticSamplers = desc.NumStaticSamplers;
+    rewritten.Desc_1_1.pStaticSamplers = samplers.empty() ? nullptr : samplers.data();
+    rewritten.Desc_1_1.Flags = desc.Flags;
+    out = rewritten;
     return true;
 }
 
@@ -126,7 +132,7 @@ void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& 
 
 bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<uint8_t>& out) {
     out.clear();
-    if (!data || size < 36) return false;
+    if (!data || size < 36 || size > UINT32_MAX) return false;
 
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
     // The host deserializer only consumes the DXBC container the serializer
@@ -135,14 +141,19 @@ bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<
 
     uint32_t chunk_count = 0;
     std::memcpy(&chunk_count, bytes + 28, sizeof(chunk_count));
-    if (chunk_count == 0 || chunk_count > 16 || 32 + chunk_count * 4 > size) return false;
+    if (chunk_count == 0 || chunk_count > 1024 || static_cast<size_t>(chunk_count) * 4 > size - 32) return false;
 
+    const size_t header_end = 32 + static_cast<size_t>(chunk_count) * 4;
     for (uint32_t i = 0; i < chunk_count; ++i) {
         uint32_t off = 0;
-        std::memcpy(&off, bytes + 32 + i * 4, sizeof(off));
+        std::memcpy(&off, bytes + 32 + static_cast<size_t>(i) * 4, sizeof(off));
         // Chunk header (FourCC + size) plus the fixed RTS0 header up to flags.
-        if (off > size || size - off < 8 + 24) continue;
+        if (off < header_end || off > size || size - off < 8 + 24) continue;
         if (std::memcmp(bytes + off, "RTS0", 4) != 0) continue;
+
+        uint32_t chunk_size = 0;
+        std::memcpy(&chunk_size, bytes + off + 4, sizeof(chunk_size));
+        if (chunk_size < 24 || chunk_size > size - off - 8) continue;
 
         const uint8_t* payload = bytes + off + 8;
         uint32_t flags = 0;
