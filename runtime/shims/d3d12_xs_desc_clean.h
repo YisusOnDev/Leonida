@@ -52,6 +52,25 @@ inline std::uint32_t without_refused_combinations(D3D12_RESOURCE_DIMENSION dimen
     return flags;
 }
 
+// The initial barrier layout of a texture whose flags without_refused_combinations changed: a UNORDERED_ACCESS (3)
+// layout without the UAV flag, or a RENDER_TARGET (2) one without the RT flag, is refused by the PC, so the texture
+// starts in COMMON (0) instead. Measured on the retail boot: slot 133 places 2D R16_TYPELESS textures with DS+UAV in the
+// UNORDERED_ACCESS layout. Every other layout goes on unchanged.
+inline std::uint32_t pc_initial_layout(std::uint32_t pc_flags, std::uint32_t layout) {
+    if (layout == 3 && !(pc_flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return 0;
+    if (layout == 2 && !(pc_flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return 0;
+    return layout;
+}
+
+// The same for a legacy initial state (slot 76): UNORDERED_ACCESS or RENDER_TARGET without the flag becomes COMMON.
+inline std::uint32_t pc_initial_state(std::uint32_t pc_flags, std::uint32_t state) {
+    if (state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS && !(pc_flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        return D3D12_RESOURCE_STATE_COMMON;
+    if (state == D3D12_RESOURCE_STATE_RENDER_TARGET && !(pc_flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        return D3D12_RESOURCE_STATE_COMMON;
+    return state;
+}
+
 // The PC flags of a console description: the PC bits only, in a combination the PC accepts.
 inline std::uint32_t pc_resource_flags(D3D12_RESOURCE_DIMENSION dimension, std::uint32_t xbox_flags) {
     return without_refused_combinations(dimension, xbox_flags & kPcResourceFlagsMask);

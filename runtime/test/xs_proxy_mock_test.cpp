@@ -1276,6 +1276,18 @@ int check_placed_resource_x() {
     EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 6, 0, word(&kResourceIid), word(&resource))) == S_OK);
     EXPECT(mock->calls[27] == 4 && g_committed.state == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     EXPECT(release(resource) == 0);
+    // A console depth texture that also allows unordered access, in the UNORDERED_ACCESS layout (3), as the retail
+    // boot places them: the PC gets a depth-stencil texture without UAV, created in COMMON.
+    {
+        D3D12_RESOURCE_DESC depth = target;
+        depth.Format = DXGI_FORMAT_R16_TYPELESS;
+        depth.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlag);
+        EXPECT(hr_of(raw6(device, 133, kVa, word(&depth), 3, 0, word(&kResourceIid), word(&resource))) == S_OK);
+        EXPECT(mock->calls[27] == 5 && g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        EXPECT(g_committed.state == D3D12_RESOURCE_STATE_COMMON);
+        EXPECT(release(resource) == 0);
+    }
 
     // Refusals before the device is called; the output is cleared.
     resource = reinterpret_cast<void*>(1);
@@ -1284,14 +1296,14 @@ int check_placed_resource_x() {
     resource = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, 0, word(&resource))) == E_POINTER && !resource);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), 0)) == E_POINTER);
-    EXPECT(mock->calls[27] == 4);
+    EXPECT(mock->calls[27] == 5);
 
     // A failed creation is returned as it is, with no object.
     mock->create_result = E_OUTOFMEMORY;
     resource = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), word(&resource))) ==
            E_OUTOFMEMORY);
-    EXPECT(!resource && mock->calls[27] == 5);
+    EXPECT(!resource && mock->calls[27] == 6);
     mock->create_result = S_OK;
 
     EXPECT(release(device) == 0 && mock->refs == 0);

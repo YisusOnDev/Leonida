@@ -3038,6 +3038,9 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
+    if (pc_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        initial_state = static_cast<D3D12_RESOURCE_STATES>(
+            pc_initial_state(static_cast<std::uint32_t>(pc_desc.Flags), static_cast<std::uint32_t>(initial_state)));
     const HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state,
                                                            clear_value, *riid, out);
     if (SUCCEEDED(hr)) lease_title_resource_memory(self, *out, pc_desc);
@@ -3117,7 +3120,10 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     const HRESULT hr =
         create(static_cast<ID3D12Device*>(device10), reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap_word),
                static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(heap_flags)), &pc_desc,
-               static_cast<std::uint32_t>(layout_word), reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
+               pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                   ? static_cast<std::uint32_t>(layout_word)
+                   : pc_initial_layout(static_cast<std::uint32_t>(pc_desc.Flags), static_cast<std::uint32_t>(layout_word)),
+               reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
                reinterpret_cast<ID3D12ProtectedResourceSession*>(session_word),
                static_cast<std::uint32_t>(castable_count), reinterpret_cast<const DXGI_FORMAT*>(castable_formats), riid,
                out);
@@ -3202,6 +3208,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
         without_refused_combinations(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (!buffer) initial_state = pc_initial_layout(static_cast<std::uint32_t>(pc_desc.Flags), initial_state);
     const bool clearable =
         !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
 
