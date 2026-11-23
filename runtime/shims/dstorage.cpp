@@ -34,6 +34,7 @@
 
 #include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "dstorage_xs_abi.h"
+#include "kernel_write_hook.h"
 #include "shims.h"
 
 using namespace dsx;
@@ -425,6 +426,9 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
     const uint64_t file_size = static_cast<uint64_t>(length.QuadPart);
     if (offset > file_size || size > file_size - offset) return E_DSTORAGE_END_OF_FILE;
     auto* out = static_cast<uint8_t*>(destination);
+    // The kernel writes the destination and raises no first-touch fault in it: xmem physical pages not committed yet
+    // would fail the read with ERROR_NOACCESS (E_DSTORAGE_ACCESS_VIOLATION), as with the title's own ReadFile.
+    rt::kernel_write::before(destination, size);
     uint32_t done = 0;
     while (done < size) {
         OVERLAPPED at{};
