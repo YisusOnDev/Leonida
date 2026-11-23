@@ -64,6 +64,55 @@ void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(std::uint8_t(v >> (8 * i)));
 }
 
+// Synthetic stored blocks let the checksum cross its own reduction boundaries and the 65535-byte deflate
+// block boundary independently. Expected checksums come from Python zlib.adler32, not the runtime's checksum.
+int adler_checks() {
+    struct Case { std::size_t size; std::uint32_t checksum[3]; };
+    const Case cases[] = {
+        {0, {0x00000001u, 0x00000001u, 0x00000001u}},
+        {1, {0x00010001u, 0x01000100u, 0x000c000cu}},
+        {5551, {0x15af0001u, 0x56039a8du, 0x9eaecc19u}},
+        {5552, {0x15b00001u, 0xf18f9b8cu, 0x6b2ccc6fu}},
+        {5553, {0x15b10001u, 0x8e299c8bu, 0x3825cceau}},
+        {11103, {0x2b5f0001u, 0xc8493627u, 0x420d9a26u}},
+        {11104, {0x2b600001u, 0xff6f3726u, 0xdcf99aecu}},
+        {11105, {0x2b610001u, 0x37a33825u, 0x78df9bd7u}},
+        {65535, {0x000e0001u, 0x68a50df3u, 0xee58868cu}},
+        {65536, {0x000f0001u, 0x77970ef2u, 0x75d98772u}},
+        {1048576, {0x00f00001u, 0x8e88ef11u, 0xe8497789u}},
+    };
+    for (const auto& c : cases) {
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            std::vector<std::uint8_t> data(c.size);
+            for (std::size_t i = 0; i < data.size(); ++i)
+                data[i] = pattern == 0 ? 0 : pattern == 1 ? 255 : std::uint8_t(i * 37 + 11);
+            std::vector<std::uint8_t> stream = {0x78, 0x01};
+            std::size_t at = 0;
+            do {
+                const auto n = std::min<std::size_t>(65535, data.size() - at);
+                stream.push_back(at + n == data.size() ? 1 : 0);  // BFINAL, stored block, byte padding
+                stream.push_back(std::uint8_t(n));
+                stream.push_back(std::uint8_t(n >> 8));
+                stream.push_back(std::uint8_t(~n));
+                stream.push_back(std::uint8_t(~n >> 8));
+                stream.insert(stream.end(), data.begin() + at, data.begin() + at + n);
+                at += n;
+            } while (at < data.size());
+            for (int shift = 24; shift >= 0; shift -= 8)
+                stream.push_back(std::uint8_t(c.checksum[pattern] >> shift));
+            std::vector<std::uint8_t> decoded;
+            CHECK(leonida::zlib_inflate(stream, decoded, data.size()) && decoded == data);
+            for (std::size_t byte = stream.size() - 4; byte < stream.size(); ++byte) {
+                stream[byte] ^= 1;
+                CHECK(!leonida::zlib_inflate(stream, decoded, data.size()));
+                stream[byte] ^= 1;
+            }
+            if (!data.empty()) CHECK(!leonida::zlib_inflate(stream, decoded, data.size() - 1));
+        }
+    }
+    return 0;
+}
+
 struct Payload {
     const std::vector<std::uint8_t>& zlib;
     std::uint32_t unpacked;
@@ -558,6 +607,7 @@ int main() {
           "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
 
     std::vector<std::uint8_t> out;
+    CHECK(adler_checks() == 0);
     CHECK(zlib_inflate(stored, out) && out.size() == 40);
     for (std::uint8_t i = 0; i < 40; ++i) CHECK(out[i] == i);
     CHECK(zlib_inflate(fixed, out) && out == bytes("hello hello hello leonida"));

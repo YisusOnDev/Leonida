@@ -362,9 +362,16 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     const std::size_t at = 2 + reader.position();
     if (at + 4 > in.size()) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
-    for (const std::uint8_t x : out) {
-        a = (a + x) % 65521;
-        b = (b + a) % 65521;
+    // Delay the reductions for at most 5552 bytes: even starting with a = b = 65520 and every byte 255,
+    // 255*n*(n+1)/2 + (n+1)*65520 fits uint32_t for n <= 5552 (the Adler-32 bound used by zlib).
+    for (std::size_t begin = 0; begin < out.size();) {
+        const std::size_t end = begin + std::min<std::size_t>(5552, out.size() - begin);
+        for (; begin < end; ++begin) {
+            a += out[begin];
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
     }
     const std::uint32_t expected = (std::uint32_t(in[at]) << 24) | (std::uint32_t(in[at + 1]) << 16) |
                                    (std::uint32_t(in[at + 2]) << 8) | in[at + 3];
