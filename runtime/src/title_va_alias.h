@@ -37,7 +37,7 @@ public:
     // An address in the title's memory: true, with `shader_va` what a shader must be given (the address itself when
     // no copy could be made). False: not the title's memory (an arena VA, a buffer of the layer's).
     using Resolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, std::uint64_t& shader_va);
-    using TableScanner = void (*)(void* context, std::uint64_t table_va);
+    using TableScanner = void (*)(void* context, std::uint64_t table_va, std::uint32_t descriptors);
 
     // [title_va, title_va + bytes) is reached as [shader_va, shader_va + bytes). A range that overlaps a live one
     // replaces it (the title has placed a new buffer over pages it released). False for an empty or wrapping range.
@@ -109,9 +109,9 @@ public:
         if (va && shader_va(va) != va) untranslated_[kind].fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Before a submission: the device rewrites the buffer V#s of the table at `table_va` (a console VA in one of its
-    // shader-visible CBV/SRV/UAV heaps).
-    void scan_table(std::uint64_t table_va) {
+    // Before a submission: the device rewrites the buffer V#s of the `descriptors` slots the root signature declares
+    // for the table at `table_va` (a console VA in one of its shader-visible CBV/SRV/UAV heaps).
+    void scan_table(std::uint64_t table_va, std::uint32_t descriptors) {
         TableScanner scanner;
         void* context;
         {
@@ -119,7 +119,52 @@ public:
             scanner = scanner_;
             context = hook_context_;
         }
-        if (scanner) scanner(context, table_va);
+        if (scanner) scanner(context, table_va, descriptors);
+    }
+
+    // The scan's cost, per ExecuteCommandLists that had tables to scan.
+    void note_scan(std::uint64_t nanoseconds) {
+        scans_.fetch_add(1, std::memory_order_relaxed);
+        scan_ns_.fetch_add(nanoseconds, std::memory_order_relaxed);
+        std::uint64_t seen = scan_max_ns_.load(std::memory_order_relaxed);
+        while (nanoseconds > seen && !scan_max_ns_.compare_exchange_weak(seen, nanoseconds)) {
+        }
+    }
+    std::uint64_t scans() const { return scans_.load(std::memory_order_relaxed); }
+    std::uint64_t scan_ns() const { return scan_ns_.load(std::memory_order_relaxed); }
+    std::uint64_t scan_max_ns() const { return scan_max_ns_.load(std::memory_order_relaxed); }
+
+    // The title's own memory, as the xmem shims hand it out (XMemAlloc, XMemVirtualAlloc, the title's VirtualAlloc):
+    // only an address in one of these ranges gets a copy. A base anywhere else (the runtime's own heap, a host DLL)
+    // is left as it was and counted.
+    void add_title_memory(std::uint64_t base, std::uint64_t bytes) {
+        if (!base || !bytes || base > UINT64_MAX - bytes) return;
+        std::uint64_t begin = base, end = base + bytes;
+        std::unique_lock lock(memory_mutex_);
+        // A commit inside a reserved range, or two that overlap, are one range.
+        auto it = memory_.upper_bound(begin);
+        if (it != memory_.begin() && std::prev(it)->second > begin) --it;
+        while (it != memory_.end() && it->first < end) {
+            begin = std::min(begin, it->first);
+            end = std::max(end, it->second);
+            it = memory_.erase(it);
+        }
+        memory_[begin] = end;
+    }
+    void remove_title_memory(std::uint64_t base) {
+        std::unique_lock lock(memory_mutex_);
+        memory_.erase(base);
+    }
+    // The title range that holds `va`: [lo, hi). False when none does.
+    bool title_memory(std::uint64_t va, std::uint64_t& lo, std::uint64_t& hi) const {
+        std::shared_lock lock(memory_mutex_);
+        auto it = memory_.upper_bound(va);
+        if (it == memory_.begin()) return false;
+        --it;
+        if (va >= it->second) return false;
+        lo = it->first;
+        hi = it->second;
+        return true;
     }
 
     // The first device to register keeps the hooks until it clears them.
@@ -166,6 +211,9 @@ private:
     TableScanner scanner_ = nullptr;
     std::array<std::atomic<std::uint64_t>, kind_count> translated_{};
     std::array<std::atomic<std::uint64_t>, kind_count> untranslated_{};
+    std::atomic<std::uint64_t> scans_{0}, scan_ns_{0}, scan_max_ns_{0};
+    mutable std::shared_mutex memory_mutex_;
+    std::map<std::uint64_t, std::uint64_t> memory_;  // the title's memory: base -> end
 };
 
 // The process's table: the device's title ranges and hooks, read by the command lists and descriptor writers.

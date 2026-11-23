@@ -42,6 +42,7 @@
 #include "kernel_write_hook.h"
 #include "write_watch.h"
 #include "xmem_pages.h"
+#include "../src/title_va_alias.h"
 
 namespace {
 
@@ -73,14 +74,27 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
 
 void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAlign); }
 
+// Every block and range the title gets here is recorded as the title's memory (src/title_va_alias.h): a shader
+// address into it can be given a GPU copy, and an address anywhere else cannot.
+void* title_block(size_t size) {
+    void* p = allocate_block(size);
+    leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(p), size ? size : 1);
+    return p;
+}
+
+void free_title_block(void* p) {
+    if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
+    _aligned_free(p);
+}
+
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    return title_block(size);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
-    _aligned_free(p);
+    free_title_block(p);
 }
 
 // XMemAllocDefault / XMemFreeDefault: the GDK's own allocator behind XMemAlloc and XMemFree, which a title that hooks
@@ -89,12 +103,12 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
 // released by either free.
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
     note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    return title_block(size);
 }
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
     note_attributes("XMemFreeDefault", attributes, kNoSize, _ReturnAddress());
-    _aligned_free(p);
+    free_title_block(p);
 }
 
 // BOOL XMemIsToolsMemAvailable(void). The measured title calls it from one helper, which six out-of-memory paths reach
@@ -379,6 +393,9 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     void* const result = xmem_virtual_alloc(address, size, allocation_type, attributes, protect);
     rt::write_watch::note_region(result);
+    // The title's memory (src/title_va_alias.h). Never forgotten: a released range is no longer committed, which
+    // the copy also checks.
+    if (result) leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(result), size);
     if (rt::startup_trace::enabled()) {
         const DWORD error = GetLastError();
         using rt::startup_trace::hex;
@@ -395,7 +412,6 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 }
 
 void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    (void)attributes;
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -1020,7 +1036,9 @@ constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    LPVOID result = VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    if (result) leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(result), size);
+    return result;
 }
 
 }  // namespace

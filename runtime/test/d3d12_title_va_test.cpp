@@ -301,7 +301,7 @@ int check_kind(Context& c, const char* kind, DWORD protect, int& checks) {
 //   - a V# made by CreateConstantBufferView (translated when written);
 //   - a root view (translated when set).
 // Negative controls: a raw V# whose base is an arena buffer and a T#-shaped slot whose base is the ring keep their
-// bytes; an address the ring does not hold is left alone.
+// bytes; committed memory that is not the title's, and a title range with no committed page, are left alone.
 int check_title_memory(Context& c, int& checks) {
     constexpr UINT64 ring_bytes = 256 * 1024;
     auto* ring = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, ring_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -309,6 +309,7 @@ int check_title_memory(Context& c, int& checks) {
     const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
     EXPECT(ring_va >= c.arena);
     auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(ring_va, ring_bytes);  // as the xmem shims record what they hand the title
     const std::uint64_t table_before = aliases.translated(leonida::TitleVaAliases::table_view);
     const std::uint64_t created_before = aliases.translated(leonida::TitleVaAliases::created_view);
     const std::uint64_t root_before = aliases.translated(leonida::TitleVaAliases::root_view);
@@ -433,14 +434,24 @@ int check_title_memory(Context& c, int& checks) {
                 static_cast<unsigned long long>(aliases.translated(leonida::TitleVaAliases::root_view) - root_before));
     EXPECT(raw_ok == kElements && cbv_ok == kElements && root_ok == kElements);
     EXPECT(rewritten && arena_kept && image_kept);
-    // An address in no committed page is not title memory: left alone, nothing made for it.
+    // Left alone and counted: committed memory that is not the title's (the runtime's own, say), and a title range
+    // with no committed page.
+    const std::uint64_t untranslated_before = aliases.untranslated(leonida::TitleVaAliases::created_view);
+    void* host = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     void* gone = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_READWRITE);
-    const auto gone_va = reinterpret_cast<std::uint64_t>(gone);
-    const D3D12_CONSTANT_BUFFER_VIEW_DESC reserved_only{gone_va, 256};
-    c.device->CreateConstantBufferView(&reserved_only, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 5 * inc});
-    EXPECT(vsharp_base(cpu + 5 * inc) == (gone_va & 0xFFFFFFFFFFFFull));
+    const auto host_va = reinterpret_cast<std::uint64_t>(host), gone_va = reinterpret_cast<std::uint64_t>(gone);
+    aliases.add_title_memory(gone_va, 65536);
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC not_title{host_va, 256}, reserved_only{gone_va, 256};
+    c.device->CreateConstantBufferView(&not_title, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 5 * inc});
+    c.device->CreateConstantBufferView(&reserved_only, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 6 * inc});
+    EXPECT(vsharp_base(cpu + 5 * inc) == (host_va & 0xFFFFFFFFFFFFull));
+    EXPECT(vsharp_base(cpu + 6 * inc) == (gone_va & 0xFFFFFFFFFFFFull));
+    EXPECT(aliases.untranslated(leonida::TitleVaAliases::created_view) - untranslated_before == 2);
+    aliases.remove_title_memory(gone_va);
+    aliases.remove_title_memory(ring_va);
+    VirtualFree(host, 0, MEM_RELEASE);
     VirtualFree(gone, 0, MEM_RELEASE);
-    checks += 3;
+    checks += 4;
     return 0;
 }
 

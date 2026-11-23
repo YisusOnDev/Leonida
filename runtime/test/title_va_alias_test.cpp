@@ -40,6 +40,14 @@ int main() {
     a.note(title + 8, leonida::TitleVaAliases::vertex_view);
     a.note(title - 8, leonida::TitleVaAliases::vertex_view);
     EXPECT(a.untranslated(leonida::TitleVaAliases::vertex_view) == 1);
+    // The title's memory: a commit inside a reservation is one range; outside every range is not the title's.
+    std::uint64_t mlo = 0, mhi = 0;
+    a.add_title_memory(0x40000000, 0x100000);
+    a.add_title_memory(0x40010000, 0x1000);
+    EXPECT(a.title_memory(0x40080000, mlo, mhi) && mlo == 0x40000000 && mhi == 0x40100000);
+    EXPECT(!a.title_memory(0x40100000, mlo, mhi) && !a.title_memory(0x3FFFFFFF, mlo, mhi));
+    a.remove_title_memory(0x40000000);
+    EXPECT(!a.title_memory(0x40080000, mlo, mhi));
     // A wrapping target (an import below heap_base) is kept as is: modular arithmetic.
     constexpr std::uint64_t below = 0xFFFFFFFFFFF00000ull;
     EXPECT(a.add(title + 0x100000, size, below) && a.shader_va(title + 0x100010) == below + 0x10);
