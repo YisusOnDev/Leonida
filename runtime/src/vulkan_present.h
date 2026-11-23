@@ -492,7 +492,7 @@ private:
         // An out-of-date retry above may have given the swapchain another extent: the compose target follows it.
         if (planes && !prepare_compose()) return give_back(frame, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
-        bool recorded = false;
+        VkResult record_result = VK_ERROR_UNKNOWN;
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         bool rollback_source = false;
         VkImageLayout prev_layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -516,7 +516,7 @@ private:
                         plane_rollbacks[i].tracked = context_.tracker_.tracked(plane_rollbacks[i].id);
                         if (plane_rollbacks[i].tracked) plane_rollbacks[i].layout = context_.tracker_.layout(plane_rollbacks[i].id, 0);
                     }
-                    recorded = record_planes(frame, std::uint32_t(frame_index_ % frames_.size()), current, *planes, image);
+                    record_result = record_planes(frame, std::uint32_t(frame_index_ % frames_.size()), current, *planes, image);
                 }
             }
         } else if (binding) {
@@ -529,12 +529,10 @@ private:
                 tracker_lock.lock();
                 rollback_source = context_.tracker_.tracked(source);
                 if (rollback_source) prev_layout = context_.tracker_.layout(source, 0);
-                record(frame.commands, *current, source, image, source_rect);
-                recorded = true;
+                record_result = record(frame.commands, *current, source, image, source_rect);
             }
         } else {
-            record_blank(frame.commands, image);
-            recorded = true;
+            record_result = record_blank(frame.commands, image);
         }
         const auto rollback = [&] {
             if (rollback_source)
@@ -545,7 +543,11 @@ private:
                         context_.tracker_.set(plane_rollbacks[i].id, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
                                               plane_rollbacks[i].layout);
         };
-        if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
+        if (record_result != VK_SUCCESS) {
+            rollback();
+            if (tracker_lock.owns_lock()) tracker_lock.unlock();
+            return give_back(frame, record_result);
+        }
         if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
             rollback();
             return stop(reset);
@@ -704,14 +706,14 @@ private:
         captured_ = false;
     }
 
-    void record(VkCommandBuffer commands, const ResourceBinding& binding, ResourceId source, std::uint32_t image,
-                const PresentRect* source_rect) {
+    VkResult record(VkCommandBuffer commands, const ResourceBinding& binding, ResourceId source, std::uint32_t image,
+                    const PresentRect* source_rect) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
-        vk.vkResetCommandBuffer(commands, 0);
+        if (const VkResult err = vk.vkResetCommandBuffer(commands, 0); err != VK_SUCCESS) return err;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vk.vkBeginCommandBuffer(commands, &begin);
+        if (const VkResult err = vk.vkBeginCommandBuffer(commands, &begin); err != VK_SUCCESS) return err;
 
         constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -753,7 +755,7 @@ private:
             detail::image_barrier(fn, commands, binding, piece.range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                   piece.layout, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any,
                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        vk.vkEndCommandBuffer(commands);
+        return vk.vkEndCommandBuffer(commands);
     }
 
     struct RollbackPlane {
@@ -788,15 +790,16 @@ private:
         return composer_->ensure_target(extent_, changed);
     }
 
-    // Records the composition of `planes` and its copy to swapchain image `image`. False, with nothing recorded and the
-    // tracker untouched, when a view cannot be made. The caller holds the resource and tracker locks.
-    bool record_planes(Frame& frame, std::uint32_t slot, const std::array<ResourceBinding, 2>& current,
-                       const PresentPlanes& planes, std::uint32_t image) {
+    // Records the composition of `planes` and its copy to swapchain image `image`. Returns an error and drops any
+    // plane views if the target is missing or view creation / command-buffer recording fails (the caller rolls back
+    // LayoutTracker). The caller holds the resource and tracker locks.
+    VkResult record_planes(Frame& frame, std::uint32_t slot, const std::array<ResourceBinding, 2>& current,
+                           const PresentPlanes& planes, std::uint32_t image) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         if (composer_->target() == VK_NULL_HANDLE || composer_->extent().width != extent_.width ||
             composer_->extent().height != extent_.height)
-            return false;  // the target does not match the swapchain: nothing recorded
+            return VK_ERROR_UNKNOWN;  // the target does not match the swapchain: nothing recorded
         drop_views(frame);
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -804,18 +807,25 @@ private:
             view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
             view_info.format = current[i].format;
             view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            if (vk.vkCreateImageView(context_.device(), &view_info, nullptr, &frame.views[i]) != VK_SUCCESS) {
+            if (const VkResult err = vk.vkCreateImageView(context_.device(), &view_info, nullptr, &frame.views[i]);
+                err != VK_SUCCESS) {
                 drop_views(frame);
-                return false;
+                return err;
             }
         }
         if (planes.count == 1) frame.views[1] = VK_NULL_HANDLE;  // the shader never reads it; plane 0's view is bound twice
 
         VkCommandBuffer commands = frame.commands;
-        vk.vkResetCommandBuffer(commands, 0);
+        if (const VkResult err = vk.vkResetCommandBuffer(commands, 0); err != VK_SUCCESS) {
+            drop_views(frame);
+            return err;
+        }
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vk.vkBeginCommandBuffer(commands, &begin);
+        if (const VkResult err = vk.vkBeginCommandBuffer(commands, &begin); err != VK_SUCCESS) {
+            drop_views(frame);
+            return err;
+        }
 
         constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -887,8 +897,11 @@ private:
                                       VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, any,
                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         }
-        vk.vkEndCommandBuffer(commands);
-        return true;
+        if (const VkResult err = vk.vkEndCommandBuffer(commands); err != VK_SUCCESS) {
+            drop_views(frame);
+            return err;
+        }
+        return VK_SUCCESS;
     }
 
     // vkGetPhysicalDeviceFormatProperties, optimal tiling, cached per format.
@@ -915,13 +928,13 @@ private:
     }
 
     // Clears the swapchain image to opaque black.
-    void record_blank(VkCommandBuffer commands, std::uint32_t image) {
+    VkResult record_blank(VkCommandBuffer commands, std::uint32_t image) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
-        vk.vkResetCommandBuffer(commands, 0);
+        if (const VkResult err = vk.vkResetCommandBuffer(commands, 0); err != VK_SUCCESS) return err;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vk.vkBeginCommandBuffer(commands, &begin);
+        if (const VkResult err = vk.vkBeginCommandBuffer(commands, &begin); err != VK_SUCCESS) return err;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         detail::image_barrier(fn, commands, target_of(image), range, VK_IMAGE_LAYOUT_UNDEFINED,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -929,7 +942,7 @@ private:
         const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
         vkCmdClearColorImage_(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
         finish_image(commands, image);
-        vk.vkEndCommandBuffer(commands);
+        return vk.vkEndCommandBuffer(commands);
     }
 
     // The swapchain image is written (TRANSFER_DST): optionally copy it to the capture buffer, then hand it to
