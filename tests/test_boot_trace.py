@@ -546,20 +546,23 @@ class BootTraceTests(unittest.TestCase):
             self.assertIn(needle, text)
 
     def test_failed_file_opens_and_skipped_int3_are_listed(self):
+        fields = {"path": "GAME:/probe/missing.bin", "error": 2, "caller": "game.exe+0x20"}
+        samples = [{**fields, "api": "CreateFileW"}, {**fields, "api": "CreateFile2"}, fields]
         self.write(
             self.startup,
             [
-                {"seq": 1, "kind": "trace_open", "pid": 1},
-                {"seq": 2, "kind": "file_open_failed", "api": "CreateFileW", "path": "GAME:/probe/missing.bin", "error": 2, "caller": "game.exe+0x20"},
-                {"seq": 3, "kind": "int3_skipped", "at": "game.exe+0x1330"},
+                *({"kind": "file_open_failed", **sample} for sample in samples),
+                {"kind": "int3_skipped", "at": "game.exe+0x1330"},
             ],
         )
         trace = bt.parse_startup(self.startup)
-        self.assertEqual(trace["file_open_failed"], [{"path": "GAME:/probe/missing.bin", "error": 2, "caller": "game.exe+0x20"}])
+        self.assertEqual(trace["file_open_failed"], samples)
         self.assertEqual(trace["int3_skipped"], ["game.exe+0x1330"])
         text = bt.format_text(bt.summarize(trace, None), 10)
-        self.assertIn("failed file opens: 1", text)
-        self.assertIn("GAME:/probe/missing.bin error 2 from game.exe+0x20", text)
+        self.assertIn("failed file opens: 3", text)
+        detail = "GAME:/probe/missing.bin error 2 from game.exe+0x20"
+        for prefix in ("CreateFileW ", "CreateFile2 ", ""):
+            self.assertIn("    " + prefix + detail, text.splitlines())
         self.assertIn("game.exe+0x1330", text)
 
     def test_last_observed_tls_callback_in_incomplete_startup(self):
