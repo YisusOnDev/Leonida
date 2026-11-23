@@ -1513,12 +1513,21 @@ public:
     void note_bindless_upload() { bindless_upload_pending_ = true; }
 
     std::uint64_t completed_retire_ticket() {
-        std::lock_guard lock(submit_mutex_);
-        if (is_device_lost()) return 0;
-        return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
-            std::uint64_t done = 0;
-            return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
-        });
+        bool lost = false;
+        std::uint64_t ticket = 0;
+        {
+            std::lock_guard lock(submit_mutex_);
+            if (is_device_lost()) return 0;
+            ticket = retire_tickets_.completed([this, &lost](VkSemaphore semaphore, std::uint64_t value) {
+                std::uint64_t done = 0;
+                const VkResult result = vk.vkGetSemaphoreCounterValue(device_, semaphore, &done);
+                if (result == VK_ERROR_DEVICE_LOST) lost = true;
+                return result == VK_SUCCESS && done >= value;
+            });
+        }
+        // Notify waiters outside submit_mutex_: callbacks can submit other queue work.
+        if (lost) mark_device_lost();
+        return lost ? 0 : ticket;
     }
 
     void drain_deleted_resources(std::uint64_t current_ticket) {
@@ -2132,8 +2141,13 @@ public:
     }
 
     bool idle() {
-        std::lock_guard lock(context_.submit_mutex());
-        return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+        VkResult result;
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            result = context_.vk.vkQueueWaitIdle(queue_);
+        }
+        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        return result == VK_SUCCESS;
     }
 
 private:
