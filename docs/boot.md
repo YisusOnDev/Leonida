@@ -103,6 +103,8 @@ Read the startup trace first; the first event that is not the expected one is th
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
 6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
    submission ran the supported commands from a list. The runtime's `[rt]` diagnostic names the command it left out.
+   A failed `ID3D12GraphicsCommandList::Close` means a recorded call was refused: the `[rt] d3d12: … refused a recorded
+   call (d3d12_com.cpp:N)` line, printed once per call site, names that method and the check that refused it.
    Compare the method's position with the public SDK vtable. An unknown slot is expected until the executable names it
    (Q2, Q6). The `[rt]` lines in the same log carry the 24 device words, feature IDs and warnings.
    The summary expects `#1` first, then one more than the last observed number. It counts each mismatch once and
