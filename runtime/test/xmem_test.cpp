@@ -266,6 +266,28 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed region");
     }
 
+    void* const reset_region = virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT | kXmem64kPages, 0,
+                                             PAGE_READWRITE);
+    check(reset_region != nullptr, "allocate committed 64 KiB region for reset");
+    if (reset_region) {
+        auto* const reset_bytes = static_cast<uint8_t*>(reset_region);
+        std::memset(reset_bytes, 0x5a, kPage64k);
+        check(virtual_alloc(reset_bytes + 0x1234, 0x2000, MEM_RESET | kXmem64kPages, 0, PAGE_READWRITE) != nullptr,
+              "unaligned 64 KiB-mode reset uses the host reset range");
+        check(reset_bytes[0] == 0x5a && reset_bytes[0x4000] == 0x5a && reset_bytes[kPage64k - 1] == 0x5a,
+              "unaligned reset preserves neighbouring committed data");
+        check(virtual_alloc(reset_bytes + 0xe123, 0x1edd, MEM_RESET | kXmem64kPages, 0, PAGE_READWRITE) != nullptr,
+              "unaligned reset near the end of a committed region succeeds");
+        check(virtual_alloc(reset_region, kPage64k, MEM_RESET | kXmem64kPages, 0, PAGE_READWRITE) == reset_region,
+              "MEM_RESET with 64 KiB pages succeeds on committed memory");
+        SetLastError(ERROR_SUCCESS);
+        void* const invalid = virtual_alloc(reset_region, kPage64k, MEM_RESET | MEM_RESERVE | kXmem64kPages, 0,
+                                            PAGE_READWRITE);
+        check(invalid == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+              "MEM_RESET combined with MEM_RESERVE fails with ERROR_INVALID_PARAMETER");
+        check(VirtualFree(reset_region, 0, MEM_RELEASE), "release the reset region");
+    }
+
     // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
     MEMORY_BASIC_INFORMATION mbi{};
     void* const pool = virtual_alloc(nullptr, SIZE_T{8} << 30, MEM_RESERVE | 0x20400000, 0x21, PAGE_READWRITE);
