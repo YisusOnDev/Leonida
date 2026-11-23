@@ -699,7 +699,10 @@ static_assert(sizeof(kConsoleId) == kConsoleIdBytes, "placeholder console id mus
 
 HRESULT __stdcall XSystemGetConsoleId(size_t size, char* out, size_t* used) {
     if (!out) return E_INVALIDARG;
-    if (size < kConsoleIdBytes) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    if (size < kConsoleIdBytes) {
+        if (used) *used = kConsoleIdBytes;
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
     std::memcpy(out, kConsoleId, kConsoleIdBytes);
     if (used) *used = kConsoleIdBytes;
     return S_OK;
@@ -739,7 +742,10 @@ const GUID* const kSystemIids[] = {&kSystem2, &kSystem3, &kSystem4, &kSystem5, n
 // buffer size the API requires (its *Bytes constant), which can be larger than the string.
 HRESULT copy_id(const char* id, size_t bytes, size_t minimum, size_t size, char* out, size_t* used) {
     if (!out) return E_INVALIDARG;
-    if (size < minimum || size < bytes) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    if (size < minimum || size < bytes) {
+        if (used) *used = minimum > bytes ? minimum : bytes;
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
     std::memcpy(out, id, bytes);
     if (used) *used = bytes;
     return S_OK;

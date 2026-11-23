@@ -683,6 +683,12 @@ void check_run_time_load() {
         check(reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 15, buf, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
                   reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 16, buf, &used) == S_OK,
               "slot 4 needs XSystemXboxLiveSandboxIdMaxBytes (16), not just the id's 7 bytes");
+        used = 0;
+        check(reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 4, buf, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && used == 16,
+              "slot 4 reports the required 16 bytes for a short buffer");
+        used = 0;
+        check(reinterpret_cast<IdQuery>(slot(sy, 5))(sy, 4, buf, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && used == 45,
+              "slot 5 reports the required 45 bytes for a short buffer");
         const GUID chain[] = {
             system_cls,
             {0x6fd71f09, 0x7513, 0x49f0, {0x89, 0xbc, 0xbf, 0xaf, 0x5d, 0xf6, 0xf8, 0x52}},
@@ -943,6 +949,10 @@ int main() {
     auto console_id = get<ConsoleIdFn>("XSystemGetConsoleId");
     char id[64] = {};
     size_t used = 0;
+    check(console_id(4, id, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && used == 39,
+          "XSystemGetConsoleId reports the required 39 bytes for a short buffer");
+    check(console_id(4, nullptr, &used) == E_INVALIDARG,
+          "XSystemGetConsoleId rejects a null output buffer");
     check(console_id(8, id, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
           "XSystemGetConsoleId rejects a buffer smaller than XSystemConsoleIdBytes");
     check(console_id(sizeof(id), id, &used) == S_OK && used == 39 && std::strlen(id) == 38,
