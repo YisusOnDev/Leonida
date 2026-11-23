@@ -7646,7 +7646,10 @@ public:
             // (vkCreateShaderModule refuses the module without them, VUID-...-pCode-08740).
             opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation =
                 state_.info.shader_output_layer && state_.info.shader_output_viewport_index;
-            opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+            // Tier 2: a heap may hold buffers and both kinds of texture together. CreateHeap accepts such heaps
+            // (heap_desc_refusal refuses only a heap that denies every kind) and placement checks only the heap's DENY
+            // flags, as on the console's RDNA2. A Tier 1 host (NVIDIA Pascal) refuses them (D3D-504, #4420).
+            opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS1: {
