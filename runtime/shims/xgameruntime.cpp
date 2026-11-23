@@ -655,13 +655,6 @@ HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
     return S_OK;
 }
 
-// XErrorReport, the sixth name xgameruntime.lib's thunks GetProcAddress in xgameruntime.dll: in both package DLLs its
-// string sits in the same block as the five entry points above, and when the lookup fails the thunks give up before
-// they call an initializer (libHttpClient.GDK.dll's initialisation then returns 0x89240101,
-// E_GAMERUNTIME_DLL_NOT_FOUND, and XCurl.dll's fails too). The arguments are IXErrorImpl slot 3's without `this`, and
-// the slot's function serves it, so a report reaches the callback XErrorSetCallback set either way.
-HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
-
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
     if (g_runtime_refs.fetch_add(1) == 0) std::fprintf(stderr, "[rt] xgameruntime: initialized (offline)\n");
