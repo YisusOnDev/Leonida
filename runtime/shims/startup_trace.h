@@ -23,6 +23,7 @@
 
 #include <windows.h>
 #include <set>
+#include <utility>
 
 #include <atomic>
 #include <cerrno>
@@ -182,6 +183,21 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 const auto op = r.ExceptionInformation[0];
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
+            }
+            if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info.ContextRecord) {
+                // The general registers, so a fault through a stale or garbage pointer says which object it was.
+                const CONTEXT& c = *info.ContextRecord;
+                const std::pair<const char*, DWORD64> regs[] = {
+                    {"rax", c.Rax}, {"rbx", c.Rbx}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rsi", c.Rsi}, {"rdi", c.Rdi},
+                    {"rbp", c.Rbp}, {"rsp", c.Rsp}, {"r8", c.R8},   {"r9", c.R9},   {"r10", c.R10}, {"r11", c.R11},
+                    {"r12", c.R12}, {"r13", c.R13}, {"r14", c.R14}, {"r15", c.R15}};
+                f += ",\"regs\":{";
+                bool first = true;
+                for (const auto& [name, value] : regs) {
+                    f += (first ? "\"" : ",\"") + std::string(name) + "\":" + quote(hex(value));
+                    first = false;
+                }
+                f += "}";
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
