@@ -1575,7 +1575,7 @@ a console client can address is an arena range, whichever heap it comes from.
 - the title points root views and V#s at its own memory, for instance a per-frame constant ring (#8862, section
   3.5 of `docs/retail_boot_chain.md`).
 
-On Windows these are user-mode addresses around 1.5 TiB, far past the arena (at most 4095 MiB, and descriptor
+On Windows these are user-mode addresses far above 4 GiB, past the arena (at most 4095 MiB, and descriptor
 tables must stay below 4 GiB), so `heap_base + VA` names nothing the layer made (the D3D-53 failure above). The layer
 therefore replaces such an address, wherever it sees one, by the console VA of a GPU copy of that memory
 (`runtime/src/title_va_alias.h`):

@@ -11,7 +11,7 @@
 
 int main() {
     leonida::TitleVaAliases a;
-    constexpr std::uint64_t title = 0x18500000000ull;  // the shape of a Windows VA past 1 TiB
+    constexpr std::uint64_t title = 0x20000000000ull;  // a synthetic user-mode VA far above 4 GiB
     constexpr std::uint64_t size = 0x10000;
     constexpr std::uint64_t arena = 0x2340000;
     // Empty: identity everywhere.
