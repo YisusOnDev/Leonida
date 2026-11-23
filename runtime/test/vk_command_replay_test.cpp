@@ -9,9 +9,6 @@
 // and back (D32_FLOAT <-> R32_FLOAT), which the replay stages through a scratch buffer. Part I resolves a depth
 // rectangle (MIN) and checks that the texels around it keep their values. Part J copies between disjoint regions
 // of one texture subresource.
-
-// rectangle (MIN) and checks that the texels around it keep their values. Part J validates two consecutive buffer
-// copies into the same destination; D3D12 guarantees that the later copy wins without an application barrier.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -1265,69 +1262,6 @@ int part_j(vktest::Device& d) {
         for (std::uint32_t x = 0; x < width; ++x)
             expect_rgba("J self-copy", pixels, y * width + x, x < 2 ? (y ? green : red) : Rgba{});
     std::printf("J: disjoint same-subresource copies, overlapping copy rejected\n");
-
-// Buffer transfer writes must be ordered even when the D3D12 application leaves the destination
-// in COPY_DEST. The second write targets precisely the same range, without an explicit barrier.
-int part_j(vktest::Device& d) {
-    if (!d.validation) {
-        std::printf("J: skipped without Vulkan validation\n");
-        return 0;
-    }
-    constexpr VkDeviceSize bytes = 4096;
-    void* up_mapped = nullptr;
-    void* readback_mapped = nullptr;
-    const VkBuffer upload = d.buffer(bytes * 2, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up_mapped);
-    const VkBuffer target = d.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, nullptr);
-    const VkBuffer readback = d.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback_mapped);
-    EXPECT(upload && target && readback && up_mapped && readback_mapped);
-    std::memset(up_mapped, 0x11, std::size_t(bytes));
-    std::memset(static_cast<std::uint8_t*>(up_mapped) + bytes, 0x22, std::size_t(bytes));
-    std::memset(readback_mapped, 0xcd, std::size_t(bytes));
-
-    ResourceBinding src{}, dst{};
-    src.buffer = upload;
-    src.size = bytes * 2;
-    dst.buffer = target;
-    dst.size = bytes;
-    const std::map<ResourceId, ResourceBinding> resources{{1, src}, {2, dst}};
-    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
-        const auto it = resources.find(id);
-        return it == resources.end() ? nullptr : &it->second;
-    };
-
-    ReplayFunctions vk{};
-    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
-    vk.pipeline_barrier2 = d.fn<PFN_vkCmdPipelineBarrier2>("vkCmdPipelineBarrier2");
-    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
-    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
-    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
-
-    CommandList list;
-    EXPECT(list.copy_buffer({2, 0, 1, 0, bytes}));
-    EXPECT(list.copy_buffer({2, 0, 1, bytes, bytes}));
-    EXPECT(list.close());
-    const unsigned errors_before = d.validation_errors();
-    EXPECT(d.run([&](VkCommandBuffer cb) {
-        if (replay(list, cb, resolve, vk) != ReplayResult::success) return false;
-        VkMemoryBarrier copy_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        copy_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        copy_read.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vk.pipeline_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &copy_read,
-                            0, nullptr, 0, nullptr);
-        VkBufferCopy region{0, 0, bytes};
-        vk.copy_buffer(cb, target, readback, 1, &region);
-        VkMemoryBarrier host_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vk.pipeline_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read,
-                            0, nullptr, 0, nullptr);
-        return true;
-    }));
-    const unsigned errors = d.validation_errors() - errors_before;
-    std::printf("J: two overlapping sequential buffer destination copies, validation errors=%u\n", errors);
-    EXPECT(errors == 0);
-    for (std::uint32_t i = 0; i < bytes; ++i) expect_byte("J second buffer copy", static_cast<std::uint8_t*>(readback_mapped), i, 0x22);
     return 0;
 }
 

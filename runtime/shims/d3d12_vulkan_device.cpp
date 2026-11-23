@@ -3835,18 +3835,11 @@ public:
                     stage.words = std::move(patched);
                 }
             }
+            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !probe_vs.empty()) stage.words = probe_vs;
+            if (stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT && !probe_ps.empty()) stage.words = probe_ps;
             const VkShaderModule module = device_.acquire_shared_module(stage.words);
             if (!module) return E_FAIL;
             shared_modules_.push_back(module);
-
-            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !probe_vs.empty()) stage.words = probe_vs;
-            if (stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT && !probe_ps.empty()) stage.words = probe_ps;
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = stage.words.size() * 4;
-            module_info.pCode = stage.words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
-            modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = stage.bit;
             info.module = module;
