@@ -343,6 +343,7 @@ HRESULT wrap(ID3D12Device* inner, Ref<ID3D12Device>& device) {
 }  // namespace
 
 int main() {
+    std::fputs("d3d12_fence_timing: initialize Vulkan test device\n", stderr);
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
@@ -368,11 +369,17 @@ int main() {
         Ref<ID3D12CommandQueue> queue;
         EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
         EXPECT(!rt::d3d12::queue_uses_calibrated_timestamps(queue.p));
+        std::fputs("d3d12_fence_timing: check clock calibration\n", stderr);
         EXPECT(check_calibration(queue.p, gpu_frequency, "fallback (submitted timestamp query)") == 0);
+        std::fputs("d3d12_fence_timing: check multiple-fence waits\n", stderr);
         EXPECT(check_multiple_fences(device.p, queue.p) == 0);
+        std::fputs("d3d12_fence_timing: check held CPU fence signals\n", stderr);
         EXPECT(check_held_cpu_signal(device.p, queue.p) == 0);
+        std::fputs("d3d12_fence_timing: check adapter LUID\n", stderr);
         EXPECT(check_luid(device.p) == 0);
+        std::fputs("d3d12_fence_timing: compare custom heap properties\n", stderr);
         EXPECT(check_custom_heap_properties(device.p) == 0);
+        std::fputs("d3d12_fence_timing: release wrapped device and queue\n", stderr);
     }
 
     // The standalone device enables VK_KHR/EXT_calibrated_timestamps where the GPU has it.
@@ -415,12 +422,18 @@ int main() {
                     qpc_clock ? "present" : "missing", calibrated ? "enabled" : "disabled");
         EXPECT(calibrated == (device_clock && qpc_clock));
         const char* clock_path = calibrated ? "calibration-capable queue" : "standalone fallback";
+        std::fputs("d3d12_fence_timing: check clock calibration\n", stderr);
         EXPECT(check_calibration(queue.p, gpu_frequency, clock_path) == 0);
+        std::fputs("d3d12_fence_timing: check multiple-fence waits\n", stderr);
         EXPECT(check_multiple_fences(standalone.p, queue.p) == 0);
+        std::fputs("d3d12_fence_timing: check held CPU fence signals\n", stderr);
         EXPECT(check_held_cpu_signal(standalone.p, queue.p) == 0);
+        std::fputs("d3d12_fence_timing: check adapter LUID\n", stderr);
         EXPECT(check_luid(standalone.p) == 0);
+        std::fputs("d3d12_fence_timing: release standalone device and queue\n", stderr);
     }
 
+    std::fputs("d3d12_fence_timing: check Vulkan validation results\n", stderr);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

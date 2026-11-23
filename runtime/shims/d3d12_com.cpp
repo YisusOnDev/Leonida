@@ -1477,7 +1477,15 @@ public:
         : context_(context), fence_(context, initial), flags_(flags), highest_(initial) {}
 
     // As in D3D12, releasing the fence completes the waits still pending on it (ALL counts it as one fence).
-    ~Fence() override { context_.cancel_fence_waits(fence_.semaphore()); }
+    ~Fence() override {
+        // A ready callback has already left the dispatcher's pending list. Synchronize with it
+        // before VulkanFence destroys the semaphore, and prevent later callbacks from using it.
+        {
+            std::lock_guard lock(callback_lifetime_->mutex);
+            callback_lifetime_->released = true;
+        }
+        context_.cancel_fence_waits(fence_.semaphore());
+    }
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
@@ -1509,7 +1517,13 @@ public:
         // the queue value may not be reached, and signalling then would break the same rule: the signal is dropped.
         leonida::VulkanContext* context = &context_;
         const VkSemaphore semaphore = fence_.semaphore();
-        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
+        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_,
+                                                              lifetime = callback_lifetime_] {
+            std::lock_guard lock(lifetime->mutex);
+            if (lifetime->released) {
+                held->fetch_sub(1);
+                return;
+            }
             std::uint64_t now = 0;
             bool signaled = false;
             if (context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now) == VK_SUCCESS &&
@@ -1562,6 +1576,11 @@ private:
         return true;
     }
 
+    struct CallbackLifetime {
+        std::mutex mutex;
+        bool released = false;
+    };
+    std::shared_ptr<CallbackLifetime> callback_lifetime_ = std::make_shared<CallbackLifetime>();
     leonida::VulkanContext& context_;
     leonida::VulkanFence fence_;
     D3D12_FENCE_FLAGS flags_;
