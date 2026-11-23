@@ -718,6 +718,29 @@ std::string describe_window_near(uintptr_t address) {
                       static_cast<unsigned long>(info.State), static_cast<unsigned long>(info.Type),
                       static_cast<unsigned long>(info.Protect));
         text += buf;
+        // The allocation that holds the address: its first region, whether the shim mapped either address, and
+        // whether it is one of the sections' whole-section scratch views.
+        const uintptr_t alloc = reinterpret_cast<uintptr_t>(info.AllocationBase);
+        MEMORY_BASIC_INFORMATION head{};
+        if (alloc && VirtualQuery(info.AllocationBase, &head, sizeof(head))) {
+            std::snprintf(buf, sizeof(buf), " alloc-head=[size %llx state %lx type %lx prot %lx]",
+                          static_cast<unsigned long long>(head.RegionSize), static_cast<unsigned long>(head.State),
+                          static_cast<unsigned long>(head.Type), static_cast<unsigned long>(head.Protect));
+            text += buf;
+        }
+        std::snprintf(buf, sizeof(buf), " shim-mapped(addr)=%d shim-mapped(alloc)=%d", g_mapped.count(address) ? 1 : 0,
+                      g_mapped.count(alloc) ? 1 : 0);
+        text += buf;
+        std::set<const Section*> sections;
+        for (const auto& [page, backing] : g_pages) {
+            const Section* const section = backing.section.get();
+            if (!sections.insert(section).second || !section->scratch) continue;
+            MEMORY_BASIC_INFORMATION scratch{};
+            if (VirtualQuery(section->scratch, &scratch, sizeof(scratch)) && scratch.AllocationBase == info.AllocationBase) {
+                std::snprintf(buf, sizeof(buf), " IS-SCRATCH-VIEW(scratch %p)", section->scratch);
+                text += buf;
+            }
+        }
     }
     return text;
 }
