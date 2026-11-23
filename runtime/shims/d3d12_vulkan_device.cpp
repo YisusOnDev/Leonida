@@ -3639,6 +3639,20 @@ public:
             if (!fed) {  // D3D12 rejects an input layout that leaves a shader input unfed
                 std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
                              e.semantic.c_str(), e.semantic_index, e.register_index);
+                static std::atomic<int> detail{0};
+                if (detail.fetch_add(1, std::memory_order_relaxed) < 6) {
+                    std::fprintf(stderr, "[rt] d3d12:   %s reads:", stages[0].entry->name.c_str());
+                    for (const auto& in : stages[0].entry->input_signature)
+                        std::fprintf(stderr, " %s%u@r%u(sv %u)", in.semantic.c_str(), in.semantic_index,
+                                     in.register_index, in.system_value);
+                    std::fprintf(stderr, "; layout gives:");
+                    for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+                        const auto& el = desc.InputLayout.pInputElementDescs[i];
+                        std::fprintf(stderr, " %s%u fmt %d slot %u", el.SemanticName ? el.SemanticName : "?",
+                                     el.SemanticIndex, static_cast<int>(el.Format), el.InputSlot);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
                 return E_INVALIDARG;
             }
         }
@@ -3881,8 +3895,11 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
-        graphics_.pipeline = build(0);
-        if (!graphics_.pipeline) return E_FAIL;
+        // LEONIDA_LAZY_PSO=1: the fully bound pipeline is built at its first draw, like the variants below, so a title
+        // that creates tens of thousands of PSOs while loading is not held up by the driver's compile of each one.
+        static const bool lazy_pso = GetEnvironmentVariableW(L"LEONIDA_LAZY_PSO", nullptr, 0) != 0;
+        graphics_.pipeline = lazy_pso ? VK_NULL_HANDLE : build(0);
+        if (!lazy_pso && !graphics_.pipeline) return E_FAIL;
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
         if (code_stage) {

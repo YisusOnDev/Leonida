@@ -3378,9 +3378,30 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const
     pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
 
     const HRESULT hr = self->real->CreateGraphicsPipelineState(&pc_desc, *riid, out);
+    static std::atomic<std::uint64_t> ok_count{0}, fail_count{0};
+    (FAILED(hr) ? fail_count : ok_count).fetch_add(1, std::memory_order_relaxed);
+    if (call % 1000 == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 tally: %llu calls, %llu created, %llu refused by the PC device\n",
+                     static_cast<unsigned long long>(call),
+                     static_cast<unsigned long long>(ok_count.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(fail_count.load(std::memory_order_relaxed)));
     if (FAILED(hr)) {
         static std::atomic<int> fail_log{0};
-        if (fail_log.fetch_add(1, std::memory_order_relaxed) < 16)
+        const int failure = fail_log.fetch_add(1, std::memory_order_relaxed);
+        if (failure < 6) {  // the input layout read from the pipeline blob, to check the parser against the VS
+            std::uint32_t declared = 0, block = 0;
+            if (xbox_desc->pipeline_blob && xbox_desc->pipeline_blob_size >= 0x50) {
+                std::memcpy(&declared, static_cast<const std::uint8_t*>(xbox_desc->pipeline_blob) + 0x4c, 4);
+                std::memcpy(&block, static_cast<const std::uint8_t*>(xbox_desc->pipeline_blob) + 0x10, 4);
+            }
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 call %llu layout: +0x4c count %u, +0x10 %u, parsed %zu:",
+                         static_cast<unsigned long long>(call), declared, block, parsed_inputs.size());
+            for (const auto& e : parsed_inputs)
+                std::fprintf(stderr, " %s%u fmt %d slot %u off %u;", e.semantic_name.c_str(), e.semantic_index,
+                             static_cast<int>(e.format), e.input_slot, e.aligned_byte_offset);
+            std::fprintf(stderr, "\n");
+        }
+        if (failure < 16)
             std::fprintf(stderr,
                          "[rt] d3d12_xs: slot 57 call %llu failed with 0x%08lx (state %llu B, pipe %llu B, progA %llu B, "
                          "progB %llu B)\n",
