@@ -510,7 +510,8 @@ def find_dumps(containers: list | None = None) -> list:
             if v:
                 found[real] = (d, v)
                 return
-        if depth == 0:
+        # At the last level, inspect packaged files there without visiting any subfolders.
+        if depth == 0 and containers is None:
             return
         try:
             with os.scandir(d) as it:
@@ -520,7 +521,7 @@ def find_dumps(containers: list | None = None) -> list:
         subs = []
         for e in entries:
             try:
-                if e.is_dir(follow_symlinks=False):
+                if depth > 0 and e.is_dir(follow_symlinks=False):
                     if e.name.lower() not in skip and not e.name.startswith((".", "$")):
                         subs.append(e.path)
                 elif containers is not None and e.name.lower().endswith(CONTAINER_SUFFIXES) \
@@ -1344,13 +1345,20 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
 
 
 def fspx_cache_complete(spirv: str) -> bool:
-    """Check that the FSPX translation index names at least one program and that its named modules are present.
-    A translation that produced no modules writes a bare `{}`, which must not be cached as a finished step."""
+    """Require a runtime-addressable compute program and all of the modules in the saved translation index."""
     try:
         index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
     except ValueError:
         return False
-    return isinstance(index, dict) and bool(index) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    if not isinstance(index, dict):
+        return False
+    # The translator can write a module with an error-only metadata row. Such a module has no runtime lookup key.
+    has_compute_key = any(
+        isinstance(meta, dict) and meta.get("stage") == "cs"
+        and isinstance(meta.get("fspx_code_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", meta["fspx_code_sha256"])
+        for meta in index.values()
+    )
+    return has_compute_key and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
@@ -2359,7 +2367,7 @@ def require_translated_shaders(work: str) -> str:
     if not os.path.isfile(index):
         fail("No translated shaders yet: run the shaders stage first.")
     try:
-        with open(index, encoding="utf-8") as f:
+        with open(index, encoding="utf-8-sig") as f:
             translated = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"The translated shader index {index} is unreadable ({getattr(e, 'strerror', None) or e}): "
@@ -2506,7 +2514,7 @@ def pipeline_names(spirv: str) -> "list[str]":
     """The checker's name-sorted index (byte order, as its std::map); ranges and diagnostic probes share it."""
     path = os.path.join(spirv, "index.json")
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"pipelines: cannot read {path}: {getattr(e, 'strerror', None) or e}")

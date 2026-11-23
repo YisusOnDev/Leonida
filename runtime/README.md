@@ -52,6 +52,11 @@ argument is null (explicit unload). A map-only load receives no detach notificat
 `--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
 print the usage and exit 2 before anything is mapped.
 
+`--init` and `--run` first check that the host can run the game's AVX code (CPUID.1 AVX and OSXSAVE, XCR0 YMM
+state; `src/host_cpu.h`). Without it they print one line naming what is missing and exit 4 before anything is
+mapped. In a virtual machine, pass the host CPU through (QEMU `-cpu host`); under Rosetta on macOS, set
+`ROSETTA_ADVERTISE_AVX=1`. `LEONIDA_SKIP_CPU_CHECK=1` skips the check; `--dry-run` never runs it.
+
 The report line is:
 
 ```
@@ -135,6 +140,16 @@ slot. This reserves one index; every additional simultaneous TLS module gets its
 clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16 modules can be live at
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
+
+A `/GA` executable's code reaches its static TLS directly at index 0 (`mov r64, gs:[58h]`), but the
+loader can only get that image an index from the OS, and it need not be 0. Before the image's sections
+are protected and before any of its code runs, TLS callbacks included, the loader rewrites each such
+slot-0 read in an executable section to the same instruction reading `TEB->TlsSlots[slot]` instead
+(`patch_ga_tls_reads`), with one `TlsAlloc` slot per image; the rewrite is the same length, so nothing
+else in the image moves. It applies only to an EXE whose own TLS index is not 0 and that has a TLS
+directory; the loader's log names the image, the number of rewritten reads and the slot. Set
+`LEONIDA_TLS_GA_PATCH=0` to turn the rewrite off, for measuring what the image does without it; any other
+value, or leaving it unset, keeps it on.
 
 Current limits, by design:
 
@@ -275,6 +290,52 @@ readings, plays each motor and trigger, and holds a constant force on a pad that
 16-byte aligned at the call into the runtime, that rbx/rbp/rdi/rsi/r12-r15 and xmm6-xmm15 survive a call
 (`test/fixtures/abi_probe.asm`, MASM; skipped without `ml64`), and that `RtlVirtualUnwind` from inside the call walks
 back to the caller.
+
+### PE-loader fuzzer: `pe_loader_fuzz`
+
+`pe_loader_fuzz` (RT-388) is a deterministic mutation fuzzer for `Loader::load`. Each case builds three small
+synthetic DLLs in the test itself (headers and four sections, base relocations, import and delay-import tables, exports
+with forwarders and ordinal-only entries, a TLS directory with template, index and callbacks, and an exception
+directory with `UNWIND_INFO`), mutates their fields and bytes, writes them to a scratch folder and loads the first one.
+A case passes when `load()` returns or throws a `std::exception`, the `Loader` is destroyed again, and after a
+successful load every export and unwind table lies inside its image. It fails on a crash, an AddressSanitizer report,
+a non-`std::exception` throw, or a case that runs past `--timeout-ms` (30 s). No image code runs (it never calls
+`initialise()`), and nothing is read from the game.
+
+CTest runs the first 120 cases of the fixed seed. Case `N` of a seed is the same everywhere, so a failure reproduces
+with `--case N` and shrinks with `--minimize N`, which retries in child processes with each mutation left out and
+prints the ones the failure needs. `--dump N DIR` writes the case's images for a closer look. A process memory limit
+(`--mem-mb`, 1024 by default) turns a mutated size of several gigabytes into a failed allocation. On a machine
+with many threads, most of each case is the loader's snapshot of every thread in the system for a TLS module
+(`install_on_existing_threads`); expect a few cases per second.
+
+```powershell
+pe_loader_fuzz --iters 20000                 # or --seconds 3600; LEONIDA_LOADER_FUZZ_ITERS/_SECONDS/_SEED
+pe_loader_fuzz --seed 0x4C454F4E49444131 --case 1234 --verbose
+pe_loader_fuzz --minimize 1234
+pe_loader_fuzz --start 10000000 --seconds 3600   # a second process on another range of cases
+```
+
+For AddressSanitizer, configure a separate build with `-DLEONIDA_LOADER_FUZZ_ASAN=ON` and `RelWithDebInfo`
+(`/fsanitize=address` does not combine with Debug's `/RTC1`). That instruments the fuzzer and the loader sources
+compiled into it, and copies `clang_rt.asan_dynamic-x86_64.dll` beside the test. MSVC needs the Visual Studio
+component "C++ AddressSanitizer". clang-cl from an official LLVM release works with the MSVC headers and libraries
+(LLVM 23.1.5 with MSVC 14.44 was tested). Run it from an x64 Developer prompt:
+
+```powershell
+cmake -S runtime -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_LOADER_FUZZ_ASAN=ON `
+  -DCMAKE_C_COMPILER=<llvm>/bin/clang-cl.exe -DCMAKE_CXX_COMPILER=<llvm>/bin/clang-cl.exe `
+  -DCMAKE_LINKER=<llvm>/bin/lld-link.exe -DCMAKE_AR=<llvm>/bin/llvm-lib.exe -DCMAKE_RC_COMPILER=<llvm>/bin/llvm-rc.exe `
+  -DCMAKE_MT=<llvm>/bin/llvm-mt.exe
+cmake --build build-asan --target pe_loader_fuzz
+build-asan/pe_loader_fuzz --seconds 3600
+```
+
+With clang-cl the target is built with `-fsanitize-address-use-after-return=never`: clang-cl 23's
+stack-use-after-return frames make MSVC C++ exception dispatch fault in `_C_specific_handler_noexcept` at `/O2`, and
+every rejected image is a thrown exception. STL container annotations are off (`_DISABLE_STRING_ANNOTATION`,
+`_DISABLE_VECTOR_ANNOTATION`), because they need the component's `stl_asan.lib` and the libraries linked in are
+built without ASan.
 
 The PE-loader and Bink-decode tests that need the retail package are optional: when
 `LEONIDA_GAME_DIR` (and, for Bink, `LEONIDA_MOVIE`) is unset they print `SKIP` and exit 0. They read
@@ -462,6 +523,8 @@ dimension outside the enum must be refused alike. It also copies a pattern throu
 ```powershell
 $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_placed_dimensions_test.exe
+```
+
 ### 1D render targets and depth buffers
 
 `d3d12_texture1d_target_test` creates `TEXTURE1D` textures with `ALLOW_RENDER_TARGET` (10 color formats) or
