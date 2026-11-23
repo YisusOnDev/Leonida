@@ -3214,13 +3214,14 @@ bool parse_xbox_pipeline_blob_input_layout_impl(const void* blob, std::size_t bl
         const std::size_t name_len = static_cast<const std::uint8_t*>(nul) - (bytes + pos);
         if (name_len == 0) break;
         const std::size_t fields_pos = pos + name_len + 1;
-        // Need at least the first 4 u32s (+0x00 slot, +0x04 DXGI_FORMAT, +0x08 SemanticIndex, +0x0c AlignedByteOffset)
+        // Need at least the first 4 u32s (+0x00 SemanticIndex, +0x04 DXGI_FORMAT, +0x08 input slot, +0x0c AlignedByteOffset;
+        // the retail boot's COLOR0/COLOR1/POSITION0 layouts at offsets 0/4/8 of one buffer give the index and slot order)
         // inside blob_size; never read past blob_size even when the last 1..4 bytes of the 28-byte block are truncated.
         if (fields_pos + 16 > blob_size) break;
         std::uint32_t slot = 0, fmt = 0, sem_idx = 0, byte_off = 0;
-        read_u32(fields_pos + 0x00, slot);
+        read_u32(fields_pos + 0x00, sem_idx);
         read_u32(fields_pos + 0x04, fmt);
-        read_u32(fields_pos + 0x08, sem_idx);
+        read_u32(fields_pos + 0x08, slot);
         read_u32(fields_pos + 0x0c, byte_off);
         XboxPipelineInputElement elem;
         elem.semantic_name.assign(reinterpret_cast<const char*>(bytes + pos), name_len);
