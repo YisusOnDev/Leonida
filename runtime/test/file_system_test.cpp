@@ -277,9 +277,15 @@ void run_checks(const std::filesystem::path& root) {
         h = create_w(L"GAME:\\data\\absent_on.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "a missing open still fails the same way with the trace on");
+        h = create_a("GAME:\\data\\absent_on.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND, "missing ANSI open keeps the host error");
+        h = create_a("GAME:", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME, "refused ANSI open keeps the shim error");
         rt::startup_trace::close();
         const std::string log = events();
-        check(count(log, "\"kind\":\"file_open_failed\"") == 1, "one file_open_failed event");
+        check(count(log, "\"kind\":\"file_open_failed\"") == 3, "one event per failed open");
+        check(count(log, "\"api\":\"CreateFileW\"") == 1, "wide open records CreateFileW");
+        check(count(log, "\"api\":\"CreateFileA\"") == 2, "host and shim failures record CreateFileA");
         check(log.find("\"path\":\"GAME:\\\\data\\\\absent_on.txt\"") != std::string::npos, "the event names the path");
         check(log.find("\"error\":2,") != std::string::npos, "the event carries error 2");
         check(log.find("\"caller\":\"host:") != std::string::npos, "the event names a caller");

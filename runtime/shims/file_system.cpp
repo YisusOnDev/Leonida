@@ -654,25 +654,30 @@ void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* c
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
-HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
-                            DWORD disposition, DWORD flags, HANDLE template_file) {
+HANDLE open_file(const char* api, const void* caller, LPCWSTR name, DWORD access, DWORD share,
+                 LPSECURITY_ATTRIBUTES attributes, DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
     const Target t = open_target(name, access, disposition);
     if (t.error) {
-        note_open_failure("CreateFileW", name, t.error, _ReturnAddress());
+        note_open_failure(api, name, t.error, caller);
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
     const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
-        note_open_failure("CreateFileW", name, error, _ReturnAddress());
+        note_open_failure(api, name, error, caller);
         SetLastError(error);
     }
     return h;
+}
+
+HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
+                            DWORD disposition, DWORD flags, HANDLE template_file) {
+    return open_file("CreateFileW", _ReturnAddress(), name, access, share, attributes, disposition, flags, template_file);
 }
 
 HANDLE WINAPI create_file_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
@@ -682,7 +687,7 @@ HANDLE WINAPI create_file_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_A
         return INVALID_HANDLE_VALUE;
     }
     const std::wstring wide = widen_ansi(name);
-    return create_file_w(wide.c_str(), access, share, attributes, disposition, flags, template_file);
+    return open_file("CreateFileA", _ReturnAddress(), wide.c_str(), access, share, attributes, disposition, flags, template_file);
 }
 
 HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD disposition,
