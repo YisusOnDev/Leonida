@@ -118,6 +118,8 @@ leonida::DebugProbe debug_probe_from_env() {
     if (!settings.problem.empty() && first_time(settings.problem))
         std::fprintf(stderr, "[rt] d3d12: %s\n", settings.problem.c_str());
     return settings;
+}
+
 // memcpy that a page fault ends instead of killing the process: the title may decommit a page between the
 // VirtualQuery that saw it committed and the read. No C++ objects here: it is a __try frame.
 // `streaming` reads with MOVNTDQA, for write-combined pages: ordinary loads from them are not cached, and memcpy
