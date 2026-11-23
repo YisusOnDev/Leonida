@@ -273,6 +273,18 @@ int check_slots(const Backend& b) {
             EXPECT(qhits(10) == before + 1);
             EXPECT(SUCCEEDED(queue->Signal(fence.p, 6)));
             if (wait_for(label, fence.p, 6)) return 1;
+            // Console slot 35 (ExecuteCommandListsX) submits the same closed list through PC slot 10; its own fence
+            // keeps the numbering of the checks below.
+            {
+                Ref<ID3D12Fence> fence35;
+                EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence35.p))));
+                const std::uint64_t before10 = qhits(10), before35 = qhits(35);
+                EXPECT(raw_call(queue.p, 35, (0xdeadbeefull << 32) | 1ull, reinterpret_cast<std::uint64_t>(lists)) ==
+                       0);
+                EXPECT(qhits(35) == before35 + 1 && qhits(10) == before10 && xs::queue_slot_first_call_seen(35));
+                EXPECT(SUCCEEDED(queue->Signal(fence35.p, 1)));
+                if (wait_for(label, fence35.p, 1)) return 1;
+            }
             if (b.vulkan) {
                 // The layer's own helpers find their queue behind the proxy.
                 EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
@@ -412,7 +424,7 @@ int check_slots(const Backend& b) {
 
         // The refused tail: every slot from the end of the public chain to the end of the table, but fence slot 12.
         for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
-            if (slot == 23 || slot == 30) continue;
+            if (slot == 23 || slot == 30 || xs::queue_slot_overridden(slot)) continue;  // 35: ExecuteCommandListsX
             before = qhits(slot);
             EXPECT(as_hr(call_slot(queue.p, slot)) == S_OK);
             EXPECT(qhits(slot) == before + 1 && xs::queue_slot_first_call_seen(slot));
