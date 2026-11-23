@@ -836,11 +836,19 @@ void test_motion(IGameInput* input) {
     check(pi->motionInfo == nullptr, "motion: the plain pad's motionInfo is null");
 
     // Before the first sensor sample arrives, SDL answers reads with zeros and the shim reports no motion at all.
+    // Keep this reading: the history-walk controls below start from it (it predates every Motion reading).
     IGameInputReading* r = nullptr;
+    IGameInputReading* pre_sample = nullptr;
     GameInputMotionState unused{};
     check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r && !r->GetMotionState(&unused),
           "motion: before the first sample, GetMotionState is false even on a sensor pad");
-    if (r) r->Release();
+    pre_sample = r;
+
+    r = nullptr;
+    check(input->GetCurrentReading(GameInputKindMotion, mdev, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "motion: before the first sample, a motion query on the sensor pad is READING_NOT_FOUND");
+    check(input->GetCurrentReading(GameInputKindMotion, nullptr, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "motion: before the first sample, a motion query with no device is READING_NOT_FOUND");
 
     r = nullptr;
     check(input->GetCurrentReading(GameInputKindMotion, mdev, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
@@ -868,6 +876,34 @@ void test_motion(IGameInput* input) {
     check(input->GetCurrentReading(GameInputKindMotion, nullptr, &r) == S_OK && r &&
               (r->GetInputKind() & GameInputKindMotion),
           "motion: a motion reading is found by kind with no device");
+
+    // RT-370: find_reading used to pick the nearest reading in history by order alone, so a Motion query could land
+    // on a plain-pad reading that carries no Motion state. Walking back from this Motion reading must skip every
+    // reading without Motion (it may simply run out and return READING_NOT_FOUND).
+    IGameInputReading* motion_prev = nullptr;
+    const HRESULT ph = input->GetPreviousReading(r, GameInputKindMotion, nullptr, &motion_prev);
+    check(ph == S_OK ? (motion_prev && (motion_prev->GetInputKind() & GameInputKindMotion) != 0)
+                     : (ph == GAMEINPUT_E_READING_NOT_FOUND && !motion_prev),
+          "motion: GetPreviousReading with a Motion filter returns only Motion readings or READING_NOT_FOUND");
+    if (motion_prev) motion_prev->Release();
+
+    // Both traversal directions and the device filter must apply the same kind predicate. sennecools verified
+    // these two paths locally against this head; pin them so a future regression is caught by the committed test.
+    IGameInputReading* motion_prev_dev = nullptr;
+    const HRESULT phd = input->GetPreviousReading(r, GameInputKindMotion, mdev, &motion_prev_dev);
+    check(phd == GAMEINPUT_E_READING_NOT_FOUND && !motion_prev_dev,
+          "motion: GetPreviousReading from the first Motion reading with a device filter is READING_NOT_FOUND");
+    if (motion_prev_dev) motion_prev_dev->Release();
+
+    IGameInputReading* motion_next = nullptr;
+    const HRESULT nh = pre_sample ? input->GetNextReading(pre_sample, GameInputKindMotion, nullptr, &motion_next)
+                                  : E_FAIL;
+    check(nh == S_OK ? (motion_next && (motion_next->GetInputKind() & GameInputKindMotion) != 0)
+                     : (nh == GAMEINPUT_E_READING_NOT_FOUND && !motion_next),
+          "motion: GetNextReading with a Motion filter from a pre-sample reading finds only Motion readings "
+          "or READING_NOT_FOUND");
+    if (motion_next) motion_next->Release();
+    if (pre_sample) pre_sample->Release();
     if (r) r->Release();
 
     r = nullptr;
