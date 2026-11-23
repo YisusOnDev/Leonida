@@ -1161,6 +1161,25 @@ void test_aggregate_device(IGameInput* input) {
                 check(buttons_of(prev) == GameInputGamepadA, "prior reading has pressed button");
                 prev->Release();
             }
+
+            // One poll records the new pad's idle baseline before the existing pad's button press.
+            Pad second;
+            attach(second, "Leonida virtual second pad", 0x045E, 0x02FF, false);
+            SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+            rt::gameinput::poll();
+            auto readings = walk(input, r2, nullptr, true, 3);
+            const bool same_poll = readings.size() == 2 && readings[0]->GetTimestamp() == readings[1]->GetTimestamp() &&
+                                   device_of(readings[0]) != device_of(readings[1]) &&
+                                   buttons_of(readings[0]) == 0 && buttons_of(readings[1]) == GameInputGamepadA;
+            check(same_poll, "hot-plug: history records the idle pad then the button press at one timestamp");
+            IGameInputReading* all_pads = current(input, nullptr);
+            IGameInputReading* aggregate = current(input, agg);
+            check(same_poll && all_pads == readings.back(), "hot-plug: unfiltered current is the last history reading");
+            check(same_poll && aggregate == readings.back(), "hot-plug: aggregate current is the last history reading");
+            if (all_pads) all_pads->Release();
+            if (aggregate) aggregate->Release();
+            release_all(readings);
+            detach(second);
             r2->Release();
         }
 

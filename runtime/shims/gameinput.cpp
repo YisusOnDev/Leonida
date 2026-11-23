@@ -2327,6 +2327,7 @@ public:
         *out = nullptr;
         if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
         std::lock_guard lock(g().mu);
+        // Readings taken in one poll share a timestamp. Use the same order as GetNextReading.
         Reading* best = nullptr;
         if (device) {
             Device* d = as_device(device);
@@ -2336,7 +2337,7 @@ public:
                 const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
                 for (Device* cd : g().connected) {
                     if (!(effective_kind & cd->info.supportedInput)) continue;
-                    if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+                    if (Reading* r = cd->latest(); r && (!best || r->order() > best->order())) best = r;
                 }
             } else {
                 if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
@@ -2346,7 +2347,7 @@ public:
             }
         } else {
             for (Device* d : g().connected)  // the most recent reading from any gamepad
-                if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+                if (Reading* r = d->latest(); r && (!best || r->order() > best->order())) best = r;
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();
