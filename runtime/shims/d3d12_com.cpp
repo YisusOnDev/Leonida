@@ -1815,6 +1815,25 @@ public:
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                         .count()));
             }
+            // The title-VA counters of src/title_va_alias.h, on the first submissions with tables and then at powers
+            // of two: whether a shader address in the title's memory got a GPU copy (translated) or not.
+            static std::atomic<std::uint64_t> reports{0};
+            if (!tables.empty()) {
+                const std::uint64_t n = ++reports;
+                if (n <= 8 || !(n & (n - 1))) {
+                    auto& a = leonida::title_va_aliases();
+                    std::string line;
+                    for (unsigned k = 0; k < leonida::TitleVaAliases::kind_count; ++k) {
+                        const auto kind = static_cast<leonida::TitleVaAliases::Kind>(k);
+                        line += std::string(", ") + leonida::TitleVaAliases::kKindNames[k] + " " +
+                                std::to_string(a.translated(kind)) + "/" + std::to_string(a.untranslated(kind));
+                    }
+                    std::fprintf(stderr, "[rt] d3d12: title VAs at submission %llu: %zu ranges, %llu tables%s "
+                                         "(translated/untranslated)\n",
+                                 static_cast<unsigned long long>(n), a.size(),
+                                 static_cast<unsigned long long>(tables.size()), line.c_str());
+                }
+            }
         }
         last_result_ = queue_.execute(recorded, &skipped_, [&graphics] { return pin_lists(graphics); });
         if (last_result_ == leonida::ReplayResult::skipped_unsupported) {

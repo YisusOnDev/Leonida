@@ -1393,6 +1393,9 @@ public:
     void set_heap_base(std::uint64_t heap_base) {
         std::unique_lock lock(resource_mutex_);
         replay_.heap_base = heap_base;
+        // A GPU page fault names a device address; the console VA a shader added heap_base to is that minus this.
+        std::fprintf(stderr, "[rt] d3d12: heap_base (arena device address) 0x%llx\n",
+                     static_cast<unsigned long long>(heap_base));
     }
 
     // Zeroed memory for unbound vertex and index buffers to read (ReplayFunctions::zero_buffer).

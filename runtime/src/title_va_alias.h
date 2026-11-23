@@ -242,9 +242,9 @@ private:
 };
 
 // The process's table: the device's title ranges and hooks, read by the command lists and descriptor writers.
-inline TitleVaAliases& title_va_aliases() {
-    static TitleVaAliases aliases;
-    return aliases;
-}
+// Namespace scope, not a function-local static: xmem's shims reach it first on a title thread, and a guarded static's
+// first use there goes through the exe's TLS slot (docs/loader notes on guarded statics).
+inline TitleVaAliases g_title_va_aliases;
+inline TitleVaAliases& title_va_aliases() { return g_title_va_aliases; }
 
 }  // namespace leonida
