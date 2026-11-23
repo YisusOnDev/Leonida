@@ -4,6 +4,9 @@
 // game data, nothing online.
 #include <windows.h>
 
+#include <aclapi.h>
+#undef small   // rpcndr.h, through aclapi.h, defines it as char
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -295,6 +298,41 @@ int main() {
     int64_t fquota = 0;
     check(at<FilesQuota>(save, 32)(save, user, "SCID", &fquota) == S_OK && fquota == (int64_t{1} << 30),
           "FilesGetRemainingQuota of an empty folder");
+    {
+        // A subfolder the walk may not list (an empty protected DACL) is skipped: the quota is the files it can read,
+        // and no std::filesystem exception reaches the title through the slot.
+        const auto files = std::filesystem::u8path(folder.c_str());
+        std::ofstream(files / L"kept.bin", std::ios::binary) << std::string(100, 'k');
+        const auto locked = files / L"locked";
+        std::filesystem::create_directories(locked, ec);   // empty: a file inside would lose its inherited ACEs too
+        ACL empty{};
+        const bool acl_set = InitializeAcl(&empty, sizeof(empty), ACL_REVISION) &&
+                             SetNamedSecurityInfoW(const_cast<wchar_t*>(locked.c_str()), SE_FILE_OBJECT,
+                                                   DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                                   nullptr, nullptr, &empty, nullptr) == ERROR_SUCCESS;
+        std::error_code probe;
+        std::filesystem::directory_iterator listing(locked, probe);
+        if (!acl_set || !probe) {
+            std::printf("SKIP this account can still list a folder with an empty DACL; the locked-folder check needs it\n");
+        } else {
+            int64_t locked_quota = 0;
+            HRESULT hr = E_FAIL;
+            try {
+                hr = at<FilesQuota>(save, 32)(save, user, "SCID", &locked_quota);
+            } catch (const std::exception& e) {
+                std::printf("     threw: %s\n", e.what());
+                hr = E_UNEXPECTED;
+            }
+            check(hr == S_OK && locked_quota == (int64_t{1} << 30) - 100,
+                  "FilesGetRemainingQuota skips a subfolder it may not list instead of throwing");
+        }
+        // No explicit ACEs, inheritance back on: the folder's access is its parent's again, so it can be removed.
+        SetNamedSecurityInfoW(const_cast<wchar_t*>(locked.c_str()), SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                              &empty, nullptr);
+        std::filesystem::remove_all(locked, ec);
+        std::filesystem::remove(files / L"kept.bin", ec);
+    }
 
     // ---- a handle that outlives its container, after the heap hands the address out again ----
     // An update and an async read keep the container handle they were made from. Once that container is closed, the

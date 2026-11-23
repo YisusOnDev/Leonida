@@ -236,11 +236,13 @@ struct BlobFile {
 std::vector<BlobFile> list_blobs(const fs::path& dir) {
     std::vector<BlobFile> out;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
-        if (!e.is_regular_file(ec)) continue;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code file_ec;
+        if (!it->is_regular_file(file_ec)) continue;
         std::string name;
-        if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
-        out.push_back({name, static_cast<uint64_t>(e.file_size(ec)), e.path()});
+        if (!decode_name(narrow(it->path().filename().wstring()), name)) continue;
+        const uintmax_t size = it->file_size(file_ec);
+        if (!file_ec) out.push_back({name, static_cast<uint64_t>(size), it->path()});
     }
     std::sort(out.begin(), out.end(), [](const BlobFile& a, const BlobFile& b) { return a.name < b.name; });
     return out;
@@ -289,12 +291,13 @@ ContainerRecord describe(const std::string& name, const fs::path& dir) {
 std::vector<ContainerRecord> list_containers(const fs::path& user_dir, std::string_view prefix) {
     std::vector<ContainerRecord> out;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(user_dir, ec)) {
-        if (!e.is_directory(ec)) continue;
+    for (fs::directory_iterator it(user_dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code dir_ec;
+        if (!it->is_directory(dir_ec)) continue;
         std::string name;
-        if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
+        if (!decode_name(narrow(it->path().filename().wstring()), name)) continue;
         if (name.compare(0, prefix.size(), prefix) != 0) continue;
-        out.push_back(describe(name, e.path()));
+        out.push_back(describe(name, it->path()));
     }
     std::sort(out.begin(), out.end(), [](const ContainerRecord& a, const ContainerRecord& b) { return a.name < b.name; });
     return out;
@@ -883,8 +886,15 @@ HRESULT STDMETHODCALLTYPE files_quota(void*, XUserHandle user, const char* confi
     if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
     uint64_t used = 0;
     std::error_code ec;
-    for (const auto& e : fs::recursive_directory_iterator(root / L"files" / widen(encode_name(config_id)), ec))
-        if (e.is_regular_file(ec)) used += static_cast<uint64_t>(e.file_size(ec));
+    // increment(ec), not the range-for's throwing operator++: no std::filesystem exception may reach the title.
+    for (fs::recursive_directory_iterator it(root / L"files" / widen(encode_name(config_id)),
+                                             fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        std::error_code file_ec;
+        if (!it->is_regular_file(file_ec)) continue;
+        const uintmax_t size = it->file_size(file_ec);
+        if (!file_ec) used += size;
+    }
     *remaining = used >= kQuotaBytes ? 0 : static_cast<int64_t>(kQuotaBytes - used);
     return S_OK;
 }
