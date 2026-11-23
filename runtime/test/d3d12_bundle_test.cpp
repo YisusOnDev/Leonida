@@ -574,6 +574,70 @@ struct TraceCapture {
 bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, const std::vector<std::uint8_t>& ps,
                   const std::filesystem::path& scratch) {
     constexpr UINT8 all = D3D12_COLOR_WRITE_ENABLE_ALL;
+    // Overflowing IA ranges are valid at Close, but on native D3D12 drivers their use immediately
+    // before a draw can remove the device. Verify the IR state snapshot without submitting that
+    // ambiguous draw. In particular, preserve slot 0 and copy exactly the available slots 30/31.
+    {
+        Rig r;
+        CHECK(r.init(device, vs, ps));
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> direct;
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                  IID_PPV_ARGS(&direct.p))));
+        r.targets(direct.p);
+        direct->SetGraphicsRootSignature(r.root1.p);
+        direct->SetPipelineState(r.pso_a.p);
+        direct->IASetPrimitiveTopology(strip);
+        r.vertices(direct.p, vb_quad);
+        const D3D12_VERTEX_BUFFER_VIEW views[4] = {
+            {r.upload_va + vb_quad, 4 * sizeof(Vertex), sizeof(Vertex)},
+            {r.upload_va + vb_other, 4 * sizeof(Vertex), sizeof(Vertex)},
+            {r.upload_va + vb_other, 4 * sizeof(Vertex), sizeof(Vertex)},
+            {r.upload_va + vb_other, 4 * sizeof(Vertex), sizeof(Vertex)}};
+        direct->IASetVertexBuffers(30, 4, views);
+        direct->IASetVertexBuffers(32, 1, views);  // entirely outside, no state change
+        direct->IASetVertexBuffers(31, 0, nullptr);  // zero count, no state change
+        direct->DrawInstanced(4, 1, 0, 0);
+        CHECK(direct->Close() == S_OK);
+        std::vector<leonida::Command> commands;
+        CHECK(rt::d3d12::recorded_commands(direct.p, commands));
+        const auto* draw = commands.empty() ? nullptr : std::get_if<leonida::Draw>(&commands.back());
+        CHECK(draw && draw->vertex_buffers[0].va == r.upload_va + vb_quad &&
+              draw->vertex_buffers[30].va == r.upload_va + vb_quad &&
+              draw->vertex_buffers[31].va == r.upload_va + vb_other &&
+              draw->vertex_buffers[29].va == 0);
+
+        auto* bundle = r.bundle(r.pso_a.p, [&](ID3D12GraphicsCommandList* b) {
+            b->IASetPrimitiveTopology(strip);
+            D3D12_VERTEX_BUFFER_VIEW deferred[4] = {views[0], views[1], views[2], views[3]};
+            b->IASetVertexBuffers(30, 4, deferred);
+            deferred[0].BufferLocation = deferred[1].BufferLocation = 0;  // snapshot must own its copy
+            b->IASetVertexBuffers(32, 1, deferred);
+            b->DrawInstanced(4, 1, 0, 0);
+        });
+        CHECK(bundle);
+        Ref<ID3D12CommandAllocator> parent_allocator;
+        Ref<ID3D12GraphicsCommandList> parent;
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                        IID_PPV_ARGS(&parent_allocator.p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, parent_allocator.p, nullptr,
+                                                  IID_PPV_ARGS(&parent.p))));
+        r.targets(parent.p);
+        parent->SetGraphicsRootSignature(r.root1.p);
+        r.vertices(parent.p, vb_quad);
+        parent->ExecuteBundle(bundle);
+        CHECK(parent->Close() == S_OK);
+        commands.clear();
+        CHECK(rt::d3d12::recorded_commands(parent.p, commands));
+        draw = nullptr;
+        for (const auto& command : commands)
+            if (const auto* d = std::get_if<leonida::Draw>(&command)) draw = d;
+        CHECK(draw && draw->vertex_buffers[0].va == r.upload_va + vb_quad &&
+              draw->vertex_buffers[30].va == r.upload_va + vb_quad &&
+              draw->vertex_buffers[31].va == r.upload_va + vb_other &&
+              draw->vertex_buffers[29].va == 0);
+    }
     // The parent's commands hold the bundle's markers and draws where the bundle made them, between the parent's own.
     {
         Rig r;

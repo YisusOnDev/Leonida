@@ -415,7 +415,13 @@ public:
     }
 
     void STDMETHODCALLTYPE IASetVertexBuffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) override {
-        if (std::uint64_t(start) + count > vertex_buffers_.size()) return check(false);
+        // D3D12 accepts a range extending past the last vertex slot: only the slots that exist
+        // are updated. A wholly out-of-range range (including a zero count) leaves state alone.
+        // Bound both deferred bundle snapshots and immediate writes, avoiding any out-of-bounds
+        // access even for an enormous guest count.
+        if (start >= vertex_buffers_.size()) return;
+        count = std::min<UINT>(count, UINT(vertex_buffers_.size()) - start);
+        if (!count) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
             std::vector<D3D12_VERTEX_BUFFER_VIEW> copy;
             if (views) copy.assign(views, views + count);
