@@ -14,6 +14,7 @@
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
 #include <windows.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <map>
@@ -45,6 +46,16 @@ std::mutex& loader_mutex() {
 std::deque<Pseudo>& pseudos() {   // a deque never moves its elements, so handed-out handles stay valid
     static auto* d = new std::deque<Pseudo>;
     return *d;
+}
+
+std::map<HMODULE, std::string>& host_module_names() {
+    static auto* names = new std::map<HMODULE, std::string>;
+    return *names;
+}
+
+uint64_t& host_module_epoch() {
+    static uint64_t epoch = 0;
+    return epoch;
 }
 
 std::string lower_ascii(std::string s) {
@@ -84,31 +95,43 @@ bool ascii_basename(const wchar_t* name) {
 // LoadLibrary's file-name rules for the module a path names: the last path component, lower case, and ".dll" added
 // when there is no extension (a trailing '.' means "no extension, add nothing").
 std::string module_name(std::string path) {
-    const size_t slash = path.find_last_of("\\/");
-    if (slash != std::string::npos) path.erase(0, slash + 1);
+    const size_t sep = path.find_last_of("\\/:");
+    if (sep != std::string::npos) path.erase(0, sep + 1);
+    if (path.empty()) return {};
     path = lower_ascii(path);
-    if (!path.empty() && path.back() == '.') path.pop_back();
+    if (path.back() == '.') path.pop_back();
     else if (path.find('.') == std::string::npos) path += ".dll";
     return path;
 }
 
 std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
+    uint64_t epoch = 0;
+    {
+        std::lock_guard lock(loader_mutex());
+        auto& names = host_module_names();
+        if (auto it = names.find(module); it != names.end()) return it->second;
+        epoch = host_module_epoch();
+    }
 
+    // Query Windows outside loader_mutex_ so FreeLibrary / loader-lock callers cannot invert locks with us.
     std::vector<wchar_t> path(MAX_PATH);
+    std::string name;
     for (;;) {
         const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
         if (!length) return {};
         if (length < path.size()) {
-            const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
-            return name;
+            name = module_name(narrow(path.data()));
+            break;
         }
         if (path.size() == 32768) return {};
         path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
     }
+
+    if (!name.empty()) {
+        std::lock_guard lock(loader_mutex());
+        if (host_module_epoch() == epoch) host_module_names().emplace(module, name);
+    }
+    return name;
 }
 
 }  // namespace
@@ -267,7 +290,7 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
-    if (module && !IS_INTRESOURCE(name)) {
+    if (module) {
         const DWORD error = GetLastError();
         const std::string dll = host_module_name(module);
         void* shim = dll.empty() ? nullptr : find(dll, what);
@@ -280,7 +303,15 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
 BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
     if (owns_bundled_module_handle(module)) return TRUE;  // mapped modules stay live until ~Loader detaches them
-    return FreeLibrary(module);
+    const BOOL ok = FreeLibrary(module);
+    if (module) {
+        const DWORD error = GetLastError();
+        std::lock_guard lock(loader_mutex());
+        ++host_module_epoch();
+        host_module_names().erase(module);
+        SetLastError(error);
+    }
+    return ok;
 }
 
 // DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
