@@ -3182,9 +3182,33 @@ bool parse_xbox_pipeline_blob_input_layout_impl(const void* blob, std::size_t bl
         return false;
     if (num_elements == 0 || num_elements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) return true;
     // Measured at +0x10: 0x1c (28 bytes = 7 u32) in PSOs 1 and 2, 0 in PSO 3 where the element stride is still 28 B.
-    const std::size_t stride_after_name = (field_block_size >= 16 && field_block_size <= 64) ? field_block_size : 28u;
+    // In the retail boot's later PSOs +0x10 holds 24 or 26 with three elements, and taking it as the stride lands
+    // inside the next semantic name: the stride after the name is 28 B, and +0x10 is something else.
+    (void)field_block_size;
+    constexpr std::size_t stride_after_name = 28u;
+    // A semantic name: an identifier of at least two characters, NUL-terminated within the blob.
+    const auto name_at = [&](std::size_t at) -> std::size_t {
+        std::size_t n = 0;
+        while (at + n < blob_size && bytes[at + n]) {
+            const char c = static_cast<char>(bytes[at + n]);
+            const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+            if (!alpha && !(n && c >= '0' && c <= '9')) return 0;
+            ++n;
+        }
+        return (at + n < blob_size && n >= 2) ? n : 0;
+    };
     std::size_t pos = 0x54;
     for (std::uint32_t idx = 0; idx < num_elements && pos + 4 <= blob_size; ++idx) {
+        if (idx && !name_at(pos)) {  // not where the measured stride puts it: look a little further on
+            std::size_t found = 0;
+            for (std::size_t at = pos > 12 ? pos - 12 : pos; at < pos + 36 && at < blob_size; ++at)
+                if (name_at(at) && (at == 0 || bytes[at - 1] == 0 || bytes[at - 1] > 0x7f || bytes[at - 1] < 0x20)) {
+                    found = at;
+                    break;
+                }
+            if (!found) break;
+            pos = found;
+        }
         const void* nul = std::memchr(bytes + pos, 0, blob_size - pos);
         if (!nul) break;
         const std::size_t name_len = static_cast<const std::uint8_t*>(nul) - (bytes + pos);
