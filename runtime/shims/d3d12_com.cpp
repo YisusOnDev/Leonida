@@ -6,6 +6,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/title_va_alias.h"
 
 #include <algorithm>
 #include <array>
@@ -1372,6 +1373,10 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
+        // A root view inside a buffer the title placed at its own VA (device slot 133) gets the console VA of the
+        // buffer's GPU copy, so the shader's heap_base + VA reaches it (src/title_va_alias.h). Descriptor tables are
+        // the layer's own heaps: never translated.
+        if (type == rt::rootsig::ParamType::Descriptor) va = leonida::title_va_aliases().shader_va(va);
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // A descriptor table is one dword at both bind points, the 32-bit VA of its first descriptor (the heaps live
