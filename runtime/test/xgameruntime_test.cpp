@@ -675,6 +675,132 @@ void check_run_time_load() {
                   "deleting the GAME: name leaves the storage file alone");
         }
 
+
+        {
+            // A path can exceed the startup caller's byte buffer even when it fits in MAX_PATH as UTF-16.
+            const auto unicode_overlay = scratch / (L"Unicode " + std::wstring(120, L'\u4f8b'));
+            const auto long_overlay = scratch / std::wstring(90, L'a') / std::wstring(90, L'b') / std::wstring(90, L'c');
+            const auto game_path = scratch / L"game";
+            const auto package_storage = game_path / rt::fs::kPersistentStorageDir;
+            std::filesystem::create_directories(package_storage);
+            std::ofstream(package_storage / L"cache.bin", std::ios::binary) << "package";
+
+            const auto create_a = reinterpret_cast<decltype(&::CreateFileA)>(rt::shims::find("kernel32.dll", "CreateFileA"));
+            const auto create_w = reinterpret_cast<decltype(&::CreateFileW)>(rt::shims::find("kernel32.dll", "CreateFileW"));
+            const auto find_ex_a = reinterpret_cast<decltype(&::FindFirstFileExA)>(
+                rt::shims::find("kernel32.dll", "FindFirstFileExA"));
+            const auto find_close = reinterpret_cast<decltype(&::FindClose)>(rt::shims::find("kernel32.dll", "FindClose"));
+            const auto remove_w = reinterpret_cast<decltype(&::DeleteFileW)>(rt::shims::find("kernel32.dll", "DeleteFileW"));
+            const auto mkdir_w = reinterpret_cast<decltype(&::CreateDirectoryW)>(rt::shims::find("kernel32.dll", "CreateDirectoryW"));
+            const auto rmdir_w = reinterpret_cast<decltype(&::RemoveDirectoryW)>(rt::shims::find("kernel32.dll", "RemoveDirectoryW"));
+            const auto copy_w = reinterpret_cast<decltype(&::CopyFileW)>(rt::shims::find("kernel32.dll", "CopyFileW"));
+            const auto move_w = reinterpret_cast<decltype(&::MoveFileW)>(rt::shims::find("kernel32.dll", "MoveFileW"));
+            const auto attr_w = reinterpret_cast<decltype(&::GetFileAttributesW)>(
+                rt::shims::find("kernel32.dll", "GetFileAttributesW"));
+
+            for (const auto& overlay : {unicode_overlay, long_overlay}) {
+                const auto host_dir = overlay / rt::fs::kPersistentStorageDir;
+                const auto extended_overlay = std::filesystem::path(L"\\\\?\\" + overlay.native());
+                check(host_dir.u8string().size() >= 256, "the configured storage path exceeds the startup byte buffer");
+                rt::fs::configure(game_path, overlay);
+                char startup_path[256]{};
+                size_t reported = 0, used_bytes = 0;
+                const bool has_alias = reinterpret_cast<GetPathSize>(slot(pls, 3))(pls, &reported) == S_OK &&
+                    reinterpret_cast<GetPath>(slot(pls, 4))(pls, sizeof(startup_path), startup_path, &used_bytes) == S_OK &&
+                    std::string(startup_path) == "PLS:\\" && used_bytes == sizeof("PLS:\\") && used_bytes == reported;
+                check(has_alias, "a 256-byte startup caller gets the short PLS path and its NUL-inclusive size");
+                if (!has_alias) continue;
+
+                const auto cache = std::string(startup_path) + "cache.bin";
+                HANDLE file = create_a(cache.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                constexpr char contents[] = "persistent";
+                DWORD transferred = 0;
+                check(file != INVALID_HANDLE_VALUE && ::WriteFile(file, contents, sizeof(contents), &transferred, nullptr) &&
+                          transferred == sizeof(contents), "CreateFileA writes cache bytes through the PLS alias");
+                if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+
+                file = create_w(L"pls:/cAcHe.bin", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                char readback[sizeof(contents)]{};
+                transferred = 0;
+                check(file != INVALID_HANDLE_VALUE && ::ReadFile(file, readback, sizeof(readback), &transferred, nullptr) &&
+                          transferred == sizeof(contents) && std::memcmp(readback, contents, sizeof(contents)) == 0,
+                      "CreateFileW reopens the same cache with a different case and slash");
+                if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+
+                WIN32_FIND_DATAA found{};
+                const HANDLE enumeration = find_ex_a("PLS:\\*.bin", FindExInfoBasic, &found, FindExSearchNameMatch, nullptr, 0);
+                check(enumeration != INVALID_HANDLE_VALUE && std::string(found.cFileName) == "cache.bin",
+                      "FindFirstFileExA lists files in the same persistent storage");
+                if (enumeration != INVALID_HANDLE_VALUE) find_close(enumeration);
+
+                std::error_code size_error;
+                check(std::filesystem::file_size(extended_overlay / rt::fs::kPersistentStorageDir / L"cache.bin", size_error) ==
+                          sizeof(contents) && !size_error, "the physical cache file is under the configured overlay");
+                uint64_t space[4]{};
+                check(reinterpret_cast<GetSpaceInfo>(slot(pls, 5))(pls, space) == S_OK && space[2] == sizeof(contents),
+                      "GetSpaceInfo accounts for the file written through the alias");
+
+                for (const wchar_t* invalid : {L"PLS:\\..\\outside.bin", L"PLS:\\sub\\..\\..\\outside.bin",
+                                               L"PLS:\\cache.bin:stream", L"PLS:C:\\outside.bin"}) {
+                    file = create_w(invalid, GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+                    const DWORD error = ::GetLastError();
+                    check(file == INVALID_HANDLE_VALUE && error == ERROR_INVALID_NAME,
+                          "the persistent alias refuses paths outside its root or with a drive or stream separator");
+                    if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+                }
+
+                const auto link = extended_overlay / rt::fs::kPersistentStorageDir / L"outside";
+                if (::CreateSymbolicLinkW(link.c_str(), package_storage.c_str(),
+                                          SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+                    file = create_w(L"PLS:\\outside\\cache.bin", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                    OPEN_EXISTING, 0, nullptr);
+                    const DWORD error = ::GetLastError();
+                    check(file == INVALID_HANDLE_VALUE && error == ERROR_ACCESS_DENIED,
+                          "a link within the persistent alias cannot lead into the package");
+                    if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+                    ::RemoveDirectoryW(link.c_str());
+                }
+
+                check(mkdir_w(L"PLS:\\objects", nullptr) &&
+                          copy_w(L"PLS:\\cache.bin", L"PLS:\\objects\\copy.bin", TRUE) &&
+                          move_w(L"PLS:\\objects\\copy.bin", L"PLS:\\objects\\moved.bin") &&
+                          attr_w(L"PLS:\\objects\\moved.bin") != INVALID_FILE_ATTRIBUTES,
+                      "directories, copies, renames and attributes use the same backing paths");
+                check(remove_w(L"PLS:\\objects\\moved.bin") && rmdir_w(L"PLS:\\objects"),
+                      "the PLS alias removes files and empty directories");
+                check(!rmdir_w(L"PLS:\\") && ::GetLastError() == ERROR_ACCESS_DENIED,
+                      "the title cannot remove the mounted storage root through the alias");
+
+                check(remove_w(L"PLS:\\cache.bin"), "a cache file can be removed through the alias");
+                file = create_a(cache.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                const DWORD error = ::GetLastError();
+                check(file == INVALID_HANDLE_VALUE && error == ERROR_FILE_NOT_FOUND,
+                      "an absent PLS file never falls back to the installed package");
+                if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+                check(std::filesystem::file_size(package_storage / L"cache.bin", size_error) == sizeof("package") - 1 &&
+                          !size_error, "the package cache remains intact");
+
+                std::error_code remove_error;
+                std::filesystem::remove_all(extended_overlay, remove_error);
+                check(!remove_error, "the isolated overlay fixture can be removed");
+            }
+
+            const auto linked_overlay = scratch / L"linked_overlay";
+            std::filesystem::create_directories(linked_overlay);
+            const auto linked_storage = linked_overlay / rt::fs::kPersistentStorageDir;
+            if (::CreateSymbolicLinkW(linked_storage.c_str(), folder.c_str(),
+                                      SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+                rt::fs::configure(game_path, linked_overlay);
+                char host_path[256]{};
+                size_t used_bytes = 0;
+                check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, sizeof(host_path), host_path, &used_bytes) == S_OK &&
+                          std::filesystem::path(host_path) == linked_storage,
+                      "a short host path can still name a relocated storage directory");
+                ::RemoveDirectoryW(linked_storage.c_str());
+            }
+            rt::fs::configure(game_path, scratch / L"overlay");
+        }
+
         void* handle = reinterpret_cast<void*>(1);
         check(reinterpret_cast<Mount>(slot(pls, 8))(pls, "pkg", &handle) == E_NOTIMPL && handle == nullptr,
               "slot 8 (MountForPackage) is E_NOTIMPL and leaves no handle");

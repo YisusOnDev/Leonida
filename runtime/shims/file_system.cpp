@@ -15,7 +15,8 @@
 //     prefer, while an open of a deleted name that fails leaves the name deleted;
 //   - FILE_FLAG_DELETE_ON_CLOSE is a delete whatever access the open asks for: the open uses the overlay copy and a
 //     package name gets its marker once the open has succeeded;
-//   - reads prefer the overlay copy and then the package;
+//   - PLS: names only the private persistent storage folder in the overlay;
+//   - GAME: reads prefer the overlay copy and then the package;
 //   - FindFirstFile merges the two folders, the overlay winning on a name, and hides deleted names and the marker
 //     folder;
 //   - folders are made in the overlay; a removed package folder is hidden by a marker, a moved package file is
@@ -43,10 +44,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -217,25 +220,7 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
-Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& parts, Drive* out_drive = nullptr,
-                           bool create_scratch = true) {
-    if (std::wstring rest; game_dir_rest(path, rest))
-        return parse_console_parts(std::wstring(kGamePrefix) + rest, parts, out_drive, create_scratch);
-    size_t prefix_length = 0;
-    const Drive drive = console_drive(path, prefix_length);
-    if (out_drive) *out_drive = drive;
-    if (drive == Drive::None) return Parsed::Host;
-    parts.clear();
-    if (drive == Drive::Scratch) {
-        parts.push_back(kScratchDir);
-        if (create_scratch) {
-            const std::filesystem::path overlay = roots().overlay;
-            const DWORD last_error = ::GetLastError();
-            std::error_code ec;
-            if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
-            ::SetLastError(last_error);
-        }
-    }
+bool parse_relative(std::wstring_view path, size_t prefix_length, std::vector<std::wstring>& parts) {
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
     auto flush = [&]() -> bool {
@@ -257,12 +242,35 @@ Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& 
     for (size_t i = prefix_length; i < path.size(); ++i) {
         const wchar_t c = path[i];
         if (is_separator(c)) {
-            if (!flush()) return Parsed::Refused;
+            if (!flush()) return false;
         } else {
             part.push_back(c);
         }
     }
-    if (!flush()) return Parsed::Refused;
+    if (!flush()) return false;
+    return true;
+}
+
+Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& parts, Drive* out_drive = nullptr,
+                           bool create_scratch = true) {
+    if (std::wstring rest; game_dir_rest(path, rest))
+        return parse_console_parts(std::wstring(kGamePrefix) + rest, parts, out_drive, create_scratch);
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(path, prefix_length);
+    if (out_drive) *out_drive = drive;
+    if (drive == Drive::None) return Parsed::Host;
+    parts.clear();
+    if (drive == Drive::Scratch) {
+        parts.push_back(kScratchDir);
+        if (create_scratch) {
+            const std::filesystem::path overlay = roots().overlay;
+            const DWORD last_error = ::GetLastError();
+            std::error_code ec;
+            if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
+            ::SetLastError(last_error);
+        }
+    }
+    if (!parse_relative(path, prefix_length, parts)) return Parsed::Refused;
     // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
     // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
@@ -331,6 +339,64 @@ Target fail(DWORD error) {
     Target t;
     t.error = error;
     return t;
+}
+
+// PLS is its own guest namespace. Its backing directory stays outside the package view and file operations
+// use the host's ordinary semantics on that directory, without package copy-up or deletion markers.
+constexpr std::wstring_view kPersistentPrefix = L"PLS:";
+
+bool persistent_guest_path(std::wstring_view path) {
+    return path.size() >= kPersistentPrefix.size() &&
+           _wcsnicmp(path.data(), kPersistentPrefix.data(), kPersistentPrefix.size()) == 0;
+}
+
+std::filesystem::path extended_path(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(path, ec).lexically_normal().make_preferred();
+    if (ec) return {};
+    const auto& wide = absolute.native();
+    if (wide.starts_with(L"\\\\?\\") || wide.starts_with(L"\\\\.\\")) return absolute;
+    if (wide.starts_with(L"\\\\")) return std::filesystem::path(L"\\\\?\\UNC\\" + wide.substr(2));
+    return std::filesystem::path(L"\\\\?\\" + wide);
+}
+
+// Check every existing component in the storage subtree. Never follow a preexisting directory junction
+// or symlink from the guest alias, including one in place of the storage directory itself.
+DWORD check_persistent_component(const std::filesystem::path& path) {
+    const DWORD saved_error = ::GetLastError();
+    const DWORD attributes = ::GetFileAttributesW(path.c_str());
+    const DWORD error = ::GetLastError();
+    ::SetLastError(saved_error);
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+        return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? ERROR_SUCCESS : error;
+}
+
+std::optional<Target> persistent_target(std::wstring_view name, bool allow_root = true) {
+    if (!persistent_guest_path(name)) return std::nullopt;
+    const size_t prefix_length = kPersistentPrefix.size();
+    if (name.size() > prefix_length && !is_separator(name[prefix_length]))
+        return fail(ERROR_INVALID_NAME);
+
+    std::vector<std::wstring> parts;
+    if (!parse_relative(name, prefix_length, parts)) return fail(ERROR_INVALID_NAME);
+    if (parts.empty() && !allow_root) return fail(ERROR_ACCESS_DENIED);
+
+    const auto overlay = roots().overlay;
+    if (overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
+    auto path = extended_path(overlay / kPersistentStorageDir);
+    if (path.empty()) return fail(ERROR_PATH_NOT_FOUND);
+    if (const DWORD error = check_persistent_component(path)) return fail(error);
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const bool wildcard = parts[i].find_first_of(L"*?") != std::wstring::npos;
+        if (wildcard && i + 1 != parts.size()) return fail(ERROR_INVALID_NAME);
+        path /= parts[i];
+        // FindFirstFile accepts a wildcard in the last component; its parent was already checked.
+        if (!wildcard) {
+            if (const DWORD error = check_persistent_component(path)) return fail(error);
+        }
+    }
+    return Target{std::move(path)};
 }
 
 // The overlay keeps one empty marker per deleted package path, outside the mirrored tree so it cannot collide with a
@@ -543,6 +609,7 @@ BOOL fail_bool(DWORD error) {
 }
 
 Target read_target(const std::wstring& path) {
+    if (auto target = persistent_target(path)) return std::move(*target);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(path, parts);
     if (parsed == Parsed::Host) {
@@ -573,6 +640,7 @@ Target read_target(const std::wstring& path) {
 }
 
 Target write_target(const std::wstring& path, bool copy_up) {
+    if (auto target = persistent_target(path, false)) return std::move(*target);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(path, parts);
     if (parsed == Parsed::Host) {
@@ -910,6 +978,19 @@ std::filesystem::path overlay_dir() {
     return g_overlay_dir;
 }
 
+std::filesystem::path ensure_persistent_storage(std::filesystem::path* host_path) {
+    const auto overlay = overlay_dir();
+    if (overlay.empty()) return {};
+    const auto configured = overlay / kPersistentStorageDir;
+    const auto path = extended_path(configured);
+    if (path.empty()) return {};
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    if (ec) return {};
+    if (host_path) *host_path = configured;
+    return path;
+}
+
 // gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
 // path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
 // file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
@@ -1102,6 +1183,13 @@ HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
+    if (auto target = persistent_target(pattern)) {
+        if (target->error) {
+            SetLastError(target->error);
+            return INVALID_HANDLE_VALUE;
+        }
+        return ::FindFirstFileW(target->path.c_str(), data);
+    }
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(pattern, parts);
     if (parsed == Parsed::Host) return ::FindFirstFileW(pattern, data);
@@ -1128,6 +1216,13 @@ HANDLE WINAPI find_first_file_ex_w(LPCWSTR pattern, FINDEX_INFO_LEVELS info_leve
     if (!pattern || !data) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
+    }
+    if (auto target = persistent_target(pattern)) {
+        if (target->error) {
+            SetLastError(target->error);
+            return INVALID_HANDLE_VALUE;
+        }
+        return ::FindFirstFileExW(target->path.c_str(), info_level, data, search_op, search_filter, additional_flags);
     }
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(pattern, parts);
@@ -1180,8 +1275,7 @@ HANDLE WINAPI find_first_file_ex_a(LPCSTR pattern, FINDEX_INFO_LEVELS info_level
     }
     const std::wstring wide = widen_ansi(pattern);
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(wide, parts);
-    if (parsed == Parsed::Host)
+    if (!persistent_guest_path(wide) && parse_console(wide, parts) == Parsed::Host)
         return ::FindFirstFileExA(pattern, info_level, data, search_op, search_filter, additional_flags);
     WIN32_FIND_DATAW wide_data{};
     const HANDLE h = find_first_file_ex_w(wide.c_str(), info_level, &wide_data, search_op, search_filter, additional_flags);
@@ -1248,6 +1342,8 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    if (auto target = persistent_target(name, false))
+        return target->error ? fail_bool(target->error) : ::DeleteFileW(target->path.c_str());
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
     if (parsed == Parsed::Host) return ::DeleteFileW(name);
@@ -1321,6 +1417,11 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
         if (t.error) return fail_bool(t.error);
         template_path = t.path.wstring();
     }
+    if (auto target = persistent_target(name)) {
+        if (target->error) return fail_bool(target->error);
+        return template_name ? ::CreateDirectoryExW(template_path.c_str(), target->path.c_str(), security)
+                             : ::CreateDirectoryW(target->path.c_str(), security);
+    }
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
     if (parsed == Parsed::Host)
@@ -1378,6 +1479,8 @@ BOOL WINAPI create_directory_ex_a(LPCSTR template_name, LPCSTR name, LPSECURITY_
 
 BOOL WINAPI remove_directory_w(LPCWSTR name) {
     if (!name) return fail_bool(ERROR_INVALID_PARAMETER);
+    if (auto target = persistent_target(name, false))
+        return target->error ? fail_bool(target->error) : ::RemoveDirectoryW(target->path.c_str());
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
     if (parsed == Parsed::Host) return ::RemoveDirectoryW(name);
@@ -1412,6 +1515,15 @@ BOOL WINAPI remove_directory_a(LPCSTR name) {
 
 BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (!from) return fail_bool(ERROR_INVALID_PARAMETER);
+    const auto persistent_from = persistent_target(from, false);
+    const auto persistent_to = to ? persistent_target(to, false) : std::nullopt;
+    if (persistent_from && persistent_from->error) return fail_bool(persistent_from->error);
+    if (persistent_to && persistent_to->error) return fail_bool(persistent_to->error);
+    if (persistent_from || persistent_to) {
+        if (!to || (flags & MOVEFILE_DELAY_UNTIL_REBOOT) != 0) return fail_bool(ERROR_INVALID_PARAMETER);
+        if (persistent_from) from = persistent_from->path.c_str();
+        if (persistent_to) to = persistent_to->path.c_str();
+    }
     std::vector<std::wstring> src, dst;
     const Parsed from_kind = parse_console(from, src);
     const Parsed to_kind = to ? parse_console(to, dst) : Parsed::Host;
@@ -1504,6 +1616,12 @@ namespace {
 // Where a copy writes: a host path as given; a GAME: path is checked against the title's view (an existing name
 // counts even when only the package has it) and then means its overlay copy.
 bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& out, DWORD& error) {
+    if (auto target = persistent_target(to, false)) {
+        error = target->error;
+        if (error) return false;
+        out = std::move(target->path);
+        return true;
+    }
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(to, parts);
     if (parsed == Parsed::Host) {
@@ -1675,6 +1793,8 @@ HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS*
 
 BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
     if (!name) return fail_bool(ERROR_INVALID_PARAMETER);
+    if (auto target = persistent_target(name, false))
+        return target->error ? fail_bool(target->error) : ::SetFileAttributesW(target->path.c_str(), attributes);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
     if (parsed == Parsed::Host) return ::SetFileAttributesW(name, attributes);

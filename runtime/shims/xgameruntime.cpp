@@ -502,23 +502,26 @@ struct PersistentSpaceInfo {
 };
 static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceInfo is four UINT64");
 
-// The storage folder, created on first use. Empty when there is no overlay (no place to keep files) or the folder
-// cannot be created.
-std::filesystem::path persistent_storage_dir() {
-    const std::filesystem::path overlay = rt::fs::overlay_dir();
-    if (overlay.empty()) return {};
-    std::filesystem::path dir = overlay / rt::fs::kPersistentStorageDir;
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return ec ? std::filesystem::path{} : dir;
-}
-
-std::string utf8_of(const std::wstring& wide) {
+std::string utf8_of(const std::filesystem::path& path) {
+    const std::wstring& wide = path.native();
     const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
     if (n <= 0) return {};
     std::string utf8(static_cast<size_t>(n), '\0');
     WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), utf8.data(), n, nullptr, nullptr);
     return utf8;
+}
+
+std::string persistent_storage_guest_path() {
+    std::filesystem::path host_path;
+    const auto physical_path = rt::fs::ensure_persistent_storage(&host_path);
+    if (physical_path.empty()) return {};
+    auto path = utf8_of(host_path);
+    // The title can supply a fixed 256-byte buffer, including the NUL. Keep short host paths compatible.
+    constexpr size_t kBootPathCapacity = 256;
+    if (path.size() < kBootPathCapacity) return path;
+    const DWORD attributes = ::GetFileAttributesW(physical_path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return {};
+    return rt::fs::kPersistentStorageGuestPath;
 }
 
 uint64_t folder_bytes(const std::filesystem::path& dir) {
@@ -537,7 +540,7 @@ uint64_t folder_bytes(const std::filesystem::path& dir) {
 HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
     if (!path_size) return E_POINTER;
     *path_size = 0;
-    const std::string path = utf8_of(persistent_storage_dir().native());
+    const std::string path = persistent_storage_guest_path();
     if (path.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     *path_size = path.size() + 1;  // with the terminating NUL
     return S_OK;
@@ -546,7 +549,7 @@ HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
 HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size_t* path_used) {
     if (path_used) *path_used = 0;
     if (!path) return E_POINTER;
-    const std::string folder = utf8_of(persistent_storage_dir().native());
+    const std::string folder = persistent_storage_guest_path();
     if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     if (path_size < folder.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     std::memcpy(path, folder.c_str(), folder.size() + 1);
@@ -557,7 +560,7 @@ HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size
 HRESULT STDMETHODCALLTYPE pls_get_space_info(void*, PersistentSpaceInfo* info) {
     if (!info) return E_POINTER;
     *info = {};
-    const std::filesystem::path dir = persistent_storage_dir();
+    const std::filesystem::path dir = rt::fs::ensure_persistent_storage();
     if (dir.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     const uint64_t used = folder_bytes(dir);
     const uint64_t left = used < kPersistentQuotaBytes ? kPersistentQuotaBytes - used : 0;
@@ -572,7 +575,7 @@ HRESULT STDMETHODCALLTYPE pls_get_space_info(void*, PersistentSpaceInfo* info) {
 
 HRESULT STDMETHODCALLTYPE pls_prompt_async(void*, uint64_t requested_bytes, XAsyncBlock* async) {
     if (!async) return E_POINTER;
-    const std::filesystem::path dir = persistent_storage_dir();
+    const std::filesystem::path dir = rt::fs::ensure_persistent_storage();
     const bool fits = !dir.empty() && requested_bytes <= kPersistentQuotaBytes - (std::min)(folder_bytes(dir), kPersistentQuotaBytes);
     if (fits) return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return S_OK; });
     return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return HRESULT_FROM_WIN32(ERROR_DISK_FULL); });

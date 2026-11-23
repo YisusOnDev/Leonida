@@ -22,6 +22,11 @@
 namespace rt::fs {
 
 inline constexpr wchar_t kPersistentStorageDir[] = L".gta6rt-persistent";
+inline constexpr char kPersistentStorageGuestPath[] = "PLS:\\";
+
+// Creates the overlay's persistent storage directory. The returned path supports Win32 long-path I/O.
+// When requested, host_path receives the configured path without an added Win32 extended-path prefix.
+std::filesystem::path ensure_persistent_storage(std::filesystem::path* host_path = nullptr);
 
 // Sets the roots. main.cpp calls this once, before anything is mapped; the test calls it per case. The overlay is
 // created on the first write, not here.

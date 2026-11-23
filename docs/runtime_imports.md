@@ -243,6 +243,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   that sits on a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
   `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything
   is written there, and removing or moving it fails with `ERROR_ACCESS_DENIED`.
+- `XPersistentLocalStorageGetPath` returns the backing path if it fits the 256-byte startup buffer including
+  the NUL. For longer paths it returns the guest root `PLS:\`, backed by the same `<overlay>\.gta6rt-persistent`
+  directory. The runtime's intercepted file APIs resolve this root directly in the overlay. The package and
+  its deletion markers are outside this namespace.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
   write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes. The copy is
   written under `<overlay>\.gta6rt-copy` and renamed into place, one copy-up at a time, so a process killed mid-copy
