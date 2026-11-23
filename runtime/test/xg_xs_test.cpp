@@ -5,7 +5,7 @@
 // XGCreateTextureComputer still hands out a computer (two measured callers use it without checking the HRESULT), slots
 // 2 and 8 (and slot 10 on a description it cannot tile) return without writing what their arguments point to, slot 10
 // answers the PC tiling of a description it can tile (GetResourceTiling, compared with src/resource_tiling.h), and a
-// description it can lay out linearly gets S_OK, slot 2's three measured fields per mip and slot 9's linear copy.
+// description it can lay out linearly gets S_OK, slot 2's whole layout structure and slots 8 and 9's linear copies.
 #include <windows.h>
 #include <d3d12.h>
 
@@ -143,7 +143,7 @@ int main() {
               tilings[0].StartTileIndexInOverallResource == expect.subresources[2].start,
           "the subresource tilings start at the first one asked for");
 
-    // A description it can lay out linearly: S_OK, and slot 2 writes only the three measured fields of each mip.
+    // A description it can lay out linearly: S_OK, and slot 2 fills the whole 0x1B40-byte layout structure.
     D3D12_RESOURCE_DESC rgba = r8;
     rgba.Width = 8;
     rgba.Height = 4;
@@ -152,20 +152,51 @@ int main() {
     void* rgba_computer = nullptr;
     check(create(&rgba, &rgba_computer) == S_OK && rgba_computer, "a description it can lay out gives S_OK");
     void* const* sv = rgba_computer ? *static_cast<void* const* const*>(rgba_computer) : vtable;
-    std::memset(layout, 0xcd, sizeof(layout));
-    check(reinterpret_cast<Slot2Fn>(sv[2])(rgba_computer, layout) == S_OK, "slot 2 answers the linear layout");
-    uint64_t size0 = 0, slice0 = 0, size1 = 0;
-    uint32_t row0 = 0, row1 = 0;
-    std::memcpy(&size0, layout + 0x50, 8);
-    std::memcpy(&slice0, layout + 0x60, 8);
-    std::memcpy(&row0, layout + 0x6C, 4);
-    std::memcpy(&size1, layout + 0x70 + 0x50, 8);
-    std::memcpy(&row1, layout + 0x70 + 0x6C, 4);
-    check(size0 == 128 && slice0 == 128 && row0 == 32 && size1 == 32 && row1 == 16,
-          "mip 0 is 8 x 4 RGBA8 (32-byte rows, 128 bytes), mip 1 4 x 2 (16-byte rows, 32 bytes)");
-    check(all_bytes(layout, 0x50, 0xcd) && all_bytes(layout + 0x58, 8, 0xcd) && all_bytes(layout + 0x68, 4, 0xcd) &&
-              all_bytes(layout + 0x70 * 2, sizeof(layout) - 0x70 * 2, 0xcd),
-          "slot 2 writes nothing but those fields of the two mips");
+    static uint8_t big[0x1C00];
+    std::memset(big, 0xcd, sizeof(big));
+    check(reinterpret_cast<Slot2Fn>(sv[2])(rgba_computer, big) == S_OK, "slot 2 answers the linear layout");
+    auto u64 = [&](size_t at) { uint64_t v = 0; std::memcpy(&v, big + at, 8); return v; };
+    auto u32 = [&](size_t at) { uint32_t v = 0; std::memcpy(&v, big + at, 4); return v; };
+    constexpr size_t kMip0 = 0x18 + 0x38, kMip1 = kMip0 + 0x70;
+    check(u64(kMip0) == 128 && u64(kMip0 + 0x10) == 128 && u32(kMip0 + 0x1C) == 32 && u64(kMip1) == 32 &&
+              u32(kMip1 + 0x1C) == 16,
+          "mip 0 is 8 x 4 RGBA8 (32-byte rows, 128 bytes), mip 1 4 x 2 (16-byte rows, 32 bytes) at the measured offsets");
+    check(u64(kMip0 + 0x08) == 0 && u64(kMip1 + 0x08) == 128, "mip 1 starts after mip 0");
+    check(u32(kMip0 + 0x18) == 8 && u32(kMip0 + 0x38) == 8 && u32(kMip0 + 0x3C) == 4 && u32(kMip1 + 0x38) == 4 &&
+              u32(kMip1 + 0x3C) == 2 && u32(kMip0 + 0x40) == 1 && u32(kMip0 + 0x44) == 1 && u32(kMip0 + 0x48) == 0,
+          "pitch in texels, sizes in texels, array size, one sample, linear mode");
+    check(u64(0x00) == 160 && u64(0x08) == 0x1000 && u32(0x10) == 2 && u32(0x14) == 1 && u32(0x1B38) == 3,
+          "the total size (both mips), the alignment, the mip and plane counts and the dimension");
+    check(u32(0x18) == 1 && u64(0x18 + 0x08) == 160 && u64(0x18 + 0x10) == 160 && u64(0x18 + 0x18) == 0 &&
+              u32(0x18 + 0x28) == 4 && u32(0x18 + 0x2C) == 2 && u32(0x18 + 0x30) == 0,
+          "plane 0: data, its size, array-slice size, offset, element bytes, two standard mips and no tail");
+    check(all_bytes(big + kMip0 + 2 * 0x70, 0x1B38 - (kMip0 + 2 * 0x70), 0) && all_bytes(big + 0x1B3C, 4, 0),
+          "the rest of the structure (other mips, planes 1-3) is zeroed, not left as the caller's stack held it");
+    check(all_bytes(big + 0x1B40, sizeof(big) - 0x1B40, 0xcd), "nothing past the 0x1B40-byte structure is written");
+
+    // A 2-slice array: the plane holds both slices, each slice's mips at the same offsets.
+    D3D12_RESOURCE_DESC arr = rgba;
+    arr.DepthOrArraySize = 2;
+    void* arr_computer = nullptr;
+    check(create(&arr, &arr_computer) == S_OK && arr_computer, "a 2-slice array can be laid out");
+    std::memset(big, 0xcd, sizeof(big));
+    check(arr_computer && reinterpret_cast<Slot2Fn>((*static_cast<void* const* const*>(arr_computer))[2])(arr_computer, big) == S_OK &&
+              u64(0x00) == 320 && u64(0x18 + 0x08) == 320 && u64(0x18 + 0x10) == 160 && u32(kMip0 + 0x40) == 2,
+          "the array's total is two slices of 160 bytes and the mips report the array size");
+
+    // Slot 8 writes mip 1 from a wider source into the texture memory, after mip 0; slot 9 reads it back.
+    uint8_t memory[160];
+    std::memset(memory, 0xcd, sizeof(memory));
+    uint8_t source[48];
+    for (int i = 0; i < 48; ++i) source[i] = static_cast<uint8_t>(i);
+    check(reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 0, 1, source, 24, 48) == S_OK,
+          "slot 8 copies a subresource in");
+    check(all_bytes(memory, 128, 0xcd) && memory[128] == 0 && memory[143] == 15 && memory[144] == 24 &&
+              memory[159] == 39,
+          "mip 1's two rows land tightly after mip 0, read at the caller's row pitch");
+    check(reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 0, 2, source, 24, 48) == kNotImpl &&
+              reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 1, 0, source, 24, 48) == kNotImpl,
+          "slot 8 refuses a subresource past the description or another plane");
 
     // Slot 9 copies mip 1 (the bytes after mip 0) into a wider destination with the caller's row pitch.
     using Slot9Fn = HRESULT(__stdcall*)(void*, void*, UINT, UINT, const void*, const void*, UINT, UINT);

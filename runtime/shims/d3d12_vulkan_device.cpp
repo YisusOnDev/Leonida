@@ -2733,20 +2733,48 @@ public:
     // the host runtime refuses a non-empty read range that ends past the buffer. A texture in a CPU-visible heap has
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
+    // A texture: without a pointer, as on D3D12 (a CPU-visible heap only). With one, as on the console, where a
+    // texture's memory is the CPU's: the pointer is the start of the whole texture (whatever the subresource) in
+    // the tight linear layout xg_xs.dll answers the title (subresources in D3D12 order, rows of whole blocks). The
+    // bytes live in a host copy kept for the resource, read from the image on the first Map and written back to
+    // every subresource on each Unmap. Measured: game_scarlett_master.exe+0x5121690 maps a texture with a pointer
+    // (vtable slot 8, from +0x5121891 and +0x512176b) to lock it for a CPU fill (+0x13363b0); with E_INVALIDARG the
+    // lock fails and the title fills a zero-sized fallback instead, overrunning it (the AV at +0x13360a3).
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
         if (image_) {
             VkImageSubresourceRange range{};
-            return !data && cpu_visible() && subresource != leonida::all_subresources &&
-                           leonida::image_range(binding_, subresource, range)
-                       ? S_OK
-                       : E_INVALIDARG;
+            if (subresource == leonida::all_subresources || !leonida::image_range(binding_, subresource, range))
+                return E_INVALIDARG;
+            if (!data) return cpu_visible() ? S_OK : E_INVALIDARG;
+            const std::lock_guard lock(shadow_mutex_);
+            if (shadow_.empty()) {
+                Region r{};
+                std::uint64_t total = 0;
+                for (UINT i = 0; region(i, nullptr, r); ++i) {
+                    shadow_offsets_.push_back(total);
+                    total += r.row_bytes * r.rows * r.slices;
+                }
+                if (!total) return E_INVALIDARG;
+                shadow_.assign(total, std::byte{0});
+                for (UINT i = 0; i < shadow_offsets_.size(); ++i)
+                    shadow_rows(false, i);
+            }
+            ++shadow_maps_;
+            *data = shadow_.data();
+            return S_OK;
         }
         if (!mapped_ || subresource != 0) return E_INVALIDARG;
         if (read && read->Begin < read->End && read->End > desc_.Width) return E_INVALIDARG;
         if (data) *data = mapped_;
         return S_OK;
     }
-    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {
+        if (!image_) return;
+        const std::lock_guard lock(shadow_mutex_);
+        if (!shadow_maps_) return;
+        --shadow_maps_;
+        for (UINT i = 0; i < shadow_offsets_.size(); ++i) shadow_rows(true, i);
+    }
 
     // CPU copies into and out of a texture subresource. D3D12 completes them before returning and leaves it to
     // the application to keep the GPU off the subresource meanwhile, so a blocking copy is the whole contract.
@@ -3016,6 +3044,14 @@ private:
         return release(S_OK);
     }
 
+    // One subresource between the image and its place in the Map copy (see Map), at tight pitches.
+    void shadow_rows(bool write, UINT subresource) {
+        Region r{};
+        if (!region(subresource, nullptr, r)) return;
+        cpu_copy(write, subresource, nullptr, shadow_.data() + shadow_offsets_[subresource],
+                 static_cast<UINT>(r.row_bytes), static_cast<UINT>(r.row_bytes * r.rows));
+    }
+
     bool cpu_visible() const {
         if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD || heap_.Type == D3D12_HEAP_TYPE_READBACK) return true;
         return heap_.Type == D3D12_HEAP_TYPE_CUSTOM && heap_.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
@@ -3041,6 +3077,10 @@ private:
     VkMemoryPropertyFlags memory_flags_ = 0;
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
+    std::mutex shadow_mutex_;                   // the texture Map copy (see Map)
+    std::vector<std::byte> shadow_;
+    std::vector<std::uint64_t> shadow_offsets_;
+    std::uint32_t shadow_maps_ = 0;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it

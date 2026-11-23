@@ -187,13 +187,29 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
     EXPECT(SUCCEEDED(create(upload_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_GENERIC_READ, upload)));
     EXPECT(SUCCEEDED(create(readback_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_COPY_DEST, readback)));
 
-    // A texture in a CPU-visible heap maps only without a pointer; a default-heap texture not at all.
+    // Without a pointer a texture maps only in a CPU-visible heap, as on D3D12; with one (the console's rule) any
+    // texture maps, to the start of its tight linear copy, which Unmap writes back to the image.
     void* pointer = nullptr;
     EXPECT(tex->Map(0, nullptr, nullptr) == S_OK);
     EXPECT(tex->Map(1, nullptr, nullptr) == S_OK);
-    EXPECT(tex->Map(0, nullptr, &pointer) == E_INVALIDARG);
     EXPECT(tex->Map(2, nullptr, nullptr) == E_INVALIDARG);
     EXPECT(gpu_only->Map(0, nullptr, nullptr) == E_INVALIDARG);
+    tex->Unmap(1, nullptr);
+    EXPECT(gpu_only->Map(0, nullptr, &pointer) == S_OK && pointer);
+    if (pointer) {
+        auto* texels = static_cast<std::uint8_t*>(pointer);
+        EXPECT(texels[0] == 0 && texels[4 * 4 * 4 - 1] == 0);  // a new texture reads back zero-filled
+        for (int i = 0; i < 4 * 4 * 4; ++i) texels[i] = static_cast<std::uint8_t>(i + 1);
+        gpu_only->Unmap(0, nullptr);
+        std::vector<std::uint8_t> back(4 * 4 * 4, 0xcd);
+        void* again = nullptr;
+        EXPECT(gpu_only->Map(0, nullptr, &again) == S_OK && again == pointer);
+        gpu_only->Unmap(0, nullptr);
+        EXPECT(SUCCEEDED(gpu_only->ReadFromSubresource(back.data(), 16, 64, 0, nullptr)));
+        EXPECT(back[0] == 1 && back[17] == 18 && back[63] == 64);  // Unmap wrote the copy into the image
+    }
+    void* mip1 = nullptr;
+    EXPECT(tex->Map(1, nullptr, &mip1) == S_OK && mip1);  // the start of the texture, not of mip 1
     tex->Unmap(1, nullptr);
 
     // A new texture reads back zero-filled.
