@@ -1,10 +1,11 @@
 // Checks the registered xg_xs.dll shim against the call shapes measured in the game executable (runtime/shims/xg_xs.cpp).
 //
 // Both exports are resolved through rt::shims::find, so this is the table the runtime installs. The checks: both
-// return E_NOTIMPL, XGSuggestSwizzleMode leaves the caller's field alone, XGCreateTextureComputer still hands out a
-// computer (two measured callers use it without checking the HRESULT), slots 2 and 8 (and slot 10 on a description it
-// cannot tile) return without writing what their arguments point to, and slot 10 answers the PC tiling of a
-// description it can tile (GetResourceTiling, compared with src/resource_tiling.h).
+// return E_NOTIMPL for a description they cannot handle, XGSuggestSwizzleMode leaves the caller's field alone,
+// XGCreateTextureComputer still hands out a computer (two measured callers use it without checking the HRESULT), slots
+// 2 and 8 (and slot 10 on a description it cannot tile) return without writing what their arguments point to, slot 10
+// answers the PC tiling of a description it can tile (GetResourceTiling, compared with src/resource_tiling.h), and a
+// description it can lay out linearly gets S_OK, slot 2's three measured fields per mip and slot 9's linear copy.
 #include <windows.h>
 #include <d3d12.h>
 
@@ -141,6 +142,43 @@ int main() {
     check(n == 7 && tilings[0].WidthInTiles == expect.subresources[2].width &&
               tilings[0].StartTileIndexInOverallResource == expect.subresources[2].start,
           "the subresource tilings start at the first one asked for");
+
+    // A description it can lay out linearly: S_OK, and slot 2 writes only the three measured fields of each mip.
+    D3D12_RESOURCE_DESC rgba = r8;
+    rgba.Width = 8;
+    rgba.Height = 4;
+    rgba.MipLevels = 2;
+    rgba.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    void* rgba_computer = nullptr;
+    check(create(&rgba, &rgba_computer) == S_OK && rgba_computer, "a description it can lay out gives S_OK");
+    void* const* sv = rgba_computer ? *static_cast<void* const* const*>(rgba_computer) : vtable;
+    std::memset(layout, 0xcd, sizeof(layout));
+    check(reinterpret_cast<Slot2Fn>(sv[2])(rgba_computer, layout) == S_OK, "slot 2 answers the linear layout");
+    uint64_t size0 = 0, slice0 = 0, size1 = 0;
+    uint32_t row0 = 0, row1 = 0;
+    std::memcpy(&size0, layout + 0x50, 8);
+    std::memcpy(&slice0, layout + 0x60, 8);
+    std::memcpy(&row0, layout + 0x6C, 4);
+    std::memcpy(&size1, layout + 0x70 + 0x50, 8);
+    std::memcpy(&row1, layout + 0x70 + 0x6C, 4);
+    check(size0 == 128 && slice0 == 128 && row0 == 32 && size1 == 32 && row1 == 16,
+          "mip 0 is 8 x 4 RGBA8 (32-byte rows, 128 bytes), mip 1 4 x 2 (16-byte rows, 32 bytes)");
+    check(all_bytes(layout, 0x50, 0xcd) && all_bytes(layout + 0x58, 8, 0xcd) && all_bytes(layout + 0x68, 4, 0xcd) &&
+              all_bytes(layout + 0x70 * 2, sizeof(layout) - 0x70 * 2, 0xcd),
+          "slot 2 writes nothing but those fields of the two mips");
+
+    // Slot 9 copies mip 1 (the bytes after mip 0) into a wider destination with the caller's row pitch.
+    using Slot9Fn = HRESULT(__stdcall*)(void*, void*, UINT, UINT, const void*, const void*, UINT, UINT);
+    uint8_t texels[160];
+    for (int i = 0; i < 160; ++i) texels[i] = static_cast<uint8_t>(i);
+    uint8_t out[64];
+    std::memset(out, 0xcd, sizeof(out));
+    check(reinterpret_cast<Slot9Fn>(sv[9])(rgba_computer, out, 0, 1, nullptr, texels, 24, 48) == S_OK,
+          "slot 9 copies a subresource out");
+    check(out[0] == 128 && out[15] == 143 && out[16] == 0xcd && out[24] == 144 && out[39] == 159 && out[40] == 0xcd,
+          "mip 1's two rows land at the caller's row pitch, nothing between them");
+    check(reinterpret_cast<Slot9Fn>(sv[9])(rgba_computer, out, 0, 2, nullptr, texels, 24, 48) == kNotImpl,
+          "slot 9 refuses a subresource past the description");
 
     void* again = nullptr;
     create(console_desc, &again);

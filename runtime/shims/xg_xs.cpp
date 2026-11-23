@@ -18,10 +18,12 @@
 // The runtime has no model of the console's resource layout (runtime/src/gfx10_tiling.h covers two swizzle modes of
 // one 2D level, without mips or the layout structure slot 2 fills), so nothing else here computes a layout:
 // - XGSuggestSwizzleMode returns E_NOTIMPL and writes nothing, so the field keeps the 0 the caller put there.
-// - XGCreateTextureComputer returns E_NOTIMPL, but still stores a computer in *out. The two checking callers then
-//   fail cleanly; the two that do not check would otherwise call through a null pointer. COM says *out is null on
-//   failure; this breaks that on purpose, because the measured callers need it.
-// - Slot 0 and slot 1 count nothing (a computer lives for the run). Every other slot but 10, up to kSlots, prints its
+// - XGCreateTextureComputer stores a computer in *out whatever it returns. For a description it can lay out linearly
+//   (2D or 3D, one sample, a format element_size knows) it returns S_OK, and slots 2 and 9 answer that linear layout
+//   (their sections below). Otherwise it returns E_NOTIMPL: the two checking callers then fail cleanly, and the two
+//   that do not check would otherwise call through a null pointer. COM says *out is null on failure; this breaks that
+//   on purpose, because the measured callers need it.
+// - Slot 0 and slot 1 count nothing (a computer lives for the run). Every other slot but 2, 9 and 10, up to kSlots, prints its
 //   index and caller once and returns E_NOTIMPL without writing its arguments, so a caller's own zero-filled outputs
 //   stay zero and a stack structure the caller did not fill stays as it was.
 // Hypothesis, not measured: slots 0 and 1 being AddRef and Release; the meaning of slots 2 and 8; that callers
@@ -153,11 +155,119 @@ HRESULT __stdcall computer_get_resource_tiling(Computer* self, UINT* total, D3D1
     return S_OK;
 }
 
+// The linear layout a computer answers for its description: subresources in D3D12 order (array slice by array slice,
+// mip by mip), each tightly packed (rows of whole blocks, slices of whole rows). Not the console's layout: on the PC the
+// texture is a PC resource, and the memory the title hands slot 9 is only read back through this same layout.
+struct MipLayout {
+    uint64_t size;   // one subresource of this mip (all its depth slices)
+    uint64_t slice;  // one depth slice
+    uint32_t row;    // one row of blocks
+    uint32_t rows;   // rows of blocks in a slice
+    uint32_t depth;  // depth slices (1 for 2D)
+};
+constexpr uint32_t kMaxLayoutMips = 15;
+
+bool linear_layout(const Computer& c, MipLayout (&mips)[kMaxLayoutMips], uint32_t& mip_count, uint32_t& arrays) {
+    if (!c.has_desc) return false;
+    const D3D12_RESOURCE_DESC& d = c.desc;
+    const bool volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && !volume) return false;
+    if (d.SampleDesc.Count > 1 || !d.Width || !d.Height || !d.DepthOrArraySize || d.Width > 0x10000) return false;
+    uint32_t bytes = 0, block = 1;
+    if (!element_size(d.Format, bytes, block)) return false;
+    mip_count = d.MipLevels;
+    if (!mip_count) {
+        uint64_t largest = std::max<uint64_t>(d.Width, d.Height);
+        if (volume) largest = std::max<uint64_t>(largest, d.DepthOrArraySize);
+        while (largest >> mip_count) ++mip_count;
+    }
+    if (mip_count > kMaxLayoutMips) return false;
+    arrays = volume ? 1 : d.DepthOrArraySize;
+    for (uint32_t m = 0; m < mip_count; ++m) {
+        const uint64_t w = std::max<uint64_t>(1, d.Width >> m), h = std::max<uint64_t>(1, d.Height >> m);
+        MipLayout& l = mips[m];
+        l.row = static_cast<uint32_t>((w + block - 1) / block * bytes);
+        l.rows = static_cast<uint32_t>((h + block - 1) / block);
+        l.depth = volume ? std::max<uint32_t>(1, d.DepthOrArraySize >> m) : 1;
+        l.slice = uint64_t{l.row} * l.rows;
+        l.size = l.slice * l.depth;
+    }
+    return true;
+}
+
+bool can_lay_out(const Computer& c) {
+    MipLayout mips[kMaxLayoutMips];
+    uint32_t count = 0, arrays = 0;
+    return linear_layout(c, mips, count, arrays);
+}
+
+// Slot 2: GetResourceLayout(layout*). Measured at the checking creation site (game_scarlett_master.exe+0x979c40): for
+// its mip m the title reads a qword at +0x50 + 0x70*m (the subresource's size: it allocates that much for slot 9's
+// output), a qword at +0x60 + 0x70*m (the depth-slice pitch) and a dword at +0x6C + 0x70*m (the row pitch). When the
+// two pitches equal its own tight ones, slot 9 copies straight into its buffer (+0x979e30). Only those three fields of
+// the mips the description has are written; the rest of the caller's structure (at most 0x1B40 bytes at that site)
+// stays as it was.
+HRESULT __stdcall computer_get_resource_layout(Computer* self, uint8_t* layout) {
+    MipLayout mips[kMaxLayoutMips];
+    uint32_t count = 0, arrays = 0;
+    if (!self || !layout || !linear_layout(*self, mips, count, arrays)) {
+        static std::atomic<bool> warned{false};
+        warn_once(warned, "texture computer slot ", 2, _ReturnAddress());
+        return kNotImpl;
+    }
+    for (uint32_t m = 0; m < count; ++m) {
+        uint8_t* entry = layout + 0x70 * m;
+        std::memcpy(entry + 0x50, &mips[m].size, sizeof(uint64_t));
+        std::memcpy(entry + 0x60, &mips[m].slice, sizeof(uint64_t));
+        std::memcpy(entry + 0x6C, &mips[m].row, sizeof(uint32_t));
+    }
+    return S_OK;
+}
+
+// Row copies that turn an access violation into a failure (no C++ objects here: the function has __try).
+bool guarded_rows(uint8_t* dst, uint64_t dst_row, uint64_t dst_slice, const uint8_t* src, const MipLayout& l) {
+    __try {
+        for (uint32_t z = 0; z < l.depth; ++z)
+            for (uint32_t y = 0; y < l.rows; ++y)
+                std::memcpy(dst + z * dst_slice + y * dst_row, src + z * l.slice + uint64_t{y} * l.row, l.row);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+// Slot 9: copies one subresource out of the texture's memory: (dst, plane, subresource, box, texel base, dst row
+// pitch, dst slice pitch). Measured at +0x979e30: dst is the title's buffer (or a temporary of slot 2's size), plane 0,
+// box null, the texel base the texture's memory; the title reads dst afterwards. The texel base is read in the linear
+// layout slot 2 answers. A box, another plane or a subresource past the description is refused with nothing written.
+HRESULT __stdcall computer_copy_from_subresource(Computer* self, uint8_t* dst, UINT plane, UINT subresource,
+                                                 const void* box, const uint8_t* texels, UINT dst_row, UINT dst_slice) {
+    MipLayout mips[kMaxLayoutMips];
+    uint32_t count = 0, arrays = 0;
+    if (!self || !dst || !texels || plane || box || !linear_layout(*self, mips, count, arrays) ||
+        subresource >= count * arrays) {
+        static std::atomic<bool> warned{false};
+        warn_once(warned, "texture computer slot ", 9, _ReturnAddress());
+        return kNotImpl;
+    }
+    uint64_t per_array = 0;
+    for (uint32_t m = 0; m < count; ++m) per_array += mips[m].size;
+    const uint32_t mip = subresource % count, array = subresource / count;
+    uint64_t offset = per_array * array;
+    for (uint32_t m = 0; m < mip; ++m) offset += mips[m].size;
+    const MipLayout& l = mips[mip];
+    if (dst_row < l.row || (l.depth > 1 && dst_slice < uint64_t{dst_row} * l.rows)) return E_INVALIDARG;
+    return guarded_rows(dst, dst_row, dst_slice, texels + offset, l) ? S_OK : E_POINTER;
+}
+
 template <size_t... Slot>
 constexpr auto make_vtable(std::index_sequence<Slot...>) {
     return std::array<void*, sizeof...(Slot)>{
         (Slot == 0    ? reinterpret_cast<void*>(&computer_add_ref)
          : Slot == 1  ? reinterpret_cast<void*>(&computer_release)
+         : Slot == 2  ? reinterpret_cast<void*>(&computer_get_resource_layout)
+         : Slot == 9  ? reinterpret_cast<void*>(&computer_copy_from_subresource)
          : Slot == 10 ? reinterpret_cast<void*>(&computer_get_resource_tiling)
                       : reinterpret_cast<void*>(&computer_slot<Slot>))...};
 }
@@ -183,8 +293,19 @@ HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out) {
     static std::atomic<bool> warned{false};
     warn_once(warned, "XGCreateTextureComputer", -1, _ReturnAddress());
     if (!out) return E_POINTER;
-    *out = computer_for(desc);  // see the top of the file: two measured callers use *out without checking the HRESULT
-    return kNotImpl;
+    Computer* computer = computer_for(desc);
+    *out = computer;  // see the top of the file: two measured callers use *out without checking the HRESULT
+    if (!can_lay_out(*computer)) return kNotImpl;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
+        std::fprintf(stderr,
+                     "[rt] xg_xs: XGCreateTextureComputer: linear layout for dimension %d %llux%u depth/array %u, "
+                     "%u mip(s), format %d (caller %s)\n",
+                     static_cast<int>(computer->desc.Dimension), static_cast<unsigned long long>(computer->desc.Width),
+                     computer->desc.Height, computer->desc.DepthOrArraySize, computer->desc.MipLevels,
+                     static_cast<int>(computer->desc.Format),
+                     rt::shims::module_offset(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
+    return S_OK;
 }
 
 HRESULT __stdcall XGSuggestSwizzleMode(const void* /*desc*/, uint32_t /*flags*/, uint32_t* /*mode*/) {
