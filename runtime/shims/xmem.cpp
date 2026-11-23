@@ -39,6 +39,7 @@
 #include "startup_trace.h"
 #include "xmem.h"
 #include "kernel_write_hook.h"
+#include "write_watch.h"
 
 namespace {
 
@@ -367,6 +368,7 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     void* const result = xmem_virtual_alloc(address, size, allocation_type, attributes, protect);
+    rt::write_watch::note_region(result);
     if (rt::startup_trace::enabled()) {
         const DWORD error = GetLastError();
         using rt::startup_trace::hex;
