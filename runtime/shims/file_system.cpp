@@ -209,9 +209,41 @@ bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts
     return parts.empty() || (parts.size() == 1 && console_drive(path, prefix_length) == Drive::Scratch);
 }
 
+// A folder's entries change one step at a time, as on the host: RemoveDirectory holds the folder's lock from its
+// emptiness check to its marker, and a GAME: write-open or CreateDirectory holds the lock of the folder it creates in
+// from its "does the folder exist" check, through mirroring that folder into the overlay, to the host call that makes
+// the entry. One of the two goes first: the create fails with ERROR_PATH_NOT_FOUND, or the remove with
+// ERROR_DIR_NOT_EMPTY. Without it both succeeded and the removed folder was back, the new entry in it. The locks are
+// striped by the folder's name, so calls in different folders rarely wait on each other; reads never take one.
+// Namespace scope, not function-local statics: these run on the title's threads. Taken after roots(); nothing holding
+// one takes another of them or calls back into the title (a copy-up's lock may be taken inside one, never around one).
+constexpr size_t kFolderLocks = 64;
+std::mutex g_folder_locks[kFolderLocks];
+
+std::mutex& folder_lock(const std::vector<std::wstring>& folder) {
+    // FNV-1a over the upper-cased components: names compare without case, so every spelling of a folder gets its lock.
+    uint64_t hash = 14695981039346656037ull;
+    const auto mix = [&hash](wchar_t c) {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ull;
+    };
+    for (const auto& part : folder) {
+        std::wstring upper(part.size(), L'\0');
+        if (part.empty() || LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, part.data(),
+                                          static_cast<int>(part.size()), upper.data(), static_cast<int>(upper.size()),
+                                          nullptr, nullptr, 0) != static_cast<int>(part.size()))
+            upper = part;
+        for (const wchar_t c : upper) mix(c);
+        mix(L'\\');
+    }
+    return g_folder_locks[hash % kFolderLocks];
+}
+
 struct Target {
     std::filesystem::path path;
     DWORD error = 0;  // non-zero: the caller fails with this error and does not touch the host
+    // A write-open's hold on the folder it opens in, until the Target goes after the host open (g_folder_locks).
+    std::unique_lock<std::mutex> folder;
 };
 
 Target fail(DWORD error) {
@@ -394,10 +426,14 @@ Target write_target(const std::wstring& path, bool copy_up) {
     // below a package file (which then read as a folder) and inside a folder the title had removed. The overlay may
     // still lack a folder only the package has, so it is mirrored here, which the title cannot see.
     // T:'s scratch folder is the exception: it creates its parent folders, as merged with RT-218.
+    // The folder's lock is held from this check to the caller's host open, so a RemoveDirectory of the folder comes
+    // wholly before or after (g_folder_locks).
+    std::unique_lock folder(folder_lock(parent_of(parts)));
     const bool scratch = !parts.empty() && same_name(parts.front().c_str(), kScratchDir);
     if (!scratch && !is_folder(r, parent_of(parts))) return fail(ERROR_PATH_NOT_FOUND);
 
     Target t;
+    t.folder = std::move(folder);
     t.path = join(r.overlay, parts);
 
     std::error_code ec;
@@ -1006,6 +1042,8 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (view(r, parts).kind != Kind::None) return fail_bool(ERROR_ALREADY_EXISTS);  // "GAME:" included
+    // From the parent's check to the new folder: a RemoveDirectory of the parent comes wholly before or after.
+    std::lock_guard folder(folder_lock(parent_of(parts)));
     if (!is_folder(r, parent_of(parts))) return fail_bool(ERROR_PATH_NOT_FOUND);
 
     const std::filesystem::path target = join(r.overlay, parts);
@@ -1049,6 +1087,8 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
+    // From the emptiness check to the marker: a create in the folder comes wholly before or after (g_folder_locks).
+    std::lock_guard folder(folder_lock(parts));
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);

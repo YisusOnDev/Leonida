@@ -255,7 +255,9 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   package has, fails with `ERROR_ALREADY_EXISTS`; a missing parent with `ERROR_PATH_NOT_FOUND`.
 - `RemoveDirectory*` needs the folder empty in the title's view (`ERROR_DIR_NOT_EMPTY` otherwise). An overlay folder is
   removed; a package folder is hidden by a `.gta6rt-dir` marker inside its marker folder, and stays on disk. A marker
-  folder on its own (left by a file deleted below it) does not hide anything.
+  folder on its own (left by a file deleted below it) does not hide anything. A remove and a write-open or
+  `CreateDirectory*` inside the folder on another thread are ordered as on the host: one goes first, and the create
+  fails with `ERROR_PATH_NOT_FOUND` or the remove with `ERROR_DIR_NOT_EMPTY`, never both succeeding.
 - `MoveFile*` writes the destination in the overlay. A package file is copied there and its old name deleted by a
   marker; an overlay file or an overlay-only folder is renamed. An existing destination needs
   `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Moving a package folder fails with

@@ -8,6 +8,7 @@
 #include <aclapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <clocale>
 
 #include <fcntl.h>
@@ -734,6 +735,75 @@ void run_checks(const std::filesystem::path& root) {
         check(mkdir_w(L"GAME:\\misc\\inner", nullptr) != FALSE, "the removed name can be made again");
         check(list(first_w, next_w, find_close, L"GAME:\\misc\\inner\\*").size() == 2,
               "and the new folder is empty: only . and ..");
+    }
+
+    // RemoveDirectory of a folder on one thread and, on another, a creating open of a file in it (CREATE_NEW,
+    // CREATE_ALWAYS, OPEN_ALWAYS) or CreateDirectory of a folder in it. The host orders the two: the remove goes first
+    // and the create fails with ERROR_PATH_NOT_FOUND, or the create goes first and the remove fails with
+    // ERROR_DIR_NOT_EMPTY. Both succeeding left the removed folder back in the title's view with the new entry in it.
+    // Each round takes a folder of its own that only the package has, empty in the title's view, and starts the two
+    // threads together; the remover waits a few more spins each round so the calls meet at different points.
+    {
+        constexpr int kRounds = 2000;
+        const auto race = [&](bool make_folder, const wchar_t* prefix, const char* what) {
+            for (int i = 0; i < kRounds; ++i)
+                std::filesystem::create_directories(package / "rmrace" / (prefix + std::to_wstring(i)));
+            int create_first = 0, remove_first = 0, both = 0, other = 0, back = 0;
+            for (int i = 0; i < kRounds; ++i) {
+                const std::wstring folder = L"GAME:\\rmrace\\" + (prefix + std::to_wstring(i));
+                const std::wstring child = folder + (make_folder ? L"\\sub" : L"\\new.tmp");
+                const DWORD disposition = i % 3 == 0 ? CREATE_NEW : i % 3 == 1 ? CREATE_ALWAYS : OPEN_ALWAYS;
+                std::atomic<int> ready{0};
+                HANDLE handle = INVALID_HANDLE_VALUE;
+                bool made = false;
+                DWORD create_error = 0;
+                std::thread creator([&] {
+                    ready.fetch_add(1);
+                    while (ready.load() < 2) {
+                    }
+                    if (make_folder) {
+                        made = mkdir_w(child.c_str(), nullptr) != FALSE;
+                    } else {
+                        handle = create_w(child.c_str(), GENERIC_WRITE, 0, nullptr, disposition, 0, nullptr);
+                        made = handle != INVALID_HANDLE_VALUE;
+                    }
+                    create_error = made ? 0 : GetLastError();
+                });
+                ready.fetch_add(1);
+                while (ready.load() < 2) {
+                }
+                for (int spin = 0; spin < (i % 64) * 64; ++spin) YieldProcessor();
+                const bool removed = rmdir_w(folder.c_str()) != FALSE;
+                const DWORD remove_error = removed ? 0 : GetLastError();
+                creator.join();
+                if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
+                if (made && removed) {
+                    ++both;
+                } else if (made && remove_error == ERROR_DIR_NOT_EMPTY) {
+                    ++create_first;
+                } else if (removed && create_error == ERROR_PATH_NOT_FOUND) {
+                    ++remove_first;
+                } else {
+                    ++other;
+                }
+                // A folder the remove took away stays away, whatever the create did.
+                if (removed) {
+                    SetLastError(0);
+                    if (attributes_w(folder.c_str()) != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND)
+                        ++back;
+                }
+            }
+            std::printf("NOTE %s against RemoveDirectoryW, %d rounds: create first %d, remove first %d, both succeeded "
+                        "%d, other %d, removed folder back %d\n",
+                        what, kRounds, create_first, remove_first, both, other, back);
+            const std::string w = what;
+            check(both == 0, (w + " and RemoveDirectoryW of its folder never both succeed").c_str());
+            check(other == 0, (w + " or RemoveDirectoryW fails as on the host (ERROR_PATH_NOT_FOUND or "
+                                   "ERROR_DIR_NOT_EMPTY)").c_str());
+            check(back == 0, (w + ": a folder RemoveDirectoryW removed stays removed").c_str());
+        };
+        race(false, L"f", "a creating CreateFileW");
+        race(true, L"d", "CreateDirectoryW");
     }
 
     // MoveFile: the destination is in the overlay; a moved package file is deleted by a marker.
