@@ -145,6 +145,19 @@ int main() {
     const auto& resolved = std::get<ResolveSubresource>(list.commands()[5]);
     CHECK(resolved.dst == 7 && resolved.dst_subresource == 1 && resolved.src == 8 && resolved.src_subresource == 0);
 
+    // DispatchMesh records its x, y, z group counts in count, instances, first through the rvalue overload.
+    CHECK(list.reset());
+    Draw mesh{};
+    mesh.pipeline = 0x1234;
+    mesh.mesh = true;
+    mesh.count = mesh.instances = 1;
+    CHECK(list.draw(Draw{mesh}));  // DispatchMesh(1, 1, 0)
+    CHECK(list.commands().empty());
+    mesh.first = 1;
+    CHECK(list.draw(std::move(mesh)));  // DispatchMesh(1, 1, 1)
+    CHECK(list.commands().size() == 1 && std::get<Draw>(list.commands()[0]).mesh);
+    CHECK(list.close());
+
     // Dispatches keep the user data they were recorded with; no pipeline is refused, no groups records nothing.
     CHECK(list.reset());
     Dispatch dispatch{0x1234, {}, 2, 1, 1};

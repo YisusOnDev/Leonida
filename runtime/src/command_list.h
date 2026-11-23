@@ -747,14 +747,17 @@ public:
 
     // A draw with no vertices or instances, or a mesh draw with no thread groups, does nothing in D3D12, and is
     // not recorded.
+    static bool empty_draw(const Draw& draw) {
+        return !draw.count || !draw.instances || (draw.mesh && !draw.first);
+    }
     bool draw(const Draw& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances || (draw.mesh && !draw.first)) return !closed_;
+        if (empty_draw(draw)) return !closed_;
         return append(draw);
     }
     bool draw(Draw&& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
+        if (empty_draw(draw)) return !closed_;
         return append(std::move(draw));
     }
 
