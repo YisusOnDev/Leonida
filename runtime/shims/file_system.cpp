@@ -27,6 +27,7 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
 
 #include <fcntl.h>
@@ -133,10 +134,30 @@ bool lies_under(const std::wstring& path, const std::filesystem::path& root) {
 
 // "G:\x" is the installed package, like "GAME:\x", and "T:\x" a scratch folder the title may write to, the way the
 // other console layers map those two drives (RT-218). Only the executable can say which spelling the title uses, so
-// a host drive of the same letter must keep working: a path under --game-dir or the overlay (a package on drive G:,
-// or a path GetModuleFileName handed back) stays a host path, and so does every G:/T: path while no roots are
-// configured. The scratch folder lives in the overlay, as `.gta6rt-temp`.
+// a host drive of the same letter must keep working: a path under --game-dir or the overlay (a package on drive G:)
+// is not read as a console drive, and every G:/T: path stays a host path while no roots are configured. A path under
+// --game-dir is the package by its host name instead (game_dir_rest below). The scratch folder lives in the overlay,
+// as `.gta6rt-temp`.
 enum class Drive { None, Game, Scratch };
+
+// A host path whose normalised form lies inside --game-dir (and not inside the overlay) names a package file by its
+// host name: a title builds one from GetModuleFileName or from the folder it was started in. It gets the same rules
+// as its GAME: spelling, so a read sees the overlay copy and a write, delete, move or attribute change goes to the
+// overlay instead of the package. Returns the part below the game folder ("\data\x", or "" for the folder itself);
+// false for any other path. ".." is resolved first, so a path that climbs out of the game folder is a host path.
+bool game_dir_rest(const std::wstring& path, std::wstring& rest) {
+    const bool absolute = (path.size() >= 3 && path[1] == L':' && is_separator(path[2])) ||
+                          (path.size() >= 2 && is_separator(path[0]) && is_separator(path[1]));
+    if (!absolute) return false;
+    const Roots r = roots();
+    if (r.game.empty()) return false;
+    const std::wstring normal = std::filesystem::path(path).lexically_normal().native();
+    if (!lies_under(normal, r.game) || (!r.overlay.empty() && lies_under(normal, r.overlay))) return false;
+    std::wstring base = r.game.lexically_normal().native();
+    while (!base.empty() && is_separator(base.back())) base.pop_back();
+    rest = normal.substr(std::min(base.size(), normal.size()));
+    return true;
+}
 
 Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     if (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) {
@@ -155,6 +176,8 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
 
 Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& parts, Drive* out_drive = nullptr,
                            bool create_scratch = true) {
+    if (std::wstring rest; game_dir_rest(path, rest))
+        return parse_console_parts(std::wstring(kGamePrefix) + rest, parts, out_drive, create_scratch);
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
     if (out_drive) *out_drive = drive;

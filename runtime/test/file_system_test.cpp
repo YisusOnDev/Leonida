@@ -1326,12 +1326,14 @@ void run_checks(const std::filesystem::path& root) {
         check(through != INVALID_HANDLE_VALUE && read_handle(through) == "ok", "an ordinary dotted name under GAME: is not reserved");
         if (through != INVALID_HANDLE_VALUE) ::CloseHandle(through);
 
-        // A package that itself sits on drive G: is reached by host paths, which must stay host paths.
+        // A package that itself sits on drive G: is reached by host paths. They are not read as the console's G:
+        // (that would look for leonida_missing_package inside the package): a path under --game-dir names the
+        // package's own file, by the GAME: rules. The drive does not exist here, so only the lookup is checked.
         rt::fs::configure(L"G:\\leonida_missing_package", L"G:\\leonida_missing_overlay");
         SetLastError(0);
         check(attributes_w(L"G:\\leonida_missing_package\\data.txt") == INVALID_FILE_ATTRIBUTES &&
                   GetLastError() != ERROR_INVALID_NAME,
-              "a path under a configured G: game folder is a host path");
+              "a path under a configured G: game folder is not read as the console drive G:");
         // No roots configured: nothing to map G: and T: onto, so they are host paths.
         rt::fs::configure({}, {});
         SetLastError(0);
@@ -2150,6 +2152,65 @@ void run_checks(const std::filesystem::path& root) {
                   !std::filesystem::exists(overlay / "data" / "once5.txt") &&
                   read_path(package / "data" / "once5.txt") == "package",
               "and after the close the name is gone again, with the package file untouched");
+
+    // A host path inside --game-dir names a package file too (a title can build one from GetModuleFileName). It reads
+    // the title's view and writes to the overlay, so the package is never written whichever spelling reaches it.
+    {
+        write_path(package / "host" / "file.txt", "package");
+        write_path(package / "host" / "gone.txt", "package");
+        const std::filesystem::path in_package = package / "host" / "file.txt";
+        HANDLE h = create_w(in_package.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
+              "a host path into the game folder reads the package file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        h = create_w(in_package.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "a write-open through a host path into the game folder succeeds");
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            ::WriteFile(h, "host", 4, &written, nullptr);
+            ::CloseHandle(h);
+        }
+        check(read_path(in_package) == "package", "the package file is not modified by a host-path write");
+        check(read_path(overlay / "host" / "file.txt") == "host", "the host-path write landed in the overlay copy");
+        h = create_w(L"GAME:\\host\\file.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "host", "GAME: sees what the host path wrote");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const std::filesystem::path host_new = package / "host" / "new.txt";
+        h = create_w(host_new.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(h != INVALID_HANDLE_VALUE && !std::filesystem::exists(host_new) &&
+                  std::filesystem::exists(overlay / "host" / "new.txt"),
+              "a file created through a host path into the game folder is made in the overlay");
+        const std::filesystem::path host_gone = package / "host" / "gone.txt";
+        check(delete_w(host_gone.c_str()) != FALSE && std::filesystem::exists(host_gone),
+              "DeleteFileW through a host path leaves the package file in place");
+        check(attributes_w(host_gone.c_str()) == INVALID_FILE_ATTRIBUTES, "and the name is gone for the title");
+        const std::filesystem::path in_overlay = overlay / "host" / "direct.txt";
+        std::filesystem::create_directories(in_overlay.parent_path());
+        h = create_w(in_overlay.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(h != INVALID_HANDLE_VALUE && std::filesystem::exists(in_overlay),
+              "a host path into the overlay stays a host path");
+        const std::filesystem::path climb = package / ".." / "outside.txt";
+        h = create_w(climb.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(h != INVALID_HANDLE_VALUE && std::filesystem::exists(root / "outside.txt") &&
+                  !std::filesystem::exists(overlay / "outside.txt"),
+              "a host path that climbs out of the game folder with .. is a host path again");
+        const std::filesystem::path inside = package / "host" / "sub" / ".." / "file.txt";
+        h = create_w(inside.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "host",
+              "a host path with .. that stays inside reads the overlay copy");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const std::filesystem::path moved = package / "host" / "moved.txt";
+        check(move_ex_w(L"GAME:\\host\\file.txt", moved.c_str(), 0) != FALSE && !std::filesystem::exists(moved) &&
+                  read_path(overlay / "host" / "moved.txt") == "host" && read_path(in_package) == "package",
+              "a move from GAME: to a host path inside the game folder stays in the overlay");
+        const std::filesystem::path away = root / "away.txt";
+        SetLastError(0);
+        check(move_ex_w(L"GAME:\\host\\moved.txt", away.c_str(), 0) == FALSE &&
+                  GetLastError() == ERROR_NOT_SAME_DEVICE && !std::filesystem::exists(away),
+              "a move from GAME: to a host path outside the game folder is ERROR_NOT_SAME_DEVICE");
     }
 }
 
