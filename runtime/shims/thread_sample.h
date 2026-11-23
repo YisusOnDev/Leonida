@@ -22,6 +22,7 @@
 
 #include "startup_trace.h"
 #include "write_watch.h"
+#include "exec_watch.h"
 
 namespace rt::thread_sample {
 
@@ -141,6 +142,7 @@ inline void start() {
     }
     if (GetEnvironmentVariableA("LEONIDA_WATCH_ADDR", buf, sizeof(buf)))
         write_watch::watch_absolute(std::strtoull(buf, nullptr, 16));
+    exec_watch::start();
     std::thread([at] {
         const auto t0 = std::chrono::steady_clock::now();
         size_t next = 0;
@@ -148,7 +150,7 @@ inline void start() {
             std::this_thread::sleep_until(t0 + std::chrono::seconds(tick));
             const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (tick % 5 == 0) std::fprintf(stderr, "[rt] tick t=%d s\n", tick);
-            while (next < at.size() && t >= at[next]) detail::peek(t), detail::sample(t), ++next;
+            while (next < at.size() && t >= at[next]) detail::peek(t), exec_watch::report(t), detail::sample(t), ++next;
         }
     }).detach();
 }
