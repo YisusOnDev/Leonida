@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
+import fssm_unpack  # noqa: E402
 import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
 import wave64_emulate_opt  # noqa: E402
@@ -593,6 +595,53 @@ class Gen:
         if not raw_op.endswith("_dpp"):
             return list(mods)
         return [m for m in mods if m not in cls._DPP_MODS and not m.startswith(cls._DPP_PREFIXES)]
+
+    def _check_int32_valu(self, op, raw_op, a, mods, *, allow_sdwa_dpp=False):
+        """Validate operands and modifiers for 32-bit integer 2-source VALU ops (vdst, src0, src1)."""
+        orig_a = self.cur_ins["args"] if self.cur_ins is not None else a
+        if len(a) != 3 or len(orig_a) != 3:
+            raise Unsupported(f"{op} operands")
+        if a[0].get("k") != "vgpr" or a[0].get("n", 1) != 1:
+            raise Unsupported(f"{op} destination")
+        if any(s.get("n", 1) != 1 or s.get("k") in ("vlist", "slist") for s in orig_a[1:]):
+            raise Unsupported(f"{op} source")
+        is_dpp = raw_op.endswith("_dpp")
+        is_sdwa = raw_op.endswith("_sdwa")
+        if not allow_sdwa_dpp:
+            if is_dpp or is_sdwa:
+                raise Unsupported(f"{op} form")
+            if mods:
+                raise Unsupported(f"{op} modifiers")
+            if any(s.get("neg") or s.get("abs") or s.get("sext") for s in orig_a):
+                raise Unsupported(f"{op} operand modifier")
+            return
+        if is_sdwa:
+            for m in mods:
+                if ":" not in m:
+                    raise Unsupported(f"{op} modifiers")
+                k, v = m.split(":", 1)
+                if k in ("dst_sel", "src0_sel", "src1_sel"):
+                    if v not in self.SDWA_SEL:
+                        raise Unsupported(f"{op} modifiers")
+                elif k == "dst_unused":
+                    if v not in ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"):
+                        raise Unsupported(f"{op} modifiers")
+                else:
+                    raise Unsupported(f"{op} modifiers")
+            if orig_a[0].get("neg") or orig_a[0].get("abs") or orig_a[0].get("sext"):
+                raise Unsupported(f"{op} operand modifier")
+            if any(s.get("neg") or s.get("abs") for s in orig_a[1:]):
+                raise Unsupported(f"{op} operand modifier")
+        elif is_dpp:
+            if self.non_dpp_mods(raw_op, mods):
+                raise Unsupported(f"{op} modifiers")
+            if any(s.get("neg") or s.get("abs") or s.get("sext") for s in orig_a):
+                raise Unsupported(f"{op} operand modifier")
+        else:
+            if mods:
+                raise Unsupported(f"{op} modifiers")
+            if any(s.get("neg") or s.get("abs") or s.get("sext") for s in orig_a):
+                raise Unsupported(f"{op} operand modifier")
 
     @staticmethod
     def opsel_bits(mods, nsrc):
@@ -6348,11 +6397,26 @@ class Gen:
             x["k"] == "special" and x.get("t", "").startswith(("exec", "vcc"))
         )
 
+    def f64_literal_one_dword(self, src: dict) -> bool:
+        """True when a literal source is the one ISA dword that supplies bits 63:32.
+
+        LLVM prints a value that fits one literal dword without padding, so its hex width is at
+        most 8 digits; a spelling wider than that is the whole binary64 constant (the full-width
+        form `tools/f64_diff.py` writes). A decimal operand has no printed width and falls back to
+        the value, which is also what a padded one-dword spelling cannot survive.
+        """
+        digits = src.get("literal_hex_digits")
+        if digits is not None:
+            return digits <= 8
+        return -0x80000000 <= src["v"] <= 0xFFFFFFFF
+
     def f64_source_words(self, src: dict, op: str) -> tuple[str, str]:
         if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
             return self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
-        if src.get("f64_literal"):
+        if src.get("f64_literal") and self.f64_literal_one_dword(src):
+            # One literal dword: bits 63:32 of the constant (docs/design.md, f64 literal sources).
             return self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
+        # A wider literal is the whole constant, so both words of it are the value: fall through.
         if src["k"] == "fimm":
             bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
         elif src["k"] == "imm":
@@ -8286,12 +8350,13 @@ class Gen:
             elif src["k"] == "fimm":
                 bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
                 low, high = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            elif src.get("f64_literal"):
-                if not 0 <= src["v"] <= 0xFFFFFFFF:
-                    raise Unsupported(op + " literal")
+            elif src.get("f64_literal") and self.f64_literal_one_dword(src):
+                # One literal dword: bits 63:32 of the constant (docs/design.md, f64 literal sources).
                 low, high = self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
-            elif src["k"] == "imm" and -16 <= src["v"] <= 64:
-                low, high = self.cu(src["v"] & 0xFFFFFFFF), self.cu(0xFFFFFFFF if src["v"] < 0 else 0)
+            elif src["k"] == "imm" and (-16 <= src["v"] <= 64 or src.get("f64_literal")):
+                # An inline integer is sign-extended; a wider literal is the whole constant.
+                bits = src["v"] & 0xFFFFFFFFFFFFFFFF
+                low, high = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
             else:
                 raise Unsupported(op + " source")
             if src.get("abs"):
@@ -9070,6 +9135,7 @@ class Gen:
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
             self.write_half16(a[0], lo, dhi)
         elif op == "v_bcnt_u32_b32":
+            self._check_int32_valu(op, ins["op"], a, mods)
             x, acc = self.src_u(a[1]), self.src_u(a[2])
             c, r = self.tmp(), self.tmp()
             self.emit(f"{c} = OpBitCount %uint {x}")
@@ -9564,6 +9630,7 @@ class Gen:
             self.emit(f"{r} = OpNot %uint {x}")
             self.dst(a[0], r)
         elif op == "v_mul_hi_i32":
+            self._check_int32_valu(op, ins["op"], a, mods)
             x, y = self.as_int(self.src_u(a[1])), self.as_int(self.src_u(a[2]))
             s, hi, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{s} = OpSMulExtended %smul {x} {y}")
@@ -10490,6 +10557,7 @@ class Gen:
             self.emit(f"{r} = OpFAdd %float {self.flush_f32(m)} {z}")
             self.dst(a[0], self.tou(self.flush_f32_mods(r, mods)))
         elif op in ("v_mul_lo_u32", "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32"):
+            self._check_int32_valu(op, ins["op"], a, mods, allow_sdwa_dpp=(op != "v_mul_lo_u32"))
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
             if op == "v_mul_lo_u32":
@@ -11208,6 +11276,7 @@ class Gen:
             self.emit(f"{r} = OpBitwiseOr %uint {keep} {ins_}")
             self.dst(a[0], r)
         elif op == "v_mul_hi_u32":
+            self._check_int32_valu(op, ins["op"], a, mods)
             x, y = self.src_u(a[1]), self.src_u(a[2])
             s, r = self.tmp(), self.tmp()
             self.emit(f"{s} = OpUMulExtended %umul {x} {y}")
@@ -11666,14 +11735,14 @@ class Gen:
             sv = a[1]
             if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                 lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-            elif sv.get("f64_literal"):
+            elif sv.get("f64_literal") and self.f64_literal_one_dword(sv):
                 lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
             elif sv["k"] == "fimm":
                 bits = struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
                 lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
             elif sv["k"] == "imm":
                 v = sv["v"]
-                if -16 <= v <= 64 or v > 0xFFFFFFFF or v < -0x80000000:
+                if -16 <= v <= 64 or not self.f64_literal_one_dword(sv):
                     bits = v & 0xFFFFFFFFFFFFFFFF
                     lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
                 else:
@@ -15266,7 +15335,8 @@ def assemble(gen):
     reserved = {loc for pair in gen.f16_half_locs.values() for loc in pair} if gen.stage == "ps" else set()
     if any(not k.startswith("%in_f16h") and v in reserved for k, v in gen.inputs.items()):
         raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
-    gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
+    occupied = used | reserved
+    gen.bary_location = next(n for n in range(len(occupied) + 1) if n not in occupied) if bary and BARY_FALLBACK else None
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs or bary:
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
@@ -16753,6 +16823,18 @@ def shader_container(path, name):
         raise Unsupported("no shader container (signatures, PSV0)") from None
 
 
+def source_wave_size(path, name):
+    """Read the source container's wave size only when all of its FSSM payloads agree."""
+    try:
+        blobs = fssm_unpack.unpack_all(shader_container(path, name))
+    except (OSError, Unsupported, ValueError, struct.error, zlib.error):
+        return None
+    sizes = {fssm_header.wave_size(blob) for blob in blobs}
+    if len(sizes) == 1:
+        return sizes.pop()
+    return None
+
+
 def input_signature_full(path, name):
     """ISG1 elements as (system value, declared mask, read/write mask)."""
     d = shader_container(path, name)
@@ -16864,6 +16946,51 @@ def restore_mix_literal(ins, raw, literal):
     for i in range(3):
         if (w1 >> (9 * i)) & 0x1FF == 0xFF and ins["args"][1 + i].get("k") == "imm":
             ins["args"][1 + i] = {**ins["args"][1 + i], "v": literal}
+
+
+# The f16 bits each inline constant code stands for when llvm-mc 21 prints a v_fma_mix* literal as that constant:
+# 0..64, -1..-16, +-0.5, +-1.0, +-2.0, +-4.0 and 1/(2*pi). Measured with llvm-mc 21.1.8 (-mcpu=gfx1013) over all 65,536
+# low halves of a literal under three high halves (0x0000, 0x3f80, 0xffff): exactly these 90 low halves print as the
+# inline constant, whatever the high half; every other literal prints in full.
+MIX_INLINE_F16 = {**{0x80 + n: n for n in range(65)}, **{0xC0 + n: -n & 0xFFFF for n in range(1, 17)},
+                  0xF0: 0x3800, 0xF1: 0xB800, 0xF2: 0x3C00, 0xF3: 0xBC00, 0xF4: 0x4000, 0xF5: 0xC000,
+                  0xF6: 0x4400, 0xF7: 0xC400, 0xF8: 0x3118}
+
+
+def mix_inline_literal(raw, printed, op):
+    """The 32-bit literal of a v_fma_mix* that llvm-mc 21 printed as an inline constant, else None.
+
+    llvm-mc 21's gfx1013 decoder reads a v_fma_mix* literal as 16 bits. When those low 16 bits are the f16 value of an
+    inline constant (MIX_INLINE_F16), it prints that constant and re-encodes the instruction in 8 bytes: each SRC
+    field that held 0xff (the literal) holds the inline code instead, and the literal word is gone (0x3f800000, 1.0 as
+    an f32 source, prints as 0; 0x3c003800 as `0.5`). llvm-mc 23 prints lit(...) instead. ``raw`` is the 12 stored
+    bytes at the instruction's offset, ``printed`` the 8-byte printed encoding. Only that change is accepted: every
+    source field that differs must be 0xff in the blob and the inline code of the literal's low half in the print,
+    and the rest of the 8 bytes must match exactly (same_encoding with all three sources live)."""
+    if not op.startswith("v_fma_mix") or len(raw) != 12 or len(printed) != 8 or raw[3] != 0xCC:
+        return None
+    literal = int.from_bytes(raw[8:], "little")
+    stored, shown = int.from_bytes(raw[4:8], "little"), int.from_bytes(printed[4:8], "little")
+    patched = shown
+    for i in range(3):
+        field = (shown >> 9 * i) & 0x1FF
+        if (stored >> 9 * i) & 0x1FF == 0xFF and field != 0xFF and MIX_INLINE_F16.get(field) == literal & 0xFFFF:
+            patched = (patched & ~(0x1FF << 9 * i)) | (0xFF << 9 * i)
+    if patched == shown or not same_encoding(raw[:8], printed[:4] + patched.to_bytes(4, "little"), op, 4):
+        return None
+    return literal
+
+
+def restore_mix_inline_literal(ins, raw, literal):
+    """Give ``ins`` the stored instruction mix_inline_literal accepted: every source the blob encodes as the literal
+    (SRC field 0xff) reads the 32-bit ``literal`` with the stored neg (NEG) and abs (NEG_HI, as abs on v_fma_mix*)
+    bits, and the encoding is the 12 stored bytes, so the next instruction starts after them."""
+    w0, w1 = int.from_bytes(raw[:4], "little"), int.from_bytes(raw[4:8], "little")
+    for i in range(3):
+        if (w1 >> 9 * i) & 0x1FF == 0xFF:
+            ins["args"][1 + i] = {"k": "imm", "v": literal, "neg": bool((w1 >> (29 + i)) & 1),
+                                  "abs": bool((w0 >> (8 + i)) & 1)}
+    ins["enc"] = raw.hex()
 
 
 def output_signature(path, name):
@@ -17036,7 +17163,9 @@ def check_printed_encodings(path, info):
     blob = native_blob(path, info["name"])
     if int(m.group(3), 16) > len(blob):
         return
+    shift = 0        # bytes the decoder read past the printed encodings so far (mix_inline_literal)
     for ins in info["insns"]:
+        ins["pc"] += shift
         if not ins.get("enc"):
             continue
         enc = bytes.fromhex(ins["enc"])
@@ -17045,6 +17174,12 @@ def check_printed_encodings(path, info):
             literal = mix_literal(raw, enc, base_op(ins["op"]))
             if literal is not None:
                 restore_mix_literal(ins, raw, literal)
+                continue
+            raw12 = blob[ins["pc"]:ins["pc"] + 12]
+            literal = mix_inline_literal(raw12, enc, base_op(ins["op"]))
+            if literal is not None:
+                restore_mix_inline_literal(ins, raw12, literal)
+                shift += 4
                 continue
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
                               f"{enc.hex()} (a field the disassembler dropped)")
@@ -17102,6 +17237,11 @@ def translate(path):
                 if literal is not None:
                     restore_mix_literal(ins, blob[at:at + len(enc)], literal)
                     break
+                literal = mix_inline_literal(blob[at:at + 12], enc, base_op(op))
+                if literal is not None:
+                    restore_mix_inline_literal(ins, blob[at:at + 12], literal)
+                    enc = blob[at:at + 12]          # the 12 bytes the decoder read: the next one starts after them
+                    break
                 at += 4
                 skipped += 4
                 if skipped > 4096 or at >= len(blob):
@@ -17142,7 +17282,7 @@ def translate(path):
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
     # heuristic (+ wave64 default for NGG mesh shaders) when no FSSM sidecar is present (FSPX or
     # synthetic listings).
-    fssm_path = native_paths(path, info["name"])[0]
+    fssm_path, fspx_path, _ = native_paths(path, info["name"])
     fssm_ws = None
     try:
         with open(fssm_path, "rb") as f:
@@ -17167,6 +17307,11 @@ def translate(path):
         if fspx_ws == 64 and code_w32:
             raise Unsupported("FSPX wave64 dispatch state contradicts wave32 code")
         g.wave64 = fspx_ws == 64
+    elif (stage in ("vs", "ps") and code_w64 and code_w32 and not (w64_marks - {"s_bfm_b64"})
+          and os.path.isfile(fspx_path) and source_wave_size(path, info["name"]) == 32):
+        # A library program can use s_bfm_b64 as scalar data. Use the matching source's
+        # wave32 flags only when this program's own EXEC instructions corroborate them.
+        g.wave64 = False
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
     if stage == "gs":
