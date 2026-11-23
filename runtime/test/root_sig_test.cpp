@@ -7,11 +7,36 @@
 #include <d3d12.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <vector>
 
 #include "d3d12_xs_rootsig.h"
 #include "shims.h"
+
+namespace {
+
+// Allocation failures: this executable's global operator new fails the next g_fail_news calls (single-threaded: armed
+// right before the call it is meant for), as xs_proxy_mock_test does for the device proxy.
+int g_fail_news = 0;
+int g_failed_news = 0;  // allocations refused so far
+
+}  // namespace
+
+// The annotations are vcruntime_new.h's, so /analyze sees the same contract as for the CRT's own operator new.
+_NODISCARD _Ret_notnull_ _Post_writable_byte_size_(size) _VCRT_ALLOCATOR
+void* __CRTDECL operator new(std::size_t size) {
+    if (g_fail_news > 0) {
+        --g_fail_news;
+        ++g_failed_news;
+        throw std::bad_alloc();
+    }
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void __CRTDECL operator delete(void* p) noexcept { std::free(p); }
+void __CRTDECL operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -489,6 +514,37 @@ void test_deserializer() {
         check(d->Flags == 0, "shim deserializer returns flags with the high byte cleared");
         shim_de->Release();
     }
+
+    // The shim copies such a blob to clear the byte. A refused allocation is E_OUTOFMEMORY with a null output, not
+    // an exception thrown out of the export into the title's code (as the device proxy's rule says: nothing throws).
+    shim_de = reinterpret_cast<ID3D12RootSignatureDeserializer*>(uintptr_t(1));
+    bool threw = false;
+    const int refused_before = g_failed_news;
+    g_fail_news = 1;
+    try {
+        hr = deserialize(tampered.data(), tampered.size(), IID_PPV_ARGS(&shim_de));
+    } catch (const std::bad_alloc&) {
+        threw = true;
+        shim_de = nullptr;
+    }
+    g_fail_news = 0;
+    check(g_failed_news == refused_before + 1, "the shim deserializer's copy of the blob is an allocation");
+    check(!threw, "a refused allocation does not leave the shim deserializer as an exception");
+    check(!threw && hr == E_OUTOFMEMORY && shim_de == nullptr,
+          "a refused allocation is E_OUTOFMEMORY with a null output");
+    // A blob without the Xbox byte is forwarded as it is, with no copy: an armed failure is not reached.
+    ID3D12RootSignatureDeserializer* plain_de = nullptr;
+    g_fail_news = 1;
+    hr = deserialize(bytes, size, IID_PPV_ARGS(&plain_de));
+    const bool untouched = g_fail_news == 1;
+    g_fail_news = 0;
+    check(SUCCEEDED(hr) && plain_de != nullptr && untouched, "a blob without the Xbox byte is forwarded without a copy");
+    if (plain_de) plain_de->Release();
+    // And the tampered blob still deserializes once allocations succeed again.
+    shim_de = nullptr;
+    hr = deserialize(tampered.data(), tampered.size(), IID_PPV_ARGS(&shim_de));
+    check(SUCCEEDED(hr) && shim_de != nullptr, "the shim deserializer succeeds again after the refused allocation");
+    if (shim_de) shim_de->Release();
 }
 
 void write_u32(std::vector<uint8_t>& buf, size_t off, uint32_t v) {

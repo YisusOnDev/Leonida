@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <new>
 #include <type_traits>
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -73,9 +74,19 @@ HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DES
     }
     if (cleared.Version == D3D_ROOT_SIGNATURE_VERSION_1_2 && !host_serializes_1_2(fn)) {
         // Windows 10's d3d12.dll stops at 1.1 (d3d12_xs_rootsig.h). Rewrite as 1.1 when nothing is lost.
+        // The 1.1 samplers are an allocation. These exports are called by the title's code, which an exception must
+        // not reach: a refused allocation is E_OUTOFMEMORY, as in the device proxy.
         std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC v11{};
-        if (!rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(cleared, samplers, v11)) {
+        bool downgraded = false;
+        try {
+            downgraded = rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(cleared, samplers, v11);
+        } catch (const std::bad_alloc&) {
+            if (blob) *blob = nullptr;
+            if (error) *error = nullptr;
+            return E_OUTOFMEMORY;
+        }
+        if (!downgraded) {
             std::fprintf(stderr,
                          "[rt] d3d12_xs: D3D12SerializeVersionedRootSignature: version 1.2 with static sampler flags, "
                          "and the host d3d12.dll serializes only up to 1.1; refused\n");
@@ -114,10 +125,16 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     // The host deserializer rejects a blob whose RTS0 flags carry the Xbox high
     // byte, so forward a copy with that byte cleared when present (the same fix
     // the serializer applies to descriptors).
+    // The copy is an allocation; refused, the call answers E_OUTOFMEMORY instead of throwing into the title's code.
     std::vector<uint8_t> cleared;
-    if (rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared)) {
-        return fn(cleared.data(), cleared.size(), iid, out);
+    bool rewritten = false;
+    try {
+        rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared);
+    } catch (const std::bad_alloc&) {
+        if (out) *out = nullptr;
+        return E_OUTOFMEMORY;
     }
+    if (rewritten) return fn(cleared.data(), cleared.size(), iid, out);
     return fn(data, size, iid, out);
 }
 
