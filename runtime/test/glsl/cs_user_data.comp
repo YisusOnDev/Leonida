@@ -48,8 +48,8 @@ void main() {
     if (pc.s[5] == 0xFFFFFFFDu) {
         // Root view read to a table pointer (d3d12_title_va_test): read through the root view, 256 bytes past its
         // base, and write where the table entry's raw 64-bit VA points.
-        Words out = at(uvec2(table.w[0], table.w[1]));
-        out.w[i] = result.w[64u + i] + pc.s[4];
+        Words target = at(uvec2(table.w[0], table.w[1]));
+        target.w[i] = result.w[64u + i] + pc.s[4];
         return;
     }
     if (pc.s[5] == 0u) {
