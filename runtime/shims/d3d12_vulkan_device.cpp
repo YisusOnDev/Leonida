@@ -1770,6 +1770,7 @@ public:
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
+        device_.context->reclaim_if_idle();  // nothing in flight: freed now, as the host frees it
     }
 
     leonida::ResourceId id() const { return resource_id(this); }

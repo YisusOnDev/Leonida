@@ -2854,6 +2854,16 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   as one fence (`d3d12_fence_events_test`).
 - The swapchain owns acquire/present semaphores and N frames in flight. A present waits for the frame's
   render-finished semaphore; the next acquire waits for the image's present-complete semaphore.
+- **Released resources** (`~Resource`, `VulkanContext::defer_destroy` and `reclaim_if_idle`; test
+  `d3d12_release_reclaim_test`). A released resource's image, buffer, views and memory go to the device's deletion
+  queue with the ticket of the submission after the latest one, since a submission that has already resolved them may
+  still be on its way to `vkQueueSubmit`; `VulkanQueue::acquire` frees what completed submissions cover. When nothing
+  is in flight (the resource and tracker locks free, so no submission is between resolving resources and recording
+  its ticket, and every recorded submission completed) the release frees them at once, as the PC runtime does. Before,
+  they waited for one more `ExecuteCommandLists` to complete, and with none they stayed: 2000 create/release cycles of
+  a 512x512 render target with nothing submitted grew local video memory by 2.5 GB (RX 6750 XT, AMD 26.11.2; native
+  D3D12 +0), and an application that waits for its queues, drops a level and builds the next held both at once. With
+  work in flight the release still waits for `acquire`, one submission late.
 - Queue types: a direct queue maps to a graphics+compute queue, a compute queue to a compute-only family if one
   exists, a copy queue to a transfer-only family. If the host exposes only one family, serialize and log; async
   compute is a performance feature, not a correctness one.

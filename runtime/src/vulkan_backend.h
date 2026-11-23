@@ -1491,6 +1491,23 @@ public:
         deletion_queue_.drain(current_ticket, device_, vk);
     }
 
+    // For a release (~Resource): defer_destroy waits for the submission after the latest one, since a submission that
+    // has already resolved what is released may still be on its way to vkQueueSubmit, and acquire() drains only what
+    // a completed submission covers. With the queues idle that next submission may never come, so a released
+    // resource kept its memory until another ExecuteCommandLists had completed. With resource_mutex_ and
+    // tracker_mutex_ held no submission is between resolving resources and recording its ticket; once every recorded
+    // one has completed, nothing can still use what was released, and it is destroyed now. Either lock busy (a
+    // submission on its way) or work in flight: it waits for acquire() as before.
+    void reclaim_if_idle() {
+        std::unique_lock resource_lock(resource_mutex_, std::try_to_lock);
+        if (!resource_lock.owns_lock()) return;
+        std::unique_lock tracker_lock(tracker_mutex_, std::try_to_lock);
+        if (!tracker_lock.owns_lock()) return;
+        const std::uint64_t submitted = submitted_ticket_.load(std::memory_order_acquire);
+        if (completed_retire_ticket() != submitted || is_device_lost()) return;
+        deletion_queue_.drain(submitted + 1, device_, vk);
+    }
+
     // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
     // monotonic even when another queue completes first; global tickets are retired in order.
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
