@@ -909,8 +909,13 @@ public:
             : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
             : 0;
         if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
-        if (argument_buffer_offset > arg_desc.Width ||
-            UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
+        // The last record needs record_size bytes, not a whole stride (WARP and the hardware driver accept
+        // stride 20 at offset 240 of a 256-byte buffer for one draw: d3d12_execute_indirect_validation).
+        // With max_command_count 0 nothing is read, and the host accepts any offset (offset 260 and U64MAX-3 of a
+        // 256-byte buffer: WARP and the RX 9070 XT, d3d12_execute_indirect_validation).
+        if (max_command_count &&
+            (argument_buffer_offset > arg_desc.Width ||
+             arg_desc.Width - argument_buffer_offset < UINT64(max_command_count - 1) * stride + record_size))
             return check(false);
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;

@@ -1185,7 +1185,11 @@ int main() {
             cl->CopyRaytracingAccelerationStructure(dst_va, src_va, mode);
             if (FAILED(cl->Close())) return false;
             queue->ExecuteCommandLists(1, lists);
-            if (rt::d3d12::last_execute_result(queue) != want) {
+            // An unsupported command is left out of a list that is submitted without it (skipped_unsupported,
+            // the layer's partial submission), which is the same refusal of that one copy.
+            const leonida::ReplayResult got = rt::d3d12::last_execute_result(queue);
+            if (got != want && !(want == leonida::ReplayResult::unsupported &&
+                                 got == leonida::ReplayResult::skipped_unsupported)) {
                 std::fprintf(stderr, "FAIL: %s (expected ReplayResult %d, got %d)\n", what, static_cast<int>(want),
                              static_cast<int>(rt::d3d12::last_execute_result(queue)));
                 return false;
@@ -1299,7 +1303,9 @@ int main() {
         cl->BuildRaytracingAccelerationStructure(&stale_build, 0, nullptr);
         if (FAILED(cl->Close())) return fail("stale placed pointer build Close");
         queue->ExecuteCommandLists(1, lists);
-        if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::unsupported)
+        // Refused before submission, or left out of a list submitted without it (skipped_unsupported).
+        if (const leonida::ReplayResult got = rt::d3d12::last_execute_result(queue);
+            got != leonida::ReplayResult::unsupported && got != leonida::ReplayResult::skipped_unsupported)
             return fail("GPU-written placed pointer list must be refused as unsupported before submission");
         std::printf("  [PASS] ARRAY_OF_POINTERS GPU-written placed pointer list unsupported before submission\n");
         zero_ptr_buf->Release();

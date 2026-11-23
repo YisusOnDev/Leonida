@@ -212,11 +212,11 @@ std::vector<Case> parity_cases() {
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, 260, nullptr, 0); }},
         {"arg_offset=256 ==width (max=0 no-op)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 256, nullptr, 0); }},
-        {"arg_offset=260 >width (max=0 no-op)", false,
+        {"arg_offset=260 >width (max=0 no-op)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 260, nullptr, 0); }},
         {"arg_offset=U64MAX-3 wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max - 3, nullptr, 0); }},
-        {"arg_offset=U64MAX-3 aligned (max=0 no-op)", false,
+        {"arg_offset=U64MAX-3 aligned (max=0 no-op)", true,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max - 3, nullptr, 0); }},
         {"arg_offset=U64MAX unaligned+wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max, nullptr, 0); }},
@@ -233,13 +233,14 @@ std::vector<Case> parity_cases() {
         {"arg_buf width=3 (max=1 OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf3.p, 0, nullptr, 0); }},
 
-        // Padded stride: the host bounds max_count * stride, not (max_count - 1) * stride + record_size, so a
-        // record that fits at the end of the buffer while its stride runs past it is refused
-        {"draw stride=20 off=240 max=1 (240+20>256)", false,
+        // Padded stride: a record that fits at the end of the buffer while its stride runs past it. Accepted by
+        // WARP and the RX 9070 XT (24.11.2026, Windows 11 26100): the host bounds (max_count - 1) * stride +
+        // record_size, not max_count * stride. The same hosts accept any offset when max_count is 0.
+        {"draw stride=20 off=240 max=1 (240+20>256)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }},
-        {"draw stride=20 off=220 max=2 (220+40>256)", false,
+        {"draw stride=20 off=220 max=2 (220+40>256)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 220, nullptr, 0); }},
-        {"dispatch stride=20 off=244 max=1 (244+20>256)", false,
+        {"dispatch stride=20 off=244 max=1 (244+20>256)", true,
          [](Env& e) {
              e.bind_compute_if_available();
              e.list->ExecuteIndirect(e.dispatch20.p, 1, e.buf256.p, 244, nullptr, 0);

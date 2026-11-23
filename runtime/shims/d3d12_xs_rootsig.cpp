@@ -148,10 +148,16 @@ bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<
     if (chunk_count == 0 || chunk_count > 16 || static_cast<size_t>(chunk_count) * 4 > size - 32) return false;
 
     // Verify the incoming container hash before rewriting: a corrupted blob must reach the host deserializer
-    // unchanged so it is rejected, rather than getting a freshly forged valid hash.
-    uint32_t expected_hash[4];
-    dxbc_checksum(bytes, size, expected_hash);
-    if (std::memcmp(expected_hash, bytes + 4, sizeof(expected_hash)) != 0) return false;
+    // unchanged so it is rejected, rather than getting a freshly forged valid hash. An all-zero hash is one the host
+    // accepts (below), so it is not a mismatch.
+    {
+        constexpr uint8_t kNoHash[16] = {};
+        uint32_t expected_hash[4];
+        dxbc_checksum(bytes, size, expected_hash);
+        if (std::memcmp(bytes + 4, kNoHash, sizeof(kNoHash)) != 0 &&
+            std::memcmp(expected_hash, bytes + 4, sizeof(expected_hash)) != 0)
+            return false;
+    }
 
     const size_t min_chunk_off = 32 + static_cast<size_t>(chunk_count) * 4;
     for (uint32_t i = 0; i < chunk_count; ++i) {
