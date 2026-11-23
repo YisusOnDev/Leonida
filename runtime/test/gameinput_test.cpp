@@ -2398,6 +2398,25 @@ int main() {
     rt::gameinput::poll();
     check(g_reading_events == after_unregister, "no reading callback after unregistering");
 
+    // Device and guide callbacks are still registered, but changes have no reading subscriber.
+    IGameInputDispatcher* idle_dispatcher = nullptr;
+    check(input->CreateDispatcher(&idle_dispatcher) == S_OK && idle_dispatcher, "create dispatcher without a reading callback");
+    if (idle_dispatcher) {
+        HANDLE idle_wait = nullptr;
+        check(idle_dispatcher->OpenWaitHandle(&idle_wait) == S_OK && idle_wait, "open idle dispatcher wait handle");
+        if (idle_wait) WaitForSingleObject(idle_wait, 0);  // consume any signal from the earlier dispatcher
+        for (int i = 0; i < 4; ++i) {
+            SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, i % 2 != 0);
+            rt::gameinput::poll();
+        }
+        check(idle_wait && WaitForSingleObject(idle_wait, 0) == WAIT_TIMEOUT,
+              "readings without a subscriber do not signal the dispatcher");
+        check(!idle_dispatcher->Dispatch(0), "readings without a subscriber do not build a dispatch backlog");
+        if (idle_wait) CloseHandle(idle_wait);
+        idle_dispatcher->Release();
+        rt::gameinput::poll();
+    }
+
     // Blocking enumeration with pads present runs before returning.
     before = g_device_events;
     GameInputCallbackToken blocking_token = 0;
