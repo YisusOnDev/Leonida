@@ -454,7 +454,7 @@ private:
             const std::int64_t next = last_origin_ + 1;
             const std::uint64_t next_us = first + std::uint64_t(next) * period_us_;
             std::uint64_t wake = next_us;
-            if (now >= next_us) {
+            if (now >= next_us && next_us <= give_up) {
                 if (pending_.size() < latency_) {
                     const std::int64_t newest = std::int64_t((now - first) / period_us_);
                     const std::int64_t origin = std::max(next, newest);

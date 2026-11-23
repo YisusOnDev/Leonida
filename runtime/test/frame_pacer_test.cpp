@@ -19,6 +19,17 @@ namespace {
 
 constexpr std::uint32_t period = 16000;  // us; round numbers keep the arithmetic readable
 
+class DelayedWakeClock final : public FrameClock {
+public:
+    std::uint64_t now_us() override { return now_; }
+    void wait(std::unique_lock<std::mutex>&, std::condition_variable&, std::uint64_t deadline_us) override {
+        now_ = deadline_us + period;
+    }
+
+private:
+    std::uint64_t now_ = 0;
+};
+
 struct Result {
     std::int32_t hr;
     std::uint64_t token;
@@ -195,6 +206,17 @@ int main() {
         // Poll with the origin due.
         clock.advance_us(period);
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 2);
+    }
+
+    // A delayed wake cannot let an origin scheduled after the deadline satisfy the wait.
+    {
+        DelayedWakeClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1));
+        std::uint64_t token = 99;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 10, 0, &token) == pacer_hr::timeout);
+        EXPECT(token == 99 && pacer.tokens_issued() == 0);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
     }
 
     // Latency 1: a frame presented late is still in flight at the next origin, so the wait holds until it is shown.
