@@ -1064,6 +1064,49 @@ struct DeviceState {
         return true;
     }
 
+    // `base`: a V#'s 48-bit base whose bit 47 is set, the VA of an UPLOAD buffer below the arena once sign-extended.
+    // Its 64 KiB-aligned pages (inside the buffer) are copied into an arena window before every submission, keyed in
+    // the alias table by the 48-bit value; `out` is the window's console VA for `base`. False: not such a buffer.
+    bool upload_window(std::uint64_t base, std::uint64_t bytes, std::uint64_t& out) {
+        if (!context || !arena.mapped) return false;
+        auto& aliases = leonida::title_va_aliases();
+        if (const std::uint64_t made = aliases.shader_va(base); made != base) {
+            out = made;
+            return true;
+        }
+        const std::uint64_t va = base | 0xFFFF000000000000ull;
+        std::uint64_t start = 0, size = 0;
+        const std::uint8_t* host = nullptr;
+        if (!context->cpu_written_buffer(va, start, size, host)) return false;
+        std::lock_guard lock(title_window_mutex);
+        if (const std::uint64_t made = aliases.shader_va(base); made != base) {
+            out = made;
+            return true;
+        }
+        const std::uint64_t want = std::clamp<std::uint64_t>(bytes, 1, kTitleWindowMax);
+        const std::uint64_t lo = std::max(start, va & ~(kTitleWindowAlign - 1));
+        const std::uint64_t hi = std::min(start + size, (va + want + kTitleWindowAlign - 1) & ~(kTitleWindowAlign - 1));
+        if (hi <= va) return false;
+        const std::uint64_t window = hi - lo;
+        if (title_window_bytes + window > title_window_cap) return false;
+        VkDeviceSize offset = 0;
+        if (!arena_allocate(window, kTitleWindowAlign, offset, arena_buffer)) return false;
+        auto* mapped = arena.mapped + offset;
+        const std::uint8_t* pages = host + (lo - start);
+        std::memcpy(mapped, pages, std::size_t(window));
+        add_shadow({pages, mapped, std::size_t(window)});
+        aliases.add(lo & 0xFFFFFFFFFFFFull, window, offset);
+        title_windows.push_back({lo & 0xFFFFFFFFFFFFull, offset});
+        title_window_bytes += window;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr, "[rt] d3d12: a V# over an UPLOAD buffer below the arena (base 0x%llx) reads a %llu KiB "
+                                 "arena window copied before every submission\n",
+                         static_cast<unsigned long long>(base), static_cast<unsigned long long>(window >> 10));
+        out = offset + (va - lo);
+        return true;
+    }
+
     // The shader-visible CBV/SRV/UAV heaps (arena offset -> end), for the scan of bound tables before a submission.
     std::mutex cbv_heap_mutex;
     std::map<VkDeviceSize, VkDeviceSize> cbv_heaps;
@@ -1098,6 +1141,14 @@ struct DeviceState {
             const std::uint64_t base = std::uint64_t(w0) | (std::uint64_t(w1 & 0xFFFFu) << 32);
             if (base < arena.size) continue;
             const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
+            // A V# the title built over an UPLOAD buffer below the arena: its VA (device address minus heap_base) is
+            // negative, and a V#'s 48 bits cannot carry it (render5L-2, RTX 3070 Laptop with ReBAR upload heaps: the
+            // UI text's constants). The bytes it names get an arena window, refreshed before every submission.
+            if (std::uint64_t to = 0; (base >> 47) && upload_window(base, std::uint64_t(w2) * (stride ? stride : 1), to)) {
+                w[0] = std::uint32_t(to);
+                w[1] = (w1 & 0xFFFF0000u) | std::uint32_t((to >> 32) & 0xFFFFu);
+                continue;
+            }
             const std::uint64_t to =
                 aliases.resolve(base, std::uint64_t(w2) * (stride ? stride : 1), leonida::TitleVaAliases::table_view);
             if (to == base) {  // bring-up: which V#s stay untranslated, and why
@@ -5160,14 +5211,17 @@ public:
             std::lock_guard lock(mutex_);
             for (auto it = tasks_.begin(); it != tasks_.end(); ++it) {
                 if (it->first != id) continue;
-                if (it == tasks_.begin()) return;
-                auto task = std::move(*it);
+                // Not behind the workers either, which may each hold a compile of minutes: the waited-for compile
+                // runs at once on its own thread. (Idea: VIctory's pipeline/make.rs queues a pipeline at its first
+                // use, so the workers only hold pipelines a frame wants; and a compile the title waits for is not
+                // held back by any throttle.)
+                std::function<void()> task = std::move(it->second);
                 tasks_.erase(it);
-                tasks_.push_front(std::move(task));
+                std::thread(std::move(task)).detach();
                 static int logged = 0;
                 if (logged++ < 16)
-                    std::fprintf(stderr, "[rt] d3d12: a dispatched compute pipeline's compile moved to the front of "
-                                         "%zu queued\n", tasks_.size());
+                    std::fprintf(stderr, "[rt] d3d12: a dispatched compute pipeline's compile starts now on its own "
+                                         "thread (%zu still queued)\n", tasks_.size());
                 return;
             }
         }
