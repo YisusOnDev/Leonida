@@ -158,16 +158,19 @@ int main() {
     auto u64 = [&](size_t at) { uint64_t v = 0; std::memcpy(&v, big + at, 8); return v; };
     auto u32 = [&](size_t at) { uint32_t v = 0; std::memcpy(&v, big + at, 4); return v; };
     constexpr size_t kMip0 = 0x18 + 0x38, kMip1 = kMip0 + 0x70;
-    check(u64(kMip0) == 128 && u64(kMip0 + 0x10) == 128 && u32(kMip0 + 0x1C) == 32 && u64(kMip1) == 32 &&
-              u32(kMip1 + 0x1C) == 16,
-          "mip 0 is 8 x 4 RGBA8 (32-byte rows, 128 bytes), mip 1 4 x 2 (16-byte rows, 32 bytes) at the measured offsets");
-    check(u64(kMip0 + 0x08) == 0 && u64(kMip1 + 0x08) == 128, "mip 1 starts after mip 0");
-    check(u32(kMip0 + 0x18) == 8 && u32(kMip0 + 0x38) == 8 && u32(kMip0 + 0x3C) == 4 && u32(kMip1 + 0x38) == 4 &&
-              u32(kMip1 + 0x3C) == 2 && u32(kMip0 + 0x40) == 1 && u32(kMip0 + 0x44) == 1 && u32(kMip0 + 0x48) == 0,
-          "pitch in texels, sizes in texels, array size, one sample, linear mode");
-    check(u64(0x00) == 160 && u64(0x08) == 0x1000 && u32(0x10) == 2 && u32(0x14) == 1 && u32(0x1B38) == 3,
+    // Rows are 256 bytes apart (src/console_linear_layout.h): mip 0 is 4 rows (1024 bytes), mip 1 2 rows (512 bytes).
+    check(u64(kMip0) == 1024 && u64(kMip0 + 0x10) == 1024 && u32(kMip0 + 0x1C) == 256 && u64(kMip1) == 512 &&
+              u32(kMip1 + 0x1C) == 256,
+          "mip 0 is 8 x 4 RGBA8 (256-byte pitch, 1024 bytes), mip 1 4 x 2 (256-byte pitch, 512 bytes) at the measured "
+          "offsets");
+    check(u64(kMip0 + 0x08) == 0 && u64(kMip1 + 0x08) == 1024, "mip 1 starts after mip 0");
+    check(u32(kMip0 + 0x18) == 64 && u32(kMip0 + 0x24) == 64 && u32(kMip0 + 0x30) == 8 && u32(kMip0 + 0x38) == 8 &&
+              u32(kMip0 + 0x3C) == 4 && u32(kMip1 + 0x38) == 4 && u32(kMip1 + 0x3C) == 2 && u32(kMip0 + 0x40) == 1 &&
+              u32(kMip0 + 0x44) == 1 && u32(kMip0 + 0x48) == 0,
+          "pitch and padded width in texels, width in elements, sizes in texels, array size, one sample, linear mode");
+    check(u64(0x00) == 1536 && u64(0x08) == 0x1000 && u32(0x10) == 2 && u32(0x14) == 1 && u32(0x1B38) == 3,
           "the total size (both mips), the alignment, the mip and plane counts and the dimension");
-    check(u32(0x18) == 1 && u64(0x18 + 0x08) == 160 && u64(0x18 + 0x10) == 160 && u64(0x18 + 0x18) == 0 &&
+    check(u32(0x18) == 1 && u64(0x18 + 0x08) == 1536 && u64(0x18 + 0x10) == 1536 && u64(0x18 + 0x18) == 0 &&
               u32(0x18 + 0x28) == 4 && u32(0x18 + 0x2C) == 2 && u32(0x18 + 0x30) == 0,
           "plane 0: data, its size, array-slice size, offset, element bytes, two standard mips and no tail");
     check(all_bytes(big + kMip0 + 2 * 0x70, 0x1B38 - (kMip0 + 2 * 0x70), 0) && all_bytes(big + 0x1B3C, 4, 0),
@@ -181,32 +184,49 @@ int main() {
     check(create(&arr, &arr_computer) == S_OK && arr_computer, "a 2-slice array can be laid out");
     std::memset(big, 0xcd, sizeof(big));
     check(arr_computer && reinterpret_cast<Slot2Fn>((*static_cast<void* const* const*>(arr_computer))[2])(arr_computer, big) == S_OK &&
-              u64(0x00) == 320 && u64(0x18 + 0x08) == 320 && u64(0x18 + 0x10) == 160 && u32(kMip0 + 0x40) == 2,
-          "the array's total is two slices of 160 bytes and the mips report the array size");
+              u64(0x00) == 3072 && u64(0x18 + 0x08) == 3072 && u64(0x18 + 0x10) == 1536 && u32(kMip0 + 0x40) == 2,
+          "the array's total is two slices of 1536 bytes and the mips report the array size");
+
+    // The plane the retail title writes back over align256(width) * height bytes (+0x532F140): a 1920x1080 R8 texture
+    // takes 2048-byte rows, 0x21C000 bytes, not the tight 0x1FA400.
+    D3D12_RESOURCE_DESC plane = r8;
+    plane.Width = 1920;
+    plane.Height = 1080;
+    plane.MipLevels = 1;
+    plane.DepthOrArraySize = 1;
+    void* plane_computer = nullptr;
+    check(create(&plane, &plane_computer) == S_OK && plane_computer, "a 1920x1080 R8 plane can be laid out");
+    std::memset(big, 0xcd, sizeof(big));
+    check(plane_computer &&
+              reinterpret_cast<Slot2Fn>((*static_cast<void* const* const*>(plane_computer))[2])(plane_computer, big) ==
+                  S_OK &&
+              u32(kMip0 + 0x1C) == 2048 && u64(kMip0) == 0x21C000 && u64(0x00) == 0x21C000,
+          "a 1920x1080 R8 plane has 2048-byte rows, 0x21C000 bytes");
 
     // Slot 8 writes mip 1 from a wider source into the texture memory, after mip 0; slot 9 reads it back.
-    uint8_t memory[160];
+    static uint8_t memory[1536];
     std::memset(memory, 0xcd, sizeof(memory));
     uint8_t source[48];
     for (int i = 0; i < 48; ++i) source[i] = static_cast<uint8_t>(i);
     check(reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 0, 1, source, 24, 48) == S_OK,
           "slot 8 copies a subresource in");
-    check(all_bytes(memory, 128, 0xcd) && memory[128] == 0 && memory[143] == 15 && memory[144] == 24 &&
-              memory[159] == 39,
-          "mip 1's two rows land tightly after mip 0, read at the caller's row pitch");
+    check(all_bytes(memory, 1024, 0xcd) && memory[1024] == 0 && memory[1039] == 15 && memory[1040] == 0xcd &&
+              memory[1280] == 24 && memory[1295] == 39 && memory[1296] == 0xcd,
+          "mip 1's two rows land 256 bytes apart after mip 0, read at the caller's row pitch, the padding untouched");
     check(reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 0, 2, source, 24, 48) == kNotImpl &&
               reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 1, 0, source, 24, 48) == kNotImpl,
           "slot 8 refuses a subresource past the description or another plane");
 
     // Slot 9 copies mip 1 (the bytes after mip 0) into a wider destination with the caller's row pitch.
     using Slot9Fn = HRESULT(__stdcall*)(void*, void*, UINT, UINT, const void*, const void*, UINT, UINT);
-    uint8_t texels[160];
-    for (int i = 0; i < 160; ++i) texels[i] = static_cast<uint8_t>(i);
+    static uint8_t texels[1536];
+    for (int i = 0; i < 1536; ++i) texels[i] = static_cast<uint8_t>(i % 251);
     uint8_t out[64];
     std::memset(out, 0xcd, sizeof(out));
     check(reinterpret_cast<Slot9Fn>(sv[9])(rgba_computer, out, 0, 1, nullptr, texels, 24, 48) == S_OK,
           "slot 9 copies a subresource out");
-    check(out[0] == 128 && out[15] == 143 && out[16] == 0xcd && out[24] == 144 && out[39] == 159 && out[40] == 0xcd,
+    check(out[0] == 1024 % 251 && out[15] == 1039 % 251 && out[16] == 0xcd && out[24] == 1280 % 251 &&
+              out[39] == 1295 % 251 && out[40] == 0xcd,
           "mip 1's two rows land at the caller's row pitch, nothing between them");
     check(reinterpret_cast<Slot9Fn>(sv[9])(rgba_computer, out, 0, 2, nullptr, texels, 24, 48) == kNotImpl,
           "slot 9 refuses a subresource past the description");
