@@ -1952,6 +1952,11 @@ bool attach_keyboard_pad() {
 // unattended boot can pass a "press a button" prompt. Each press is logged. LEONIDA_AUTO_PRESS_HOLD_MS holds each
 // press longer (a title presenting a frame every 2-3 s may never read a 300 ms press; Menu then follows 1 s after A is
 // released), and LEONIDA_AUTO_PRESS_MENU=0 leaves Menu out.
+// How the title reads input, reported with each auto press: whether it asks for readings at all, and how often it gets
+// a gamepad one (a press the title never samples cannot pass a prompt).
+std::atomic<uint64_t> g_title_current_reads{0}, g_title_pad_reads{0}, g_title_pad_hits{0}, g_title_next_reads{0},
+    g_title_callbacks{0};
+
 bool auto_pressed(int vk) {
     static const std::vector<uint64_t> at = [] {
         std::vector<uint64_t> v;
@@ -1986,8 +1991,14 @@ bool auto_pressed(int vk) {
         if (t >= from && t < from + hold) {
             const uint64_t bit = uint64_t{1} << (i * 2 % 64 + (vk == VK_ESCAPE));
             if (!(logged.fetch_or(bit) & bit))
-                std::fprintf(stderr, "[rt] gameinput: auto press %s at %.1f s\n", vk == VK_RETURN ? "A" : "Menu",
-                             static_cast<double>(t) / 1e6);
+                std::fprintf(stderr, "[rt] gameinput: auto press %s at %.1f s (title so far: GetCurrentReading %llu, "
+                                     "of them gamepad %llu answered %llu; GetNext/PreviousReading %llu; reading "
+                                     "callbacks %llu)\n", vk == VK_RETURN ? "A" : "Menu", static_cast<double>(t) / 1e6,
+                             static_cast<unsigned long long>(g_title_current_reads.load()),
+                             static_cast<unsigned long long>(g_title_pad_reads.load()),
+                             static_cast<unsigned long long>(g_title_pad_hits.load()),
+                             static_cast<unsigned long long>(g_title_next_reads.load()),
+                             static_cast<unsigned long long>(g_title_callbacks.load()));
             return true;
         }
     }
@@ -2765,6 +2776,9 @@ public:
     HRESULT STDMETHODCALLTYPE GetCurrentReading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
+        g_title_current_reads.fetch_add(1, std::memory_order_relaxed);
+        const bool pad_kind = (kind & GameInputKindGamepad) != 0;
+        if (pad_kind) g_title_pad_reads.fetch_add(1, std::memory_order_relaxed);
         if (kind != GameInputKindUnknown && !(kind & kReadableKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
         std::lock_guard lock(g().mu);
         // Readings taken in one poll share a timestamp. Use the same order as GetNextReading.
@@ -2799,6 +2813,7 @@ public:
             }
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
+        if (pad_kind) g_title_pad_hits.fetch_add(1, std::memory_order_relaxed);
         best->AddRef();
         *out = best;
         return S_OK;
@@ -2806,10 +2821,12 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetNextReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                              IGameInputReading** out) override {
+        g_title_next_reads.fetch_add(1, std::memory_order_relaxed);
         return find_reading(ref, kind, device, out, true);
     }
     HRESULT STDMETHODCALLTYPE GetPreviousReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                                  IGameInputReading** out) override {
+        g_title_next_reads.fetch_add(1, std::memory_order_relaxed);
         return find_reading(ref, kind, device, out, false);
     }
     // E_NOTIMPL is GameInput v0's own answer: Microsoft's reference page says the method "was never implemented in
@@ -2825,6 +2842,7 @@ public:
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
         if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
+        g_title_callbacks.fetch_add(1, std::memory_order_relaxed);
         return add({0, CbType::Reading, as_device(device), kind, 0, context, reinterpret_cast<void*>(fn), true}, token);
     }
 
