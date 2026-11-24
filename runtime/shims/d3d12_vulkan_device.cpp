@@ -985,11 +985,26 @@ struct DeviceState {
         // Only the title's own memory gets a copy (xmem's ranges): an address anywhere else, the runtime's or a host
         // DLL's memory included, is left as it was and counted.
         std::uint64_t title_lo = 0, title_hi = 0;
-        if (!aliases.title_memory(va, title_lo, title_hi)) return true;
+        static std::atomic<int> bail_log{0};  // diagnostic: why an address is left untranslated (first 12)
+        if (!aliases.title_memory(va, title_lo, title_hi)) {
+            if (bail_log.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] d3d12: title VA 0x%llx (+0x%llx) left untranslated: not in the title's "
+                                     "xmem ranges
+",
+                             (unsigned long long)va, (unsigned long long)bytes);
+            return true;
+        }
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), &mbi, sizeof(mbi)) ||
-            mbi.State != MEM_COMMIT || !mbi.Protect || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            mbi.State != MEM_COMMIT || !mbi.Protect || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            if (bail_log.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] d3d12: title VA 0x%llx (+0x%llx) left untranslated: state 0x%lx protect "
+                                     "0x%lx
+",
+                             (unsigned long long)va, (unsigned long long)bytes, (unsigned long)mbi.State,
+                             (unsigned long)mbi.Protect);
             return true;
+        }
         std::lock_guard lock(title_window_mutex);
         if (const std::uint64_t made = aliases.shader_va(va); made != va) {  // another thread made it meanwhile
             out = made;
@@ -4869,10 +4884,23 @@ public:
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
         if (code_stage) {
+            // The code base holds the bytes the translator's code offsets index: the FSSM blob, or for a bare RDNA2
+            // program (slot 57, fspx_gfx) the program itself. That case had an empty fssm, so the zero-size arena
+            // request failed and every such PSO came back E_OUTOFMEMORY (render4-5: 7,075 slot-57 refusals).
+            const std::uint8_t* code_data = code_stage->fssm.data();
+            std::size_t code_size = code_stage->fssm.size();
+            if (!code_size) {
+                code_data = static_cast<const std::uint8_t*>(code_stage->code.pShaderBytecode);
+                code_size = code_stage->code.BytecodeLength;
+            }
             VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
-            code_bytes_ = code_stage->fssm.size();
+            if (!code_size || !device_.arena_allocate(code_size, 256, offset, DeviceState::arena_shader)) {
+                log_once("graphics PSO code base: no room in the GPU address arena (raise LEONIDA_ARENA_MB); bytes",
+                         int(code_size));
+                return E_OUTOFMEMORY;
+            }
+            std::memcpy(device_.arena.mapped + offset, code_data, code_size);
+            code_bytes_ = code_size;
             code_base_ = offset;
             graphics_.code_base = offset;
         }

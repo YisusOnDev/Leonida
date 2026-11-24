@@ -245,6 +245,14 @@ int main() {
           "slot 6: (3, 1) is 131 elements in");
     check(slot<Slot6Fn>(computer, 6)(computer, 0, 0, 128, 0, 0, 0, nullptr) == 0, "slot 6: outside is 0");
 
+    // The plane the retail title writes back over align256(width) * height bytes (+0x532F140, scout/frontier6): a
+    // linear 1920x1080 R8 texture takes 2048-byte rows, 0x21C000 bytes.
+    d = desc(1920, 1080, 1, 61, 0x100);
+    check(create(&d, &computer) == S_OK, "1920x1080 R8 linear: S_OK");
+    slot<Slot2Fn>(computer, 2)(computer, layout.data());
+    check(u32(mips + 0x1C) == 2048 && u64(mips) == 0x21C000 && u64(0) == 0x21C000,
+          "a linear 1920x1080 R8 plane has 2048-byte rows, 0x21C000 bytes");
+
     // Sizes VIctory's library answered for full BC7 chains in 0x10a (oracle run).
     struct { uint32_t w, h; uint64_t size; } chains[] = {{1024, 1024, 1441792}, {2048, 2048, 5636096},
                                                          {4096, 4096, 22413312}};

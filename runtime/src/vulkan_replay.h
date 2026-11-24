@@ -1155,7 +1155,29 @@ inline std::atomic<bool (*)(void* to, std::uint64_t from, std::size_t bytes)> g_
 // Set by the device: the host mapping of the GPU address arena, to show what a 32-bit user-data pointer names.
 inline std::atomic<const std::uint8_t*> g_draw_log_arena{nullptr};
 inline std::atomic<std::uint64_t> g_draw_log_arena_size{0};
+// LEONIDA_DRAW_LOG_INDEXED=1: only indexed draws and the one draw after each run of them are logged (and counted
+// against N and M), so a frame's UI text draws and its composite are seen without knowing how far into the run they
+// begin.
+inline std::atomic<int> g_draw_log_indexed{-1};
+inline std::atomic<bool> g_draw_log_after_indexed{false};
 inline void log_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipeline& graphics) {
+    int only_indexed = g_draw_log_indexed.load(std::memory_order_relaxed);
+    if (only_indexed < 0) {
+#ifdef _WIN32
+        char flag[8] = {};
+        std::size_t flag_length = 0;
+        only_indexed = getenv_s(&flag_length, flag, sizeof(flag), "LEONIDA_DRAW_LOG_INDEXED") == 0 && flag_length > 1 &&
+                       flag[0] != '0';
+#else
+        const char* flag = std::getenv("LEONIDA_DRAW_LOG_INDEXED");
+        only_indexed = flag && *flag && *flag != '0';
+#endif
+        g_draw_log_indexed.store(only_indexed, std::memory_order_relaxed);
+    }
+    if (only_indexed) {
+        const bool after = g_draw_log_after_indexed.exchange(draw.indexed, std::memory_order_relaxed);
+        if (!draw.indexed && !after) return;
+    }
     long left = g_draw_log_left.load(std::memory_order_relaxed);
     if (left == -1) {
         char text[16] = {};
@@ -3457,6 +3479,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         out.unpredicated_copies = unpredicated_copies;
         out.draw_count = draw_count;  // its draw slot is free again
         out.skipped.push_back({0, i, command_name(command), why ? why : "the replay does not implement it"});
+        {  // Diagnostic: a command left out of a list that still runs (first 32, then at powers of two).
+            static std::atomic<std::uint64_t> left_out{0};
+            const std::uint64_t n = left_out.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 32 || !(n & (n - 1)))
+                std::fprintf(stderr, "[rt] replay: left out command %zu of %zu (%s): %s (%llu so far)
+", i,
+                             commands.size(), command_name(command), why ? why : "the replay does not implement it",
+                             static_cast<unsigned long long>(n));
+        }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
     out.statistics_overlaps = statistics_overlaps;
