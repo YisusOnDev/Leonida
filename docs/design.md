@@ -144,7 +144,7 @@ add a source file, add it to `runtime\CMakeLists.txt` and to the file list in `b
 | Rest-of-world / script | Six archives, 1.57 GB total: `core_restofworld` 1.21 GB (11 Bink 2 streams / 1.24 GB, 37 decoded models, 958 graphics pages, 6 PSIN), `story000_restofworld` 189 MB, `story000_script` 74 MB (2,309 PSIN, 2,118 complete), small `appdata0`/licences. No maps; no validated script container. | `tools/restofworld_index.py`; [restofworld.md](restofworld.md) |
 | Audio stations | Audio config `0x762160`: 19 station blocks of `{station hash, u32 boundary, ordered u32 content ids}`; the boundary is a byte offset, not a count. VCRR content ids `0x28F2-0x2941` map exactly to records `0xBD73-0xBDC2` (80/80); other clusters are context-dependent or shared. Title-keyed stream ids resolve 702/800 resolved titles exactly and 746/800 with case/punctuation/feature variants. No per-track start offsets. | [radio_stations.md](radio_stations.md) |
 | D3D12 command objects | Measured command queue / command list / fence / `PresentX` surface, split into verified exports and slots, prior-art claims, and open questions. Queue/list/fence creation and barriers are scoped; `PresentX` signature/slot and exact swapchain/plane parameters remain open until the executable is available. | [d3d12_command_objects.md](d3d12_command_objects.md) |
-| Console DirectStorage | Runtime shim: file and memory sources, zlib, physical-page destinations, and BCPack modes 1 and 3-7 decoded on the CPU with the repository's own clean-room tables (`runtime/src/bcpack.cpp`, port of `tools/bcpack.py`). **BC6H/BC7 chunks that reference the built-in initial history fail cleanly (`E_NOTIMPL`, counted):** that history is an unpublished codec constant, not in the repository, and may only come from local calibration over the player's own pools (`tools/bcpack_history_calib.py`), never from another project's table; the runtime has no loader for a calibrated file yet. Swizzle modes 1-4 are undocumented and were not seen in a boot (0 of 19,080 requests): `E_NOTIMPL`, counted. | [directstorage.md](directstorage.md) "BCPack requests" |
+| Console DirectStorage | Runtime shim: file and memory sources, zlib, physical-page destinations, and BCPack modes 1 and 3-7 decoded on the CPU with the repository's own clean-room tables (`runtime/src/bcpack.cpp`, port of `tools/bcpack.py`). **BC6H/BC7 chunks that reference the built-in initial history fail cleanly (`E_NOTIMPL`, counted):** that history is an unpublished codec constant, not in the repository, and may only come from local calibration over the player's own pools (`tools/bcpack_history_calib.py`), never from another project's table; the runtime has no loader for a calibrated file yet. What a BC7 chunk needs is listed in [directstorage.md](directstorage.md) "BCPack requests": 256 history entries of 24 endpoint and 32 index bytes, with known and confirmed bit depths per byte, from the player's own pools only. Swizzle modes 1-4 are undocumented and were not seen in a boot (0 of 19,080 requests): `E_NOTIMPL`, counted. | [directstorage.md](directstorage.md) "BCPack requests" |
 
 ### rpf9dump (bulk export)
 
@@ -206,6 +206,32 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
   for 4 KiB alignment) for the others; the PC answer for a 128x4 `R16G16B16A16` `SW_4KB_S` texture was 0x1000 bytes
   where its archive chunk is 0x4000, the console size, and the archive read builder asserted (`+0x4ffd879`, boot
   frontier5-3, class `0x149c46708`). Confirmed by `xg_xs_test` with the captured descriptions.
+- Slot 108 (`GetResourceAllocationInfo2`) gives the same answer, with each description's place in the per-resource
+  array, and slot 56 (`GetResourceAllocationInfo1`) follows. Slot 108 is the size of a texture's own memory:
+  the title's texture creation (`+0x193E1DA`, through the wrapper `+0xABFAE0`) rounds a block-compressed width and
+  height up to 4, asks for 4 KiB alignment and keeps the 4 KiB answer only when the reply's alignment is 0x1000
+  (`+0xABFDB7`; otherwise it asks again with alignment 0), allocates that many bytes at that alignment, places the
+  texture there (slot 133 or 127), and stores the size in KiB. A PC size smaller than the console layout lets the
+  console-sized data DirectStorage writes there run into the next allocation. The two calls through the title's
+  device pointer are the only ones measured; slot 56 has no call site through it and no boot reached it (frontier7-1
+  to 7-3), so its answer is there for consistency only. Slots 133 and 127 create committed textures with alignment 0,
+  since a PC device refuses 4 KiB for a texture that is not small by its own rule. Confirmed by `xs_proxy_mock_test`
+  (`check_texture_answers_108_56`) and `xg_xs_test` (per-description places).
+- The title's fatal int3 at `+0x2474606` is its own GPU-hang handler (`+0x2474500`), not an assert. It writes a
+  dump (`T:\*.dmp`) and always breaks. Three paths reach it: (1) a wait helper (`+0x10A0C0`, polled from the fence
+  wait `+0x4FB0A50` and the frame-pacing ring `+0x2474740`). It runs only when the byte at exe `0x14A943998` is 1. It
+  watches five queue timelines (table exe `0x1468929D0`) and fails when, for at least 10 polls and 10.0 s
+  (`0x41200000` stored at `+0x10A31A`), none of them completes the work submitted on it. (2) A fence's
+  `GetCompletedValue` (or the slot 12 completed-value word) reads `UINT64_MAX`, which is device removed (`+0x4DAD0AA`,
+  `+0x4FB0C31`...). (3) An HRESULT checker (`+0x4E9B660`, called after device calls such as slots 133 and 127)
+  that sees `0x887A0005`/`06`/`07`/`20` (removed, hung, reset, driver internal error). Hypothesis, by elimination:
+  path (1). frontier7-2 logged no device loss and no failed D3D12 call, and the title went on submitting and
+  presenting (51 ExecuteCommandLists/PresentX in its last 5 s, the last Signal three log lines before the dump), so
+  this is not a whole-pipeline stall. It is one of the five watched timelines left incomplete while none of them took
+  new work. That boot ran with `LEONIDA_IO_LOG=1` and several 4-26 s deferred compute compiles; the other 420 s boots
+  (frontier7-1/3) did not hit it. The runtime now logs a fence stall (a
+  queue signal pending with no progress for 4 s) and graphics pipeline compiles over 1 s (with `LEONIDA_LAZY_PSO` a
+  graphics pipeline is built at its first draw, on the replay path, which holds that queue's submission).
 - PSO metadata is a new variant (`PSIN`, `LSCH` schema, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`, little-endian).
   CodeWalker's parser reads the container but not the new schema; dump it once the exe gives the field names.
 

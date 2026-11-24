@@ -5305,8 +5305,18 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
+        const ULONGLONG compile_start = GetTickCount64();
         const VkResult pipe_res = device_.context->vk.vkCreateGraphicsPipelines(
             device_.info.device, device_.pipeline_cache(), 1, &info, nullptr, &pipeline);
+        // A graphics compile at a draw (LEONIDA_LAZY_PSO builds it there) holds that queue's submission: one over a
+        // second is named, since the title's watchdog fails a frame wait after 10 s without queue progress.
+        if (const ULONGLONG ms = GetTickCount64() - compile_start; ms >= 1000) {
+            static std::atomic<int> slow_logged{0};
+            if (slow_logged.fetch_add(1, std::memory_order_relaxed) < 64)
+                std::fprintf(stderr, "[rt] d3d12: slow graphics pipeline compile: %llu ms (%u stages), VkResult %d\n",
+                             static_cast<unsigned long long>(ms), static_cast<unsigned>(r.stages.size()),
+                             static_cast<int>(pipe_res));
+        }
         if (pipe_res != VK_SUCCESS) {
             if (pipe_res == VK_ERROR_DEVICE_LOST)
                 device_.context->mark_device_lost("PipelineState::build (vkCreateGraphicsPipelines)", pipe_res);
