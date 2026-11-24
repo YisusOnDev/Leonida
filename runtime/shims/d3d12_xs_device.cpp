@@ -2038,6 +2038,24 @@ void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint
                     unsigned char console_layout = 0) {
     if (slot >= kListSlots) return;
     ListStats::hits[slot].fetch_add(1, std::memory_order_relaxed);
+    {  // LEONIDA_LIST_LOG=<first>: every list call from the <first>th on, 400 of them (one frame's console calls)
+        static std::atomic<long long> start{-2};
+        static std::atomic<long long> seen{0};
+        long long first = start.load(std::memory_order_relaxed);
+        if (first == -2) {
+            char text[24] = {};
+            std::size_t length = 0;
+            first = getenv_s(&length, text, sizeof(text), "LEONIDA_LIST_LOG") == 0 && length > 1 ? std::atoll(text) : -1;
+            start.store(first, std::memory_order_relaxed);
+        }
+        if (first >= 0) {
+            const long long n = seen.fetch_add(1, std::memory_order_relaxed);
+            if (n >= first && n < first + 400)
+                std::fprintf(stderr, "[rt] list-log: #%lld slot %u args 0x%llx 0x%llx 0x%llx 0x%llx\n", n, slot,
+                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+        }
+    }
     bool expected = false;
     if (ListStats::first[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
         const char* name = list_tail_name(slot, console_layout);
