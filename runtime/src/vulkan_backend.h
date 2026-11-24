@@ -1414,6 +1414,15 @@ public:
         replay_.quad_index_count = count;
     }
 
+    // The arena ring the console vertex-buffer tables are written to (ReplayFunctions::vertex_tables).
+    void set_vertex_tables(std::uint8_t* mapped, std::uint64_t va, std::uint32_t bytes) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.vertex_tables = mapped;
+        replay_.vertex_tables_va = va;
+        replay_.vertex_tables_bytes = bytes;
+        if (!replay_.vertex_tables_cursor) replay_.vertex_tables_cursor = std::make_shared<std::atomic<std::uint32_t>>(0);
+    }
+
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
     void set_color_attachment_format(std::function<bool(VkFormat)> check) {
         std::unique_lock lock(resource_mutex_);

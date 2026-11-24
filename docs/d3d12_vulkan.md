@@ -1889,6 +1889,29 @@ constant; their meaning is open).
 `s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
 42 `s3`; their meaning is open).
 
+**The console's vertex-buffer table (measured on one program).** The game's own vertex shaders call a fetch shader
+(`s_swappc_b64`, replaced by Vulkan vertex inputs). The console-compiled programs of the pipeline library (slot 57,
+`fspx_gfx`) fetch their vertices themselves instead. `fspx_gfx/54edf226…` is the vertex program of the composite
+that writes the back buffer every frame. It does the following:
+- It loads a 16-byte buffer V# from the 40-bit pointer `s[0:1]` (`s0`, and bits 0-7 of `s1`).
+- It adds `s2` to `VertexIndex - BaseVertex`.
+- It fetches position (dwords at +0), colour (a typed 8-bit load at +12, gated on the V#'s FORMAT being non-zero) and
+  uv (+16) of a 24-byte vertex. The stride comes from V# word 1, and NUM_RECORDS and OOB_SELECT are checked.
+
+Its root table at `s8` holds buffer V#s too, not the vertex buffer: slot 0 is read as 16 dwords from +0 and slot 2 as
+16 dwords from +352.
+
+On the console that table is the driver's, filled from `IASetVertexBuffers`. With `s0..s7` left zero, the program
+read its V# from the arena's never-allocated zero page and drew nothing. Replay now does the following
+(`src/console_vertex_table.h`, `console_vertex_table_test`):
+- For a pipeline whose vertex stage is such a program, it writes one V# per input slot the layout uses into a
+  2048-entry ring in the arena. Each V# holds the view's console VA (the arena copy of the title's memory), its
+  stride, `size / stride` records and a non-zero format.
+- It sets `s[0:1]` to the ring entry, `s2` to the first vertex (base vertex when indexed) and `s3` to the first
+  instance.
+
+Other pipelines keep `s0..s7` as recorded, because 551 PS and 12 VS read `s1` as a constant.
+
 **Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
 each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the
 console launched the dispatch with. Every one of those 29 containers also carries an `RTS0`, which makes this the

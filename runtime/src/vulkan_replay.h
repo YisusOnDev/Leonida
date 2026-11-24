@@ -38,6 +38,7 @@
 
 #include <vulkan/vulkan.h>
 #include "title_va_alias.h"
+#include "console_vertex_table.h"
 #include "vulkan_predicate.h"
 #include "vulkan_predicated_copy.h"
 #include "vulkan_indirect_dispatch_count.h"
@@ -782,6 +783,10 @@ struct GraphicsPipeline {
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
+    // The vertex shader is a console-compiled program (slot 57, fspx_gfx) that fetches its vertices itself: it
+    // loads one buffer V# per input slot from the 40-bit pointer s[0:1] (s0, s1 bits 0-7) and adds s2 to its vertex
+    // index (docs/d3d12_vulkan.md section 3.5, "The console's vertex-buffer table"). Replay writes that table.
+    bool console_vertex_table = false;
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -910,6 +915,12 @@ struct ReplayFunctions {
     VkDeviceSize quad_indices_offset = 0;
     std::uint32_t quad_index_count = 0;
     std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
+    // A ring in the GPU address arena for the console vertex-buffer tables (GraphicsPipeline::console_vertex_table):
+    // host mapping, its console VA, its size, and the shared write cursor. Null: such draws keep s[0:1] as recorded.
+    std::uint8_t* vertex_tables = nullptr;
+    std::uint64_t vertex_tables_va = 0;
+    std::uint32_t vertex_tables_bytes = 0;
+    std::shared_ptr<std::atomic<std::uint32_t>> vertex_tables_cursor;
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
@@ -1239,11 +1250,11 @@ inline void log_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipe
         const std::uint64_t arena_size = g_draw_log_arena_size.load(std::memory_order_relaxed);
         for (int i = 0; i < 16; ++i) {
             const std::uint64_t at = draw.user_data[i] & ~3ull;
-            if (at < 0x10000 || at + 64 > arena_size) continue;
-            std::uint32_t w[16];
+            if (at < 0x10000 || at + 96 > arena_size) continue;
+            std::uint32_t w[24];  // three 32-byte slots
             std::memcpy(w, arena + at, sizeof(w));
             std::string line;
-            for (int k = 0; k < 16; ++k) {
+            for (int k = 0; k < 24; ++k) {
                 char one[12];
                 std::snprintf(one, sizeof(one), " %08x", w[k]);
                 line += one;
@@ -4544,6 +4555,28 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
+            if (graphics.console_vertex_table && draw->views && vk.vertex_tables && vk.vertex_tables_cursor &&
+                vk.vertex_tables_bytes >= kConsoleVertexTableBytes) {
+                std::array<std::uint32_t, 4 * 32> words;
+                const std::uint32_t slots = console_vertex_table(
+                    draw->views->vertex_buffers, graphics.vertex_slots,
+                    [](std::uint64_t va, std::uint64_t) { return title_va_aliases().shader_va(va); }, words);
+                const std::uint32_t tables = vk.vertex_tables_bytes / kConsoleVertexTableBytes;
+                const std::uint32_t index = vk.vertex_tables_cursor->fetch_add(1, std::memory_order_relaxed) % tables;
+                const std::uint64_t at = std::uint64_t(index) * kConsoleVertexTableBytes;
+                std::memcpy(vk.vertex_tables + at, words.data(), std::size_t(std::max(slots, 1u)) * 16);
+                console_vertex_user_words(data.s, vk.vertex_tables_va + at, draw->indexed, draw->first,
+                                          draw->base_vertex, draw->first_instance);
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: console vertex table at VA 0x%llx for %s: %u slot(s), V#0 %08x %08x %08x "
+                                 "%08x (view va 0x%llx size %u stride %u)\n",
+                                 static_cast<unsigned long long>(vk.vertex_tables_va + at), graphics.debug.c_str(),
+                                 slots, words[0], words[1], words[2], words[3],
+                                 static_cast<unsigned long long>(draw->views->vertex_buffers[0].va),
+                                 draw->views->vertex_buffers[0].size, draw->views->vertex_buffers[0].stride);
+            }
             detail::log_draw(*draw, d, graphics);
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
             if (graphics.bindless_set) {

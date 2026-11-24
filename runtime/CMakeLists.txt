@@ -3988,6 +3988,10 @@ if(TARGET Vulkan::Headers)
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)
     add_test(NAME title_va_alias COMMAND title_va_alias_test)
+    # The console vertex-buffer table of slot-57 vertex programs (src/console_vertex_table.h).
+    add_executable(console_vertex_table_test test/console_vertex_table_test.cpp)
+    target_link_libraries(console_vertex_table_test PRIVATE Vulkan::Headers)
+    add_test(NAME console_vertex_table COMMAND console_vertex_table_test)
   endif()
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
