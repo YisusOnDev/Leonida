@@ -52,6 +52,24 @@ int main() {
     console_vertex_user_words(s, 0x1'0000'0040ull, true, 7, 5, 0);
     EXPECT(s[0] == 0x40u && s[1] == 0xABCD0001u && s[2] == 5 && s[3] == 0);
 
-    std::printf("console_vertex_table: V#s per used slot at the arena copy, null V# for an unbound slot, user words\n");
+    // A rectangle as the composite draws it: position (x, y, z), a packed colour, uv; right angle at the second
+    // vertex. The fourth corner is (3840, 0) with uv (1, 0); the colour is copied.
+    struct Vertex { float x, y, z; std::uint32_t colour; float u, v; };
+    static_assert(sizeof(Vertex) == 24);
+    const Vertex given[3] = {{0, 0, 0, 0xFF808080u, 0, 0}, {0, 2160, 0, 0xFF808080u, 0, 1}, {3840, 2160, 0, 0xFF808080u, 1, 1}};
+    Vertex out[6] = {};
+    EXPECT(expand_rect_list(reinterpret_cast<const std::uint8_t*>(given), 24, 1, reinterpret_cast<std::uint8_t*>(out)));
+    EXPECT(out[0].x == 0 && out[1].y == 2160 && out[2].x == 3840);
+    // The second triangle: the two corners next to the right angle, then the fourth.
+    EXPECT(out[3].x == 3840 && out[3].y == 2160 && out[4].x == 0 && out[4].y == 0);
+    EXPECT(out[5].x == 3840 && out[5].y == 0 && out[5].u == 1 && out[5].v == 0 && out[5].colour == 0xFF808080u);
+    // Right angle at the first vertex (TL, TR, BL): the fourth is BR.
+    const Vertex first[3] = {{0, 0, 0, 1, 0, 0}, {10, 0, 0, 1, 1, 0}, {0, 20, 0, 1, 0, 1}};
+    EXPECT(expand_rect_list(reinterpret_cast<const std::uint8_t*>(first), 24, 1, reinterpret_cast<std::uint8_t*>(out)));
+    EXPECT(out[5].x == 10 && out[5].y == 20 && out[5].u == 1 && out[5].v == 1);
+    EXPECT(!expand_rect_list(reinterpret_cast<const std::uint8_t*>(first), 6, 1, reinterpret_cast<std::uint8_t*>(out)));
+
+    std::printf("console_vertex_table: V#s per used slot at the arena copy, null V# for an unbound slot, user words, "
+                "rectangle expansion\n");
     return 0;
 }

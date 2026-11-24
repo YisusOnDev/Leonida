@@ -1071,6 +1071,21 @@ struct DeviceState {
             const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
             const std::uint64_t to =
                 aliases.resolve(base, std::uint64_t(w2) * (stride ? stride : 1), leonida::TitleVaAliases::table_view);
+            if (to == base) {  // bring-up: which V#s stay untranslated, and why
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                    std::uint64_t lo = 0, hi = 0;
+                    const bool title = aliases.title_memory(base, lo, hi);
+                    std::fprintf(stderr,
+                                 "[rt] table-log: untranslated V# in table 0x%llx slot %llu: base 0x%llx stride %u "
+                                 "records %u (arena 0x%llx bytes, known buffer %d, title memory %d)\n",
+                                 static_cast<unsigned long long>(table_va),
+                                 static_cast<unsigned long long>((at - table_va) / kDescriptorSize),
+                                 static_cast<unsigned long long>(base), stride, w2,
+                                 static_cast<unsigned long long>(arena.size),
+                                 int(context && context->knows_buffer_va(base)), int(title));
+                }
+            }
             if (to == base || (to >> 48)) continue;
             w[0] = std::uint32_t(to);
             w[1] = (w1 & 0xFFFF0000u) | std::uint32_t((to >> 32) & 0xFFFFu);
