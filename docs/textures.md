@@ -976,6 +976,21 @@ provisional/last-resort entries (inspectable via `bcpack.decode_with_info`).
   - **BC6H (`codec 6`):** **268 / 268** chunks (100%) decode in provisional mode (`0` strict because every chunk references built-in history, `0` refused).
   - **BC7 (`codec 7`):** **583 / 5,167** chunks (11.3%) decode in strict mode; **5,150 / 5,167** (99.67%) decode in provisional mode; **17 / 5,167** (0.33%) cleanly refuse when unknown built-in history references exceed the consistency budget.
 
+### 6. Native decoder for the runtime (RT-186)
+
+`runtime/src/bcpack.{h,cpp}` is a dependency-free C++20 port of `tools/bcpack.py`:
+`leonida::bcpack::decode(raw, codec, out, allow_provisional)` gives the same bytes, the same refusals and the
+same provisional labels as `bcpack.decode_with_info(raw, codec, len(out), allow_provisional=...)` with
+`history=None`. Its tables (`runtime/src/bcpack_tables.inc`) are generated from the Python ones by
+`tools/gen_bcpack_tables.py`. `tests/test_bcpack_native.py` encodes random lanes for all six codecs with the test
+encoder of `tests/test_bcpack.py` (multi-fragment lanes, narrowed widths, every `q`), corrupts some of them, and
+checks that both decoders agree on status, message, labels and bytes, in strict and provisional mode; ctest runs
+it as `bcpack_native_vs_python` against the built `bcpack_test`.
+
+Not ported yet: `--history` loading. Without it the native decoder, like `tools/bcpack.py` without `--history`,
+refuses BC6H/BC7 chunks that reference built-in history, which on the corpus above is every BC6H chunk and most
+BC7 chunks.
+
 ## What `textures.rpf` holds
 
 The 192.6 MB archive has no composition table elsewhere in the docs (only census rows). `tools/rpf9_carve.py`

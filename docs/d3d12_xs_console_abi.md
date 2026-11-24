@@ -162,6 +162,7 @@ end; on a full buffer they call the vtable method the record stands for (Package
 | 48 | `IASetVertexBuffers` | Sibling layer |
 | 51 | `ClearDepthStencilView` | Sibling layer |
 | 80 | `ExecuteIndirect` | Sibling layer (note: the package measured slot 80 as a console-only call, a `Dispatch`-with-extra-word shape; slot assignments past 61 differ between the two sources — unconfirmed) |
+| 62 | `CopyMemoryToMemoryX(dst, src, size, flags)` (newer layout; older 60) | **Measured here + VIctory** (GPL-3, `crates/victory-gpu/src/list.rs`, read for the slot only): VIctory lists it at older slot 60 and shifts every slot from 59 on by +2 in the newer layout; the retail title's first call is `(title address, title address, 0x1000, word with low half 0)`. The shim records the call and copies on the CPU (under `__try`) each time the list is submitted through queue `ExecuteCommandLists`; a Reset drops the recorded copies (shortcut: the console copies when the GPU reaches it in the list) |
 | 83 | `CopyTextureRegionX` (older layout) | Sibling layer; the package measured a `CopyTextureRegion`-shaped call at slot 85 — consistent with the newer layout (+2) |
 | 108 | `ResolveSubresourceRegion` | Sibling layer |
 | 139 | `Reset(allocator, pso)` → PC slot 10 | **Measured here**: retail 1.0.2.1 (Pipodi) — the title creates a list, `Close`s at slot 9, then calls 139 with `(allocator proxy, 0)` before recording; the proxy unwraps the allocator and forwards to PC `Reset` |

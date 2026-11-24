@@ -1791,6 +1791,22 @@ int check_lists() {
     EXPECT(hr_of(raw(list, 49, 0, 1, word(&so_view))) == S_OK && real->calls[45] == 1);
     // The console tail past the PC chain is refused with E_NOTIMPL only when the mapped PC slot is missing.
     EXPECT(hr_of(raw(list, 146, word(list), 0)) == S_OK && real->calls[80] == 1);  // enhanced Barrier -> GCL7 80
+    // Console 62, CopyMemoryToMemoryX(dst, src, size, flags): recorded, never forwarded, and copied on the CPU when
+    // the list is submitted; a Reset drops what was recorded before it.
+    {
+        std::uint8_t from[64], to[64];
+        for (int i = 0; i < 64; ++i) from[i] = static_cast<std::uint8_t>(i + 1), to[i] = 0;
+        EXPECT(raw(list, 62, word(to), word(from), sizeof(from), 0) == 0 && real->calls[62] == 0 && to[0] == 0);
+        void* queue = make_queue(device);
+        EXPECT(queue != nullptr);
+        void* submitted[1] = {list};
+        EXPECT(raw(queue, 10, 1, word(submitted)) == 0);
+        EXPECT(std::memcmp(to, from, sizeof(to)) == 0);
+        std::memset(to, 0, sizeof(to));
+        EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+        EXPECT(raw(queue, 10, 1, word(submitted)) == 0 && to[0] == 0);
+        EXPECT(release(queue) == 0);
+    }
     EXPECT(release(list) == 0 && real->refs == 0);
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);

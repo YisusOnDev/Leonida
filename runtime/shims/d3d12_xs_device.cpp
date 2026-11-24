@@ -44,6 +44,7 @@
 #include <dxgi1_4.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <cerrno>
@@ -1295,6 +1296,8 @@ void** get_child_vtable();
 // The command-list proxy's helpers (defined with the list proxy below): proxy_real_object checks lists through
 // list_real_or_null, since the ListProxy type is complete only there.
 IUnknown* list_real_or_null(const void* object);
+// Runs the copies a list proxy deferred to its submission (console list slot 62); nothing for any other object.
+void list_run_deferred(const void* object);
 
 template <ChildKind K>
 bool is_child_proxy(const void* object) {
@@ -1336,7 +1339,10 @@ public:
             copy = heap_.get();
         }
         const auto* in = reinterpret_cast<const std::uint64_t*>(objects);
-        for (std::uint32_t i = 0; i < n; ++i) copy[i] = unwrap_object(in[i]);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            list_run_deferred(reinterpret_cast<const void*>(in[i]));
+            copy[i] = unwrap_object(in[i]);
+        }
         data_ = copy;
         return true;
     }
@@ -1967,6 +1973,10 @@ constexpr unsigned kConsoleClearUavFloat = 54;
 constexpr unsigned kConsoleReset = 139;
 constexpr unsigned kConsoleBarrier = 146;
 constexpr unsigned kConsoleAllocateUpload = 148;
+// CopyMemoryToMemoryX(destination, source, size, flags) in the newer layout (older slot 60, +2 from ExecuteIndirect on).
+// Identified from VIctory's list table (crates/victory-gpu/src/list.rs, GPL-3, read for the slot only) and the retail
+// title's first call: two title addresses, 0x1000 bytes, a flags word whose low half is 0.
+constexpr unsigned kConsoleCopyMemoryToMemory = 62;
 
 constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot <= 26) return slot;               // PC order, measured
@@ -1990,6 +2000,10 @@ struct ListProxy {
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vb_scratch;  // slot-48 views with their VAs translated
     std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> so_scratch;  // slot-49 views, same treatment
+    // CopyMemoryToMemoryX calls (console slot 62) recorded since the last Reset: (destination, source, size), run on
+    // the CPU each time the list is submitted (list_run_deferred), in record order.
+    std::mutex deferred_mutex;
+    std::vector<std::array<std::uint64_t, 3>> deferred_copies;
 
     void pin_cursor_at_limit() {
         const std::uint64_t at_limit = static_cast<std::uint64_t>(
@@ -2131,6 +2145,41 @@ unsigned detect_list_slot_count(IUnknown* real) {
     return 60;
 }
 
+// Console list slot 62, CopyMemoryToMemoryX(destination, source, size, flags): a GPU copy between two title
+// addresses (memory is unified on the console). Shortcut: the list records the call and the copy runs on the CPU when
+// the list is submitted (queue ExecuteCommandLists, before the real lists go to the GPU), as VIctory does; on the
+// console it runs when the GPU reaches it in the list. The copy runs under __try: physical pages mapped into a window are committed on first touch by the xmem shim's
+// exception handler (which runs before this frame's handler), and a range nobody can touch is skipped and counted.
+bool guarded_memmove(void* destination, const void* source, size_t size) {
+    __try {
+        std::memmove(destination, source, size);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+void list_copy_memory(std::uint64_t destination, std::uint64_t source, std::uint64_t size) {
+    static std::atomic<std::uint64_t> copied{0}, skipped{0};
+    static std::atomic<int> logged{0};
+    const bool ok = destination && source && size && size < (std::uint64_t{1} << 32) &&
+                    guarded_memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source),
+                                    static_cast<size_t>(size));
+    if (ok) {
+        copied.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || (!ok && skipped.load() <= 16))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: CopyMemoryToMemoryX 0x%llx <- 0x%llx, 0x%llx bytes: %s (copied %llu, skipped "
+                     "%llu)\n",
+                     static_cast<unsigned long long>(destination), static_cast<unsigned long long>(source),
+                     static_cast<unsigned long long>(size), ok ? "copied on the CPU" : "skipped (access violation)",
+                     static_cast<unsigned long long>(copied.load()), static_cast<unsigned long long>(skipped.load()));
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2160,6 +2209,10 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         if constexpr (pc == kListNotForwarded) {
             if constexpr (Slot == kConsoleAllocateUpload) {
                 return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
+            } else if constexpr (Slot == kConsoleCopyMemoryToMemory) {
+                const std::lock_guard lock(self->deferred_mutex);
+                self->deferred_copies.push_back({a1, a2, a3});
+                return 0;
             }
             return 0;  // unmodelled console slot: recorded above, never a PC call
         } else {
@@ -2185,6 +2238,8 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // exists, the same way).
                 a1 = unwrap_object(a1);
                 a2 = unwrap_object(a2);
+                const std::lock_guard lock(self->deferred_mutex);
+                self->deferred_copies.clear();
             } else if constexpr (Slot == kConsoleExecuteBundle) {
                 a1 = unwrap_object(a1);  // the bundle is a list proxy too
             } else if constexpr (Slot >= 41 && Slot <= 46) {
@@ -2323,6 +2378,13 @@ void** get_list_vtable() {
 
 bool is_list_proxy_impl(const void* list) {
     return list && *reinterpret_cast<void* const*>(list) == reinterpret_cast<void*>(get_list_vtable());
+}
+
+void list_run_deferred(const void* object) {
+    if (!is_list_proxy_impl(object)) return;
+    auto* list = const_cast<ListProxy*>(static_cast<const ListProxy*>(object));
+    const std::lock_guard lock(list->deferred_mutex);
+    for (const auto& c : list->deferred_copies) list_copy_memory(c[0], c[1], c[2]);
 }
 
 IUnknown* list_real_or_null(const void* object) {
