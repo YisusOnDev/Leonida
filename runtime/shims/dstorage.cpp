@@ -24,6 +24,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -523,6 +524,17 @@ public:
                 desc_.SourceType == DSTORAGE_REQUEST_SOURCE_FILE && e.request.File) {
                 e.file = live_file(e.request.File);
                 if (!e.file) e.enqueue_error = E_DSTORAGE_INVALID_FILE_HANDLE;
+            }
+            static const bool io_log = std::getenv("LEONIDA_IO_LOG") != nullptr;
+            if (io_log) {
+                static std::atomic<uint64_t> n{0};
+                const uint64_t k = ++n;
+                if (k <= 200 || k % 1000 == 0)
+                    std::fprintf(stderr, "[rt] io-log: dstorage request #%llu opts 0x%llx file %ls off 0x%llx size %u dst %u name %s\n",
+                                 static_cast<unsigned long long>(k), static_cast<unsigned long long>(o),
+                                 e.file ? e.file->path().c_str() : L"-",
+                                 static_cast<unsigned long long>(e.request.FileOffset), e.request.SourceSize,
+                                 e.request.DestinationSize, e.request.Name ? "(named)" : "-");
             }
             e.counted = true;  // TotalRequestCount is "submitted requests" (DSTORAGE_PRIORITY_STATS): see submit_locked
         }
@@ -1076,6 +1088,8 @@ public:
         if (!iid_policy().accept_creating(riid, Kind::File, "IDStorageFactoryX::OpenFile")) return E_NOINTERFACE;
         const HANDLE h = create_file_w()(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                          FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (std::getenv("LEONIDA_IO_LOG"))
+            std::fprintf(stderr, "[rt] io-log: dstorage OpenFile %ls -> %s\n", path, h == INVALID_HANDLE_VALUE ? "FAIL" : "ok");
         if (h == INVALID_HANDLE_VALUE) {
             const DWORD error = GetLastError();
             return HRESULT_FROM_WIN32(error ? error : ERROR_FILE_NOT_FOUND);

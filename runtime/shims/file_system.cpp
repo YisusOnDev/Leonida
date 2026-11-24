@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -1037,6 +1038,15 @@ HANDLE open_file(const char* api, const void* caller, LPCWSTR name, DWORD access
     } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
         opened_delete_on_close(name, last_error);
     }
+    // Diagnostic: LEONIDA_IO_LOG=1 prints the first 3000 opens (guest path, result, caller).
+    static const bool io_log = std::getenv("LEONIDA_IO_LOG") != nullptr;
+    if (io_log) {
+        static std::atomic<int> left{3000};
+        if (left.fetch_sub(1, std::memory_order_relaxed) > 0)
+            std::fprintf(stderr, "[rt] io-log: %s %ls -> %s (err %lu, caller %s)\n", api, name,
+                         h == INVALID_HANDLE_VALUE ? "FAIL" : "ok", h == INVALID_HANDLE_VALUE ? last_error : 0ul,
+                         rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)).c_str());
+    }
     if (h != INVALID_HANDLE_VALUE && t.replaces_package_file) SetLastError(ERROR_ALREADY_EXISTS);
     return h;
 }
@@ -1076,6 +1086,15 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(last_error);
     } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
         opened_delete_on_close(name, last_error);
+    }
+    // Diagnostic: LEONIDA_IO_LOG=1 prints the first 3000 opens (guest path, result, caller).
+    static const bool io_log = std::getenv("LEONIDA_IO_LOG") != nullptr;
+    if (io_log) {
+        static std::atomic<int> left{3000};
+        if (left.fetch_sub(1, std::memory_order_relaxed) > 0)
+            std::fprintf(stderr, "[rt] io-log: CreateFile2 %ls -> %s (err %lu, caller %s)\n", name,
+                         h == INVALID_HANDLE_VALUE ? "FAIL" : "ok", h == INVALID_HANDLE_VALUE ? last_error : 0ul,
+                         rt::startup_trace::where(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
     }
     if (h != INVALID_HANDLE_VALUE && t.replaces_package_file) SetLastError(ERROR_ALREADY_EXISTS);
     return h;
