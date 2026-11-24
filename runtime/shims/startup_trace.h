@@ -184,8 +184,11 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
-            if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info.ContextRecord) {
-                // The general registers, so a fault through a stale or garbage pointer says which object it was.
+            const bool with_regs =
+                r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_BREAKPOINT;
+            if (with_regs && info.ContextRecord) {
+                // The general registers, so a fault through a stale or garbage pointer says which object it was, and
+                // an inline assert (int3) says which values it tested.
                 const CONTEXT& c = *info.ContextRecord;
                 const std::pair<const char*, DWORD64> regs[] = {
                     {"rax", c.Rax}, {"rbx", c.Rbx}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rsi", c.Rsi}, {"rdi", c.Rdi},
@@ -211,6 +214,17 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                     first = false;
                 }
                 f += "}";
+                // An assert's locals live in its frame: the first 32 stack words, when the stack page is readable.
+                MEMORY_BASIC_INFORMATION m{};
+                const auto* sp = reinterpret_cast<const DWORD64*>(c.Rsp);
+                if (r.ExceptionCode == EXCEPTION_BREAKPOINT && VirtualQuery(sp, &m, sizeof(m)) &&
+                    m.State == MEM_COMMIT && (m.Protect & (PAGE_READWRITE | PAGE_READONLY)) &&
+                    reinterpret_cast<const uint8_t*>(m.BaseAddress) + m.RegionSize >=
+                        reinterpret_cast<const uint8_t*>(sp + 32)) {
+                    f += ",\"stack_words\":[";
+                    for (int i = 0; i < 32; ++i) f += (i ? "," : "") + quote(hex(sp[i]));
+                    f += "]";
+                }
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
@@ -236,7 +250,10 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
         const std::lock_guard lock(m);
         first = seen.insert(at).second;
     }
-    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
+    if (first) {
+        log_exception(*info);  // registers and stack words: the values the assert tested
+        event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
+    }
     info->ContextRecord->Rip += 1;
     return true;
 }
