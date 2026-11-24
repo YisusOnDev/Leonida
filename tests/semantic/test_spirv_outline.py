@@ -113,6 +113,14 @@ class OutlinedProgram(unittest.TestCase):
         self.assertEqual(run(self.inline), want)
         self.assertEqual(run(self.outlined), want)
 
+    def test_inlined_back_gives_the_same_words(self):
+        # spirv_outline.inline_outlined, which the one-function interpreters use, is the inverse: no call left,
+        # the same stores.
+        back = spirv_outline.inline_outlined(self.outlined)
+        self.assertNotIn("OpFunctionCall %uint %of", back)
+        self.assertNotIn("%of0 = OpFunction", back)
+        self.assertEqual(run(back), expected())
+
     def test_off_lanes_store_nothing(self):
         got = run(self.outlined)
         self.assertFalse([a for a in got if a >= 96])

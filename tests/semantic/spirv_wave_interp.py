@@ -143,8 +143,24 @@ class _Lane:
         self.outputs = {}
 
 
+def _inline_outlined(text):
+    """Functions the translator's outliner (tools/spirv_outline.py, SPIRV-SIZE-3) made are inlined back: this
+    interpreter runs one function."""
+    if "OpFunctionCall" not in text or " %of" not in text:
+        return text
+    import os
+    import sys
+    tools = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import spirv_outline
+    return spirv_outline.inline_outlined(text)
+
+
 class _Module:
     def __init__(self, text):
+        text = _inline_outlined(text)
         self.types = {}
         self.consts = {}
         self.ptr_types = {}

@@ -388,6 +388,7 @@ class Gen:
         self.v_interp_copy = {}   # PS: vgpr -> (root barycentric register v0/v1, program-order index of its
                                   # single defining plain v_mov of it); valid I/J sources (SHADER-177)
         self.lane_hoist = False  # CS: %h_li / %h_wl / %h_up are defined once in %entry (lane_hoisted)
+        self.lane_hoist_up = False  # %h_up is used (only wave64 reads the upper half)
         self.helper_depth = 0    # > 0 while a helper function's body is built (no %main ids such as %h_li there)
         self.spans = []          # (start, end) in self.body of each top-level instruction's lines (spirv_outline)
         self.span_depth = 0
@@ -5332,6 +5333,7 @@ class Gen:
         lane mask. The hoisted lane gives the hoisted %h_up."""
         lane = lane or self.wave_lane()
         if lane == "%h_wl":
+            self.lane_hoist_up = True
             return "%h_up"
         up = self.tmp()
         self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
@@ -16113,8 +16115,9 @@ def assemble(gen):
                "%h_ly = OpCompositeExtract %uint %h_lid 1", "%h_lz = OpCompositeExtract %uint %h_lid 2",
                f"%h_ty = OpIMul %uint %h_ly {c(sx)}", f"%h_tz = OpIMul %uint %h_lz {c(sx * sy)}",
                "%h_lxy = OpIAdd %uint %h_lx %h_ty", "%h_li = OpIAdd %uint %h_lxy %h_tz",
-               f"%h_wl = OpBitwiseAnd %uint %h_li {c(63 if gen.wave64 else 31)}",
-               f"%h_up = OpUGreaterThanEqual %bool %h_wl {c(32)}"]
+               f"%h_wl = OpBitwiseAnd %uint %h_li {c(63 if gen.wave64 else 31)}"]
+        if gen.lane_hoist_up:
+            fn.append(f"%h_up = OpUGreaterThanEqual %bool %h_wl {c(32)}")
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])

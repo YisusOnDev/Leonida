@@ -427,3 +427,94 @@ def outline_units(units, outliner, new_id):
                 if any(x in rename for x in t):
                     out[i] = " ".join(rename.get(x, x) for x in t)
     return result
+
+
+def inline_outlined(text, prefix="%of"):
+    """The module with every call of an outlined function replaced by its body (the inverse of the pass), for
+    interpreters and tools that read one function. A call splits its block: the body follows under its own labels,
+    the code after the call continues under a new label, and an OpPhi that named the split block names that label.
+    Only functions this pass emits are inlined (one entry, one return at the end, no OpVariable)."""
+    lines = text.split("\n")
+    funcs, keep, i = {}, [], 0
+    while i < len(lines):
+        t = lines[i].split()
+        if len(t) >= 4 and t[1] == "=" and t[2] == "OpFunction" and t[0].startswith(prefix):
+            name = t[0]
+            j = i + 1
+            params = []
+            while lines[j].split()[2:3] == ["OpFunctionParameter"]:
+                params.append(lines[j].split()[0])
+                j += 1
+            entry = lines[j].split()[0]
+            k = j + 1
+            while lines[k].split()[:1] != ["OpFunctionEnd"]:
+                k += 1
+            body = [l.strip() for l in lines[j + 1:k]]
+            last = body.pop().split()
+            if last[0] not in ("OpReturn", "OpReturnValue") or any(
+                    l.split()[0] in ("OpReturn", "OpReturnValue") or " OpVariable " in l for l in body):
+                raise ValueError(f"{name} is not an outlined function")
+            funcs[name] = (params, entry, body, last[1] if len(last) > 1 else None)
+            i = k + 1
+            continue
+        keep.append(lines[i])
+        i += 1
+    if not funcs:
+        return text
+    # Decorations (NoContraction) of a function's ids are repeated for each inlined copy.
+    decos, kept = {}, []
+    for line in keep:
+        t = line.split()
+        if t[:1] == ["OpDecorate"] and len(t) > 1 and t[1].startswith(prefix):
+            fn = t[1].rsplit("_", 1)[0]
+            if fn in funcs:
+                decos.setdefault(fn, []).append(t)
+                continue
+        kept.append(line)
+    keep = kept
+    new_decos = []
+    out, value_of, cont_of = [], {}, {}
+    cur, n = None, 0
+    for line in keep:
+        t = line.split()
+        if len(t) >= 3 and t[1] == "=" and t[2] == "OpLabel":
+            cur = t[0]
+        if len(t) >= 5 and t[1] == "=" and t[2] == "OpFunctionCall" and t[4] in funcs:
+            params, entry, body, ret = funcs[t[4]]
+            n += 1
+            tag = f"_i{n}"
+            sub = dict(zip(params, t[5:]))
+
+            def ren(x):
+                if x in sub:
+                    return sub[x]
+                return x + tag if x.startswith(t[4] + "_") else x
+            out.append(f"OpBranch {ren(entry)}")
+            out.append(f"{ren(entry)} = OpLabel")
+            out += [" ".join(ren(x) for x in l.split()) for l in body]
+            label = f"{t[4]}_c{tag}"
+            out += [f"OpBranch {label}", f"{label} = OpLabel"]
+            if ret is not None:
+                value_of[t[0]] = ren(ret)
+            if cur is not None:
+                cont_of[cur] = label
+            new_decos += [" ".join([d[0], ren(d[1])] + d[2:]) for d in decos.get(t[4], ())]
+            continue
+        out.append(line)
+    res = []
+    for line in out:
+        t = line.split()
+        if any(x in value_of for x in t):
+            t = [value_of.get(x, x) for x in t]
+            line = " ".join(t)
+        if len(t) >= 5 and t[1] == "=" and t[2] == "OpPhi":
+            if any(p in cont_of for p in t[5::2]):
+                t = t[:4] + [cont_of.get(x, x) if k % 2 else x for k, x in enumerate(t[4:])]
+                line = " ".join(t)
+        res.append(line)
+    if new_decos:
+        at = next((k for k, l in enumerate(res) if l.split()[:1] == ["OpDecorate"]), None)
+        if at is None:
+            at = next(k for k, l in enumerate(res) if " = OpType" in l)
+        res[at:at] = ["         " + d for d in new_decos]
+    return "\n".join(res)

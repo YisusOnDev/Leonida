@@ -121,6 +121,17 @@ def _ints(args):
 
 
 def run(spvasm):
+    if "OpFunctionCall" in spvasm and " %of" in spvasm:
+        # Functions the translator's outliner (tools/spirv_outline.py) made: inlined back into the one function
+        # this interpreter runs; a straight-line body inlines as a chain of OpBranch to the next label.
+        import os
+        import sys
+        tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import spirv_outline
+        spvasm = spirv_outline.inline_outlined(spvasm)
+    inlined = "OpFunctionCall" not in spvasm
     types, consts, mem = {}, {}, {}
     body = []
 
@@ -256,8 +267,8 @@ def run(spvasm):
         raise NotImplementedError("GLSL." + fn)
 
     for res, op, args in body:
-        if op in ("OpLabel", "OpReturn", "OpFunctionEnd"):
-            continue
+        if op in ("OpLabel", "OpReturn", "OpFunctionEnd") or (op == "OpBranch" and inlined):
+            continue        # an inlined body's OpBranch goes to the next label (straight-line code only here)
         if op == "OpVariable":
             declare(res, args)
             continue
