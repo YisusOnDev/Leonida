@@ -3639,6 +3639,17 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const
         pc_desc.NumRenderTargets = 0;
     }
     pc_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    // The state blob's depth state is not decoded yet. The title's UI draws (the press-A screen) bind a
+    // R32G8X24_TYPELESS depth target that holds 0 (VIctory oracle, frame 901: the depth target stays 0.0 while the
+    // text is drawn), so the old default (test on, LESS, D32_FLOAT) rejected every fragment and viewed a D32S8 image
+    // as D32. Without depth the pipeline leaves the depth attachment alone. LEONIDA_SLOT57_DEPTH=1 restores the
+    // old default.
+    static const bool keep_depth = GetEnvironmentVariableW(L"LEONIDA_SLOT57_DEPTH", nullptr, 0) != 0;
+    if (!keep_depth) {
+        pc_desc.DepthStencilState.DepthEnable = FALSE;
+        pc_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        pc_desc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    }
     pc_desc.SampleDesc.Count = 1;
     pc_desc.SampleDesc.Quality = 0;
     pc_desc.NodeMask = 0;
@@ -3646,13 +3657,19 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const
     pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
 
     const HRESULT hr = self->real->CreateGraphicsPipelineState(&pc_desc, *riid, out);
-    static std::atomic<std::uint64_t> ok_count{0}, fail_count{0};
+    static std::atomic<std::uint64_t> ok_count{0}, fail_count{0}, oom_count{0}, invalid_count{0};
     (FAILED(hr) ? fail_count : ok_count).fetch_add(1, std::memory_order_relaxed);
+    if (hr == E_OUTOFMEMORY) oom_count.fetch_add(1, std::memory_order_relaxed);
+    if (hr == E_INVALIDARG) invalid_count.fetch_add(1, std::memory_order_relaxed);
     if (call % 1000 == 0)
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 tally: %llu calls, %llu created, %llu refused by the PC device\n",
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 57 tally: %llu calls, %llu created, %llu refused by the PC device "
+                     "(E_OUTOFMEMORY %llu, E_INVALIDARG %llu)\n",
                      static_cast<unsigned long long>(call),
                      static_cast<unsigned long long>(ok_count.load(std::memory_order_relaxed)),
-                     static_cast<unsigned long long>(fail_count.load(std::memory_order_relaxed)));
+                     static_cast<unsigned long long>(fail_count.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(oom_count.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(invalid_count.load(std::memory_order_relaxed)));
     if (FAILED(hr)) {
         static std::atomic<int> fail_log{0};
         const int failure = fail_log.fetch_add(1, std::memory_order_relaxed);
