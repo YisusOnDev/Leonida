@@ -4555,6 +4555,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
+            std::uint32_t draw_count = draw->count, draw_first = draw->first;  // a rectangle list's expansion changes them
             if (graphics.console_vertex_table && draw->views && vk.vertex_tables && vk.vertex_tables_cursor &&
                 vk.vertex_tables_bytes >= kConsoleVertexTableBytes) {
                 std::array<std::uint32_t, 4 * 32> words;
@@ -4564,8 +4565,30 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const std::uint32_t tables = vk.vertex_tables_bytes / kConsoleVertexTableBytes;
                 const std::uint32_t index = vk.vertex_tables_cursor->fetch_add(1, std::memory_order_relaxed) % tables;
                 const std::uint64_t at = std::uint64_t(index) * kConsoleVertexTableBytes;
+                // A rectangle list: six vertices per rectangle, expanded here into the rest of the table's entry
+                // (src/console_vertex_table.h, expand_rect_list), and slot 0's V# pointed at them.
+                constexpr std::uint32_t kExpandedAt = 64;
+                const VertexBufferView& v0 = draw->views->vertex_buffers[0];
+                const std::uint32_t rects = draw->count / 3;
+                const auto peek = detail::g_draw_log_peek.load(std::memory_order_relaxed);
+                if (draw->topology == topology_rect_list && !draw->indexed && draw->instances == 1 && rects &&
+                    draw->count % 3 == 0 && slots >= 1 && peek && v0.va && v0.stride >= 8 && v0.stride % 4 == 0 &&
+                    std::uint64_t(6) * rects * v0.stride <= kConsoleVertexTableBytes - kExpandedAt) {
+                    std::uint8_t given[kConsoleVertexTableBytes / 2];
+                    const std::size_t bytes = std::size_t(3) * rects * v0.stride;
+                    if (bytes <= sizeof(given) &&
+                        peek(given, v0.va + std::uint64_t(v0.stride) * draw->first, bytes) &&
+                        expand_rect_list(given, v0.stride, rects, vk.vertex_tables + at + kExpandedAt)) {
+                        words[0] = std::uint32_t(vk.vertex_tables_va + at + kExpandedAt);
+                        words[1] = (words[1] & 0xFFFF0000u) |
+                                   std::uint32_t(((vk.vertex_tables_va + at + kExpandedAt) >> 32) & 0xFFFFu);
+                        words[2] = 6 * rects;  // records: the stride is kept
+                        draw_count = 6 * rects;
+                        draw_first = 0;
+                    }
+                }
                 std::memcpy(vk.vertex_tables + at, words.data(), std::size_t(std::max(slots, 1u)) * 16);
-                console_vertex_user_words(data.s, vk.vertex_tables_va + at, draw->indexed, draw->first,
+                console_vertex_user_words(data.s, vk.vertex_tables_va + at, draw->indexed, draw_first,
                                           draw->base_vertex, draw->first_instance);
                 static std::atomic<int> logged{0};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
@@ -4643,7 +4666,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);
             } else {
-                vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
+                vk.draw(command_buffer, draw_count, draw->instances, draw_first, draw->first_instance);
             }
             vk.end_rendering(command_buffer);
         }

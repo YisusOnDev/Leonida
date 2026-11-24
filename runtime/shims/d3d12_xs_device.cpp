@@ -4540,6 +4540,28 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     }
     const UINT mask = static_cast<UINT>(visible_mask);
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
+    // A device that cannot make a format a render target (B4G4R4A4_UNORM, format 115, on the RTX 3070 Laptop's
+    // driver) refuses its size, and the title asserts on the refusal (+0x344196). Stand-in: the size of the same
+    // texture without the target and unordered-access usage, which the title's placement only needs as bytes.
+    if (info.SizeInBytes == UINT64_MAX && clean) {
+        constexpr auto usage = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+        std::unique_ptr<D3D12_RESOURCE_DESC[]> plain(new (std::nothrow) D3D12_RESOURCE_DESC[desc_count]);
+        if (plain) {
+            for (UINT i = 0; i < desc_count; ++i) {
+                plain[i] = descs[i];
+                plain[i].Flags &= ~usage;
+            }
+            const D3D12_RESOURCE_ALLOCATION_INFO retry = real->GetResourceAllocationInfo(mask, desc_count, plain.get());
+            static std::atomic<int> logged{0};
+            if (retry.SizeInBytes != UINT64_MAX && logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 25: format %d %llux%u refused with its target usage; sized "
+                                     "without it (0x%llx bytes)\n",
+                             static_cast<int>(descs[0].Format), static_cast<unsigned long long>(descs[0].Width),
+                             descs[0].Height, static_cast<unsigned long long>(retry.SizeInBytes));
+            if (retry.SizeInBytes != UINT64_MAX) info = retry;
+        }
+    }
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
     // Sampled textures from the title: the console's answer, its layout's size at its alignment (4 KiB for the 4 KiB

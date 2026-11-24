@@ -11,7 +11,9 @@
 #include "gfx10_descriptors.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace leonida {
 
@@ -46,6 +48,57 @@ std::uint32_t console_vertex_table(const std::array<VertexBufferView, 32>& views
         for (unsigned k = 0; k < 4; ++k) out[slot * 4 + k] = words[k];
     }
     return slots;
+}
+
+// A rectangle list (topology 17) drawn by such a program: its pipeline is a triangle list (slot 57 does not carry the
+// rectangle topology type), so the vertices are expanded before the draw, six per rectangle: the three given, then the
+// two that share the corner opposite the right angle and the fourth corner. The right angle is found from the
+// position (the first two dwords, floats); the fourth corner is a + b - corner for every dword, except one with the
+// same bits at all three vertices (a packed colour, say), which is copied. `in` holds 3 * rects vertices of `stride`
+// bytes (a multiple of 4, at least 8); `out` gets 6 * rects. The composite into the back buffer is one such rectangle:
+// (0,0), (0,2160), (3840,2160), right angle at the second vertex, fourth corner (3840,0).
+inline bool expand_rect_list(const std::uint8_t* in, std::uint32_t stride, std::uint32_t rects, std::uint8_t* out) {
+    if (stride < 8 || stride % 4) return false;
+    const std::uint32_t words = stride / 4;
+    const auto word = [&](std::uint32_t vertex, std::uint32_t k) {
+        std::uint32_t w;
+        std::memcpy(&w, in + std::size_t(vertex) * stride + 4 * k, 4);
+        return w;
+    };
+    const auto real = [](std::uint32_t w) {
+        float f;
+        std::memcpy(&f, &w, 4);
+        return f;
+    };
+    for (std::uint32_t r = 0; r < rects; ++r) {
+        const std::uint32_t v = 3 * r;
+        // The corner whose two edges are perpendicular (the smallest |dot|).
+        std::uint32_t corner = 1;
+        float best = -1.0f;
+        for (std::uint32_t c = 0; c < 3; ++c) {
+            const std::uint32_t a = (c + 1) % 3, b = (c + 2) % 3;
+            const float ax = real(word(v + a, 0)) - real(word(v + c, 0)), ay = real(word(v + a, 1)) - real(word(v + c, 1));
+            const float bx = real(word(v + b, 0)) - real(word(v + c, 0)), by = real(word(v + b, 1)) - real(word(v + c, 1));
+            const float dot = std::fabs(ax * bx + ay * by);
+            if (!(dot == dot)) continue;  // NaN
+            if (best < 0.0f || dot < best) best = dot, corner = c;
+        }
+        const std::uint32_t a = (corner + 1) % 3, b = (corner + 2) % 3;
+        std::uint8_t* to = out + std::size_t(6 * r) * stride;
+        std::memcpy(to, in + std::size_t(v) * stride, std::size_t(3) * stride);
+        std::memcpy(to + 3 * std::size_t(stride), in + std::size_t(v + a) * stride, stride);
+        std::memcpy(to + 4 * std::size_t(stride), in + std::size_t(v + b) * stride, stride);
+        for (std::uint32_t k = 0; k < words; ++k) {
+            const std::uint32_t wc = word(v + corner, k), wa = word(v + a, k), wb = word(v + b, k);
+            std::uint32_t w4 = wc;
+            if (!(wc == wa && wa == wb)) {
+                const float f = real(wa) + real(wb) - real(wc);
+                if (f == f && std::fabs(f) <= 3.0e38f) std::memcpy(&w4, &f, 4);
+            }
+            std::memcpy(to + 5 * std::size_t(stride) + 4 * k, &w4, 4);
+        }
+    }
+    return true;
 }
 
 // The user words a draw with such a vertex shader gets: s[0:1] the table's console VA (s1 keeps its upper bits), s2
