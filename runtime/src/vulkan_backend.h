@@ -1269,18 +1269,6 @@ public:
         BufferVaIndex<ResourceId>::Hit hit{};
         return buffer_vas_.find(va, hit);
     }
-    // The CPU-written (UPLOAD) buffer that holds `va`: its first VA, size and mapped bytes. False for any other.
-    bool cpu_written_buffer(std::uint64_t va, std::uint64_t& start, std::uint64_t& size, const std::uint8_t*& host) {
-        std::shared_lock lock(resource_mutex_);
-        BufferVaIndex<ResourceId>::Hit hit{};
-        if (!buffer_vas_.find(va, hit)) return false;
-        const ResourceBinding* b = resolve(hit.id);
-        if (!b || !b->host || va < b->va || va - b->va >= b->size) return false;
-        start = b->va;
-        size = b->size;
-        host = b->host;
-        return true;
-    }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
         set_resource_locked(id, binding);
