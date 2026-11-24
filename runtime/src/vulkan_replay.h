@@ -786,6 +786,7 @@ struct GraphicsPipeline {
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    std::string debug;  // LEONIDA_DRAW_LOG: shader names and fixed state, filled by the device
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -1147,12 +1148,12 @@ inline void log_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipe
     }
     std::fprintf(stderr,
                  "[rt] draw-log: %s count %u inst %u first %u topo %u vp %.0f,%.0f %.0fx%.0f d%.2f-%.2f sc %d,%d-%d,%d "
-                 "area %ux%u pipe %d depth{id %llu fmt %d}%s vbs %zu user%s\n",
+                 "area %ux%u pipe %d depth{id %llu fmt %d}%s vbs %zu user%s | %s\n",
                  draw.indexed ? "indexed" : "draw", draw.count, draw.instances, draw.first, draw.topology,
                  draw.viewport.x, draw.viewport.y, draw.viewport.width, draw.viewport.height, draw.viewport.min_depth,
                  draw.viewport.max_depth, draw.scissor.left, draw.scissor.top, draw.scissor.right, draw.scissor.bottom,
                  d.area.width, d.area.height, d.pipeline != VK_NULL_HANDLE, static_cast<unsigned long long>(d.depth.id),
-                 int(graphics.depth_format), colors.c_str(), d.vertex_buffers.size(), user.c_str());
+                 int(graphics.depth_format), colors.c_str(), d.vertex_buffers.size(), user.c_str(), graphics.debug.c_str());
 }
 
 // D3D converts a float clear value to a normalised format by rounding to nearest even, so an exact tie goes to the
