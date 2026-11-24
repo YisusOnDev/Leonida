@@ -9,6 +9,10 @@
 //     through the three corner colours; the bottom-right quadrant is only right when the fourth corner is.
 //   frame 2, quad list: PSO topology type TRIANGLE, IASetPrimitiveTopology(19), DrawInstanced(8): two quads (corners
 //     in order around the quad), the top-left and bottom-right quadrants, each one colour. These pixels are exact.
+//   frame 3, the same rectangle as frame 1 given as top left, bottom left, bottom right (the right angle at the second
+//     corner, the order GTA VI's full-screen rectangles come in: VIctory, GPL-3.0, primitive.rs; no code taken). The
+//     layer finds the right-angle corner per rectangle, so the fourth is top left + bottom right - bottom left and the
+//     pixels are frame 1's.
 // Pixels are read back and compared; the other two quadrants of frame 2 stay the clear colour. LEONIDA_VK_VALIDATION=1
 // runs it under the validation layer.
 #include "vk_test_device.h"
@@ -83,15 +87,20 @@ int main() {
     EXPECT(vs_program.size() >= 4 && ps_program.size() == 0x110);
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
 
-    // Frame 1: the rectangle's three corners. Vertices 0..2. Frame 2: two quads, vertices 3..10.
+    // Frame 1: the rectangle's three corners. Vertices 0..2. Frame 2: two quads, vertices 3..10. Frame 3: the
+    // rectangle again, top left, bottom left, bottom right, vertices 11..13 (cd = cb + cc - ca, the plane's corner).
     const float ca[4] = {0.0f, 0.0f, 0.0f, 1.0f}, cb[4] = {1.0f, 0.0f, 0.5f, 1.0f}, cc[4] = {0.0f, 0.5f, 1.0f, 1.0f};
     const float q1[4] = {0.25f, 0.5f, 0.75f, 1.0f}, q2[4] = {1.0f, 0.0f, 0.5f, 1.0f};
-    const Vertex vertices[11] = {vertex(-1, 1, ca), vertex(1, 1, cb), vertex(-1, -1, cc),
+    float cd[4];
+    for (int c = 0; c < 4; ++c) cd[c] = cb[c] + cc[c] - ca[c];
+    const Vertex vertices[14] = {vertex(-1, 1, ca), vertex(1, 1, cb), vertex(-1, -1, cc),
                                  vertex(-1, 1, q1), vertex(0, 1, q1), vertex(0, 0, q1), vertex(-1, 0, q1),
-                                 vertex(0, 0, q2), vertex(1, 0, q2), vertex(1, -1, q2), vertex(0, -1, q2)};
-    static_assert(sizeof(Vertex) == 32 && sizeof(vertices) == 352);
+                                 vertex(0, 0, q2), vertex(1, 0, q2), vertex(1, -1, q2), vertex(0, -1, q2),
+                                 vertex(-1, 1, ca), vertex(-1, -1, cc), vertex(1, -1, cd)};
+    static_assert(sizeof(Vertex) == 32 && sizeof(vertices) == 448);
 
-    std::vector<Pixel> rect_pixels(target_extent * target_extent), quad_pixels(target_extent * target_extent);
+    std::vector<Pixel> rect_pixels(target_extent * target_extent), quad_pixels(target_extent * target_extent),
+        rect2_pixels(target_extent * target_extent);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -172,8 +181,9 @@ int main() {
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         std::memcpy(up, vertices, sizeof(vertices));
 
-        // Two V#s over the one vertex buffer: slot 0 the rectangle's three corners, slot 1 the eight quad corners.
-        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+        // Three V#s over the one vertex buffer: slot 0 the rectangle's three corners, slot 1 the eight quad corners,
+        // slot 2 the rectangle's corners in the second order.
+        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> srv_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
@@ -183,9 +193,10 @@ int main() {
         EXPECT(cpu && gpu >= 0x10000 && gpu < (1ull << 32) && step >= 16);
         const std::uint64_t buffer_va = vertex_buffer->GetGPUVirtualAddress();
         EXPECT(buffer_va >= 0x10000);
-        const std::array<std::uint32_t, 4> vsharps[2] = {make_vsharp(buffer_va, 3),
-                                                         make_vsharp(buffer_va + 3 * sizeof(Vertex), 8)};
-        for (unsigned i = 0; i < 2; ++i)
+        const std::array<std::uint32_t, 4> vsharps[3] = {make_vsharp(buffer_va, 3),
+                                                         make_vsharp(buffer_va + 3 * sizeof(Vertex), 8),
+                                                         make_vsharp(buffer_va + 11 * sizeof(Vertex), 3)};
+        for (unsigned i = 0; i < 3; ++i)
             std::memcpy(reinterpret_cast<void*>(cpu + std::uint64_t(i) * step), vsharps[i].data(), 16);
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -263,6 +274,7 @@ int main() {
         };
         EXPECT(render_frame(1, rect_pso.p, rect_list, 0, 3, rect_pixels) == 0);
         EXPECT(render_frame(2, quad_pso.p, quad_list, 1, 8, quad_pixels) == 0);
+        EXPECT(render_frame(3, rect_pso.p, rect_list, 2, 3, rect2_pixels) == 0);
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         rect_pso.reset();
         quad_pso.reset();
@@ -280,37 +292,42 @@ int main() {
     const float scale[4] = {0.5f, 2.0f, 1.0f, 1.0f};
     unsigned covered = 0, off = 0;
     float worst = 0.0f;
-    for (UINT row = 0; row < target_extent; ++row) {
-        for (UINT col = 0; col < target_extent; ++col) {
+    const auto check_rect = [&](const char* label, const std::vector<Pixel>& pixels) -> bool {
+        covered = 0;
+        for (UINT row = 0; row < target_extent; ++row) {
+            for (UINT col = 0; col < target_extent; ++col) {
+                const float u = (float(col) + 0.5f) / target_extent, v = (float(row) + 0.5f) / target_extent;
+                const Pixel& got = pixels[row * target_extent + col];
+                bool pixel_ok = true;
+                for (int c = 0; c < 4; ++c) {
+                    const float want = (ca[c] + u * (cb[c] - ca[c]) + v * (cc[c] - ca[c])) * scale[c];
+                    const float error = std::fabs(got[c] - want);
+                    worst = std::fmax(worst, error);
+                    if (!(error <= 2e-5f)) pixel_ok = false;
+                }
+                covered += pixel_ok;
+                if (!pixel_ok && off++ < 8)
+                    std::fprintf(stderr, "%s pixel (%u, %u): got %g,%g,%g,%g\n", label, col, row, got[0], got[1], got[2], got[3]);
+            }
+        }
+        // The four quadrant centres on their own, so a wrong fourth corner is named by quadrant.
+        const char* names[4] = {"top left", "top right", "bottom left", "bottom right"};
+        for (int quadrant = 0; quadrant < 4; ++quadrant) {
+            const UINT col = (quadrant & 1 ? 48 : 16), row = (quadrant & 2 ? 48 : 16);
+            const Pixel& got = pixels[row * target_extent + col];
             const float u = (float(col) + 0.5f) / target_extent, v = (float(row) + 0.5f) / target_extent;
-            const Pixel& got = rect_pixels[row * target_extent + col];
-            bool pixel_ok = true;
             for (int c = 0; c < 4; ++c) {
                 const float want = (ca[c] + u * (cb[c] - ca[c]) + v * (cc[c] - ca[c])) * scale[c];
-                const float error = std::fabs(got[c] - want);
-                worst = std::fmax(worst, error);
-                if (!(error <= 2e-5f)) pixel_ok = false;
-            }
-            covered += pixel_ok;
-            if (!pixel_ok && off++ < 8)
-                std::fprintf(stderr, "rect pixel (%u, %u): got %g,%g,%g,%g\n", col, row, got[0], got[1], got[2], got[3]);
-        }
-    }
-    // The four quadrant centres on their own, so a wrong fourth corner is named by quadrant.
-    const char* names[4] = {"top left", "top right", "bottom left", "bottom right"};
-    for (int quadrant = 0; quadrant < 4; ++quadrant) {
-        const UINT col = (quadrant & 1 ? 48 : 16), row = (quadrant & 2 ? 48 : 16);
-        const Pixel& got = rect_pixels[row * target_extent + col];
-        const float u = (float(col) + 0.5f) / target_extent, v = (float(row) + 0.5f) / target_extent;
-        for (int c = 0; c < 4; ++c) {
-            const float want = (ca[c] + u * (cb[c] - ca[c]) + v * (cc[c] - ca[c])) * scale[c];
-            if (!(std::fabs(got[c] - want) <= 2e-5f)) {
-                std::fprintf(stderr, "rect %s quadrant: channel %d got %g want %g\n", names[quadrant], c, got[c], want);
-                return 1;
+                if (!(std::fabs(got[c] - want) <= 2e-5f)) {
+                    std::fprintf(stderr, "%s %s quadrant: channel %d got %g want %g\n", label, names[quadrant], c, got[c], want);
+                    return false;
+                }
             }
         }
-    }
-    EXPECT(covered == target_extent * target_extent);
+        return covered == target_extent * target_extent;
+    };
+    EXPECT(check_rect("rect (right angle first)", rect_pixels));
+    EXPECT(check_rect("rect (right angle second)", rect2_pixels));
 
     // Quad list: whole-bit comparison; two quadrants one colour each, the rest the clear colour.
     const Pixel clear_color = {0.5f, 0.125f, 0.25f, 0.5f};

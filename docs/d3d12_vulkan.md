@@ -1928,6 +1928,13 @@ VIctory's `crates/victory-gpu/src/primitive.rs` (GPL-3, no code taken), which st
 `V1 + V2 - V0` (0-based). For these rectangles that point is not the missing corner:
 `LEONIDA_PROBE=BlitColour` on renderB-7 showed `VS_Blit` covering half the screen.
 
+The geometry stage of `src/rect_list_geometry.h` now finds the right-angle corner of each rectangle from its
+positions: the corner whose two edges have the smallest squared dot product in x, y, ties to the first. The fourth
+corner is the other two minus that one, for the position and every interpolant. The strip it emits starts at that
+corner, so the winding is kept. This takes both orders: the right angle first (`d3d12_rect_list_test` frame 1) and
+VIctory's right angle second, top left, bottom left, bottom right (frame 3). Reference: VIctory `primitive.rs`
+(GPL-3), the fact only.
+
 The table's slot 0 comes from device slot 70: a view of memory with no resource object. Leonida now writes typed,
 structured and raw buffer views of it, and copies the result back over the title's heap backing. This is the shape of
 VIctory's `View::Placed` (`descriptor.rs`, `descriptor/host.rs`). VIctory reaches title memory through on-demand host
@@ -2294,7 +2301,7 @@ The trace will enumerate them.
 
 ### Console rectangle and quad lists
 
-The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiveTopology(17)`, with a PSO whose topology type is 19) and quad list (`IASetPrimitiveTopology(19)`). The facts are from xvalkyrie (GPL-3.0, commit `53af7df77c10`; no code taken): a rectangle is three corners and the fourth is v2 + v3 - v1 for the position and every interpolant, after the vertex stage; a quad is four vertices. The layer draws both as triangles (`d3d12_rect_list_test`, RTX 4090: 4096 of 4096 pixels, the colour plane exact, quad list bit-exact).
+The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiveTopology(17)`, with a PSO whose topology type is 19) and quad list (`IASetPrimitiveTopology(19)`). The facts are from xvalkyrie (GPL-3.0, commit `53af7df77c10`; no code taken): a rectangle is three corners and the fourth is made for the position and every interpolant, after the vertex stage (opposite the right-angle corner, found per rectangle; see section 3.5); a quad is four vertices. The layer draws both as triangles (`d3d12_rect_list_test`, RTX 4090: 4096 of 4096 pixels, the colour plane exact, quad list bit-exact).
 - **Rectangle list**: PSO type 19 builds a triangle-list pipeline plus a generated geometry stage (`src/rect_list_geometry.h`, written from the vertex shader's own outputs) that takes the three corners and emits the strip v1 v2 v3 v4 (same winding). It has to be post-vertex-stage: the translated vertex shaders fetch by V# themselves, and the fourth corner is a function of what they write. A corner value with the same bits at all three corners (a flat attribute) is copied. Needs `geometryShader` (else `E_NOTIMPL`), no application GS, and a vertex shader with no ClipDistance, CullDistance, Layer or ViewportIndex output.
 - **Quad list**: a non-indexed draw uses a shared index buffer containing the triangle-list pattern
   `0 1 2, 0 2 3` for each quad. Both triangles start at the first vertex for flat inputs. One draw preserves instance
