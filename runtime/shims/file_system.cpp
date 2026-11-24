@@ -1039,20 +1039,6 @@ HANDLE open_file(const char* api, const void* caller, LPCWSTR name, DWORD access
         SetLastError(last_error);
     } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
         opened_delete_on_close(name, last_error);
-    } else if (rt::startup_trace::enabled()) {
-        // Diagnostic: the first 4,000 successful opens, with their time, so a loading stall shows the last file.
-        static std::atomic<int> left{4000};
-        if (left.fetch_sub(1, std::memory_order_relaxed) > 0) {
-            std::string utf8;
-            if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
-                utf8.resize(static_cast<size_t>(n) - 1);
-                WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
-            }
-            rt::startup_trace::event("file_open", std::string("\"path\":") + rt::startup_trace::quote(utf8) +
-                                                      ",\"caller\":" +
-                                                      rt::startup_trace::quote(rt::startup_trace::where(
-                                                          reinterpret_cast<uint64_t>(caller))));
-        }
     }
     // Diagnostic: LEONIDA_IO_LOG=1 prints the first 3000 opens (guest path, result, caller).
     static const bool io_log = std::getenv("LEONIDA_IO_LOG") != nullptr;

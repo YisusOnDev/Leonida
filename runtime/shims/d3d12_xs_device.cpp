@@ -32,6 +32,7 @@
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 #include "../src/title_va_alias.h"  // set_descriptor_source: title-written slots reach the layer heap
+#include "../src/console_texture_desc.h"  // slot 25: sampled textures at their console size
 
 #ifdef LEONIDA_VULKAN_DEVICE
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
@@ -4507,6 +4508,29 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    // Sampled textures from the title: the console's answer, its layout's size at its alignment (4 KiB for the 4 KiB
+    // modes), smaller or larger than the PC's. The title pages its archive reads by it (src/console_texture_desc.h:
+    // a PC-sized 128x4 4KB_S class read 0x1000 bytes of a 0x4000-byte chunk and asserted at +0x4ffd879). Computed from
+    // the title's own descriptions: the cleaned copies have lost the Layout field that names the swizzle mode.
+    if (call.console_abi && title_descs) {
+        UINT64 size = 0, alignment = 0;
+        if (leonida::console_layout::console_texture_placement(title_descs, desc_count, size, alignment)) {
+            static std::atomic<int> logged{0};
+            if ((size != info.SizeInBytes || alignment != info.Alignment) &&
+                logged.fetch_add(1, std::memory_order_relaxed) < 16)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 25: console size 0x%llx align 0x%llx for PC 0x%llx align 0x%llx: "
+                             "%llux%ux%u mips %u format %d layout 0x%x align asked 0x%llx (%u description(s))\n",
+                             static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment),
+                             static_cast<unsigned long long>(info.SizeInBytes),
+                             static_cast<unsigned long long>(info.Alignment),
+                             static_cast<unsigned long long>(title_descs[0].Width), title_descs[0].Height,
+                             title_descs[0].DepthOrArraySize, title_descs[0].MipLevels,
+                             static_cast<int>(title_descs[0].Format), static_cast<unsigned>(title_descs[0].Layout),
+                             static_cast<unsigned long long>(title_descs[0].Alignment), static_cast<unsigned>(desc_count));
+            info = {size, alignment};
+        }
+    }
     // The retail title asserts (int3) when the upper half of the size is set, which is what the refusal (UINT64_MAX)
     // looks like to it: name the refused descriptions, a few of them.
     static std::atomic<int> refused_logged{0};

@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "../src/console_texture_layout.h"
+#include "../src/console_texture_desc.h"
 #include "shims.h"
 
 namespace {
@@ -51,9 +52,9 @@ namespace cl = leonida::console_layout;
 
 constexpr HRESULT kNotImpl = static_cast<HRESULT>(rt::shims::kENotImpl);
 constexpr size_t kSlots = 32;
-constexpr uint32_t kSwizzled = 0x100, kRowMajor = 1;
-constexpr uint32_t kAllowRenderTarget = 1, kAllowDepthStencil = 2;
-constexpr uint32_t kTexture1d = 2, kTexture2d = 3, kTexture3d = 4;
+constexpr uint32_t kSwizzled = cl::kDescSwizzled;
+constexpr uint32_t kAllowDepthStencil = cl::kDescDepthStencil;
+constexpr uint32_t kTexture3d = 4;
 constexpr size_t kLayoutMips = 15;
 
 // Prints once per entry point; `slot` is the vtable index for a computer method, or -1 for an export.
@@ -66,14 +67,8 @@ void warn_once(std::atomic<bool>& warned, const char* what, int slot, const void
                  rt::shims::module_offset(reinterpret_cast<uint64_t>(caller)).c_str());
 }
 
-// The mode the console's library picks: linear for 1D, the XOR depth and render modes for targets, else 4 KiB
-// standard (VIctory's rule, from the library's older optimal-mode function).
-uint32_t suggested(const D3D12_RESOURCE_DESC& d) {
-    if (static_cast<uint32_t>(d.Dimension) == kTexture1d) return cl::kLinear;
-    if (static_cast<uint32_t>(d.Flags) & kAllowDepthStencil) return cl::kSw64kbZX;
-    if (static_cast<uint32_t>(d.Flags) & kAllowRenderTarget) return cl::kSw64kbRX;
-    return cl::kSw4kbS;
-}
+// The mode the console's library picks (src/console_texture_desc.h, shared with the device's GetResourceAllocationInfo).
+uint32_t suggested(const D3D12_RESOURCE_DESC& d) { return cl::suggested_swizzle(d); }
 
 struct Computer {
     const void* const* vtable;
@@ -84,26 +79,7 @@ struct Computer {
 };
 
 std::optional<cl::Texture> texture_for(const D3D12_RESOURCE_DESC& d) {
-    cl::TextureDesc t;
-    switch (static_cast<uint32_t>(d.Dimension)) {
-    case kTexture1d: t.dimension = cl::Dimension::tex1d; break;
-    case kTexture2d: t.dimension = cl::Dimension::tex2d; break;
-    case kTexture3d: t.dimension = cl::Dimension::tex3d; break;
-    default: return std::nullopt;
-    }
-    const uint32_t layout = static_cast<uint32_t>(d.Layout);
-    if (layout == 0) t.swizzle = suggested(d);
-    else if (layout == kRowMajor) t.swizzle = cl::kLinear;
-    else if ((layout & ~0xffu) == kSwizzled) t.swizzle = layout & 0xff;
-    else return std::nullopt;
-    if (d.Width > 0xffffffffull) return std::nullopt;
-    t.width = static_cast<uint32_t>(d.Width);
-    t.height = d.Height;
-    t.depth_or_array = d.DepthOrArraySize;
-    t.mips = d.MipLevels;
-    t.format = static_cast<uint32_t>(d.Format);
-    t.samples = std::max<uint32_t>(d.SampleDesc.Count, 1);
-    auto texture = cl::Texture::make(t);
+    auto texture = cl::console_texture(d);
     if (!texture || texture->planes[0].layout.mips.size() > kLayoutMips) return std::nullopt;
     return texture;
 }
