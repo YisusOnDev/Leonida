@@ -1912,6 +1912,16 @@ read its V# from the arena's never-allocated zero page and drew nothing. Replay 
 
 Other pipelines keep `s0..s7` as recorded, because 551 PS and 12 VS read `s1` as a constant.
 
+A slot-57 pipeline is created as a triangle list, because its state blob's topology field is not decoded. The
+composite draws one rectangle (topology 17, three vertices), so it covered half the screen
+(`LEONIDA_PROBE=e3151ebe`, `LEONIDA_PROBE_MODE=ps`: half the frame green). For such a draw, replay now expands
+the vertices on the CPU into the vertex-table entry (`expand_rect_list`), six per rectangle:
+- The fourth corner is the one opposite the right angle, found from the position.
+- Each dword of the fourth corner is `a + b - corner`. A dword with the same bits at all three corners is copied.
+- Slot 0's V# is pointed at the expanded vertices.
+
+This applies to non-indexed single-instance draws of at most three 24-byte rectangles.
+
 **Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
 each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the
 console launched the dispatch with. Every one of those 29 containers also carries an `RTS0`, which makes this the
