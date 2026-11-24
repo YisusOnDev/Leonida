@@ -976,11 +976,27 @@ struct DeviceState {
     std::uint64_t title_window_bytes = 0;
     std::uint64_t title_window_cap = 64ull << 20;
 
+    // Title-placed buffers imported with a device address below the arena (create_host_buffer): [start, end). A
+    // shader cannot reach them by their wrapped VA, so addresses in them get windows like any title memory.
+    std::mutex low_import_mutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> low_imports;
+    void add_low_import(std::uint64_t start, std::uint64_t bytes) {
+        std::lock_guard lock(low_import_mutex);
+        low_imports.emplace_back(start, start + bytes);
+    }
+    bool in_low_import(std::uint64_t va) {
+        std::lock_guard lock(low_import_mutex);
+        for (const auto& [lo, hi] : low_imports)
+            if (va >= lo && va < hi) return true;
+        return false;
+    }
+
     // Called through title_va_aliases().resolve for an address with no copy yet. False: not the title's memory.
     bool resolve_title_memory(std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
         out = va;
         if (!arena.mapped || va < arena.size || !context) return false;
-        if (context->knows_buffer_va(va)) return false;  // an upload or readback buffer's biased VA, say
+        // An upload or readback buffer's biased VA, say; but an import below the arena is the title's memory to window.
+        if (context->knows_buffer_va(va) && !in_low_import(va)) return false;
         auto& aliases = leonida::title_va_aliases();
         // Only the title's own memory gets a copy (xmem's ranges): an address anywhere else, the runtime's or a host
         // DLL's memory included, is left as it was and counted.
@@ -1085,8 +1101,9 @@ struct DeviceState {
             const std::uint64_t to =
                 aliases.resolve(base, std::uint64_t(w2) * (stride ? stride : 1), leonida::TitleVaAliases::table_view);
             if (to == base) {  // bring-up: which V#s stay untranslated, and why
-                static std::atomic<int> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                static std::atomic<std::uint64_t> logged{0};
+                if (const std::uint64_t n = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                    n <= 12 || !(n & (n - 1))) {  // the first 12, then at powers of two
                     std::uint64_t lo = 0, hi = 0;
                     const bool title = aliases.title_memory(base, lo, hi);
                     std::fprintf(stderr,
@@ -2619,19 +2636,17 @@ public:
         // root views read as unsigned: an import the driver put below the arena (the RTX 3070 Laptop does) wraps to
         // 0xffff..., which misses it (renderB-5: the composite's table V#s, base 0xfffd8e82de20). The arena shadow
         // answers instead.
-        if (buffer_va_ && (buffer_va_ < device_.arena.address || ((buffer_va_ - device_.arena.address) >> 47))) {
-            log_once("a title-placed buffer imported below the GPU address arena is not reachable by a V#; using an "
-                     "arena shadow instead; size in KiB:",
+        // The import is kept (vertex and index views and the CPU still use it), but its wrapped VA is not handed to
+        // shaders: an address in it a shader is given gets an on-demand 64 KiB window copy in the arena instead
+        // (resolve_title_memory), which costs only the windows named. A whole-buffer arena shadow (renderB-6) cost
+        // 130 ms per submission for the 174 MiB buffer.
+        const bool unreachable =
+            buffer_va_ && (buffer_va_ < device_.arena.address || ((buffer_va_ - device_.arena.address) >> 47));
+        if (unreachable) {
+            log_once("a title-placed buffer imported below the GPU address arena is not reachable by a V#; shader "
+                     "addresses in it get arena windows; size in KiB:",
                      int(std::min<UINT64>(desc_.Width / 1024, INT_MAX)));
-            vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
-            vk.vkFreeMemory(device_.info.device, memory_, nullptr);
-            buffer_ = VK_NULL_HANDLE;
-            memory_ = VK_NULL_HANDLE;
-            memory_flags_ = 0;
-            mapped_ = nullptr;
-            host_import_ = false;
-            va_ = buffer_va_ = gpu_va_ = 0;
-            return E_NOTIMPL;
+            device_.add_low_import(va_, desc_.Width);
         }
         device_.log_va("title-placed buffer", va_, desc_.Width);
         leonida::ResourceBinding binding{};
@@ -2642,7 +2657,7 @@ public:
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         // Shaders reach the imported pages by their device address (src/title_va_alias.h).
-        if (buffer_va_) alias_title_va(buffer_va_ - device_.arena.address);
+        if (buffer_va_ && !unreachable) alias_title_va(buffer_va_ - device_.arena.address);
         return S_OK;
     }
 
