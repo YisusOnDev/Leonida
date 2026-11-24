@@ -222,6 +222,28 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         log_once(logged_planes_, "PresentX with 2 planes and no overlay flag on plane 1: only plane 0 is shown (plane 1 is taken "
                                  "as the GameDVR copy of the frame)");
     const bool compose = hdr0 || placement(planes[0]) || filter_of(planes[0]) != xbox_scale_filter_default || overlay;
+    // LEONIDA_DRAW_LOG (src/vulkan_replay.h): the first 40 presents and every 500th name the resource each plane shows,
+    // so a black frame can be matched against the render targets the draw log says were written.
+    {
+        const std::uint64_t n = presents_.load(std::memory_order_relaxed);
+        char env[16] = {};
+        std::size_t env_length = 0;
+        const bool logging = getenv_s(&env_length, env, sizeof(env), "LEONIDA_DRAW_LOG") == 0 && env_length > 1;
+        if (logging && (n < 40 || n % 500 == 0)) {
+            for (UINT i = 0; i < plane_count; ++i) {
+                ID3D12Resource* r = planes[i].ppResources[0];
+                const D3D12_RESOURCE_DESC rd = r->GetDesc();
+                const D3D12_RECT* sr = planes[i].pSrcViewRects;
+                std::fprintf(stderr,
+                             "[rt] present-log: #%llu plane %u/%u id %llu %llux%u fmt %d flags 0x%x cs %d filter %d rect %ld,%ld-%ld,%ld compose %d\n",
+                             static_cast<unsigned long long>(n), i, plane_count,
+                             static_cast<unsigned long long>(resource_id(r)), static_cast<unsigned long long>(rd.Width),
+                             rd.Height, int(rd.Format), planes[i].Flags, int(planes[i].ColorSpace), int(planes[i].ScaleFilter),
+                             sr ? sr->left : -1L, sr ? sr->top : -1L, sr ? sr->right : -1L, sr ? sr->bottom : -1L,
+                             int(hdr0 || placement(planes[0]) || filter_of(planes[0]) != xbox_scale_filter_default || overlay));
+            }
+        }
+    }
 
     if (compose) {
         // Every shown plane: a 2D texture, a source rectangle inside it, a placement inside the output.

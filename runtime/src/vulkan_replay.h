@@ -1114,23 +1114,31 @@ struct PreparedDraw {
 
 // LEONIDA_DRAW_LOG=N: the first N draws the replay emits, one line each (bring-up: why a frame stays the clear colour).
 // Namespace-scope state, not guarded statics: replay may run on a title thread.
+// LEONIDA_DRAW_LOG_SKIP=M: the first M draws are not logged (to see the draws of a later frame).
 inline std::atomic<long> g_draw_log_left{-1};
+inline std::atomic<long long> g_draw_log_skip{-1};
 inline void log_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipeline& graphics) {
     long left = g_draw_log_left.load(std::memory_order_relaxed);
     if (left == -1) {
         char text[16] = {};
         std::size_t length = 0;
         long n = 0;
+        long long skip = 0;
 #ifdef _WIN32
         if (getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1) n = std::atol(text);
+        if (getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG_SKIP") == 0 && length > 1) skip = std::atoll(text);
 #else
         (void)length;
         if (const char* env = std::getenv("LEONIDA_DRAW_LOG")) n = std::atol(env);
+        if (const char* env = std::getenv("LEONIDA_DRAW_LOG_SKIP")) skip = std::atoll(env);
 #endif
+        long long expected_skip = -1;
+        g_draw_log_skip.compare_exchange_strong(expected_skip, skip);
         long expected = -1;
         g_draw_log_left.compare_exchange_strong(expected, n);
         left = g_draw_log_left.load(std::memory_order_relaxed);
     }
+    if (left > 0 && g_draw_log_skip.load(std::memory_order_relaxed) > 0 && g_draw_log_skip.fetch_sub(1) > 0) return;
     if (left <= 0 || g_draw_log_left.fetch_sub(1) <= 0) return;
     std::string colors;
     for (std::size_t i = 0; i < d.colors.size(); ++i) {
