@@ -4534,6 +4534,11 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
             for (UINT i = 0; i < desc_count; ++i) {
                 plain[i] = descs[i];
                 plain[i].Flags &= ~usage;
+                // A 16-bit packed format the device may not have at all (B4G4R4A4 needs VK_EXT_4444_formats):
+                // sized as another 16-bit colour format of the same shape.
+                if (plain[i].Format == DXGI_FORMAT_B4G4R4A4_UNORM || plain[i].Format == DXGI_FORMAT_B5G5R5A1_UNORM ||
+                    plain[i].Format == DXGI_FORMAT_B5G6R5_UNORM)
+                    plain[i].Format = DXGI_FORMAT_R16_UNORM;
             }
             const D3D12_RESOURCE_ALLOCATION_INFO retry = real->GetResourceAllocationInfo(mask, desc_count, plain.get());
             static std::atomic<int> logged{0};
