@@ -265,6 +265,7 @@ D3D12_RESOURCE_DESC g_seen_descs[4];  // the first descriptions the mock device'
 std::uint32_t g_seen_desc_count = 0;
 std::uint32_t g_seen_calls = 0;  // slot 25 calls since the test cleared it; only the first is recorded
 
+bool g_refuse_all = false;  // the mock PC device refuses every description (slots 25 and 68)
 std::uint64_t g_texture_size_bias = 0;  // added to each texture's answer: a driver that pads more than the console
 
 std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::uint64_t descs_word) {
@@ -286,7 +287,7 @@ std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) total += g_texture_size_bias;
     }
     auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(ret);
-    *out = {refused ? UINT64_MAX : total, 65536};
+    *out = {refused || g_refuse_all ? UINT64_MAX : total, 65536};
     return ret;
 }
 
@@ -361,7 +362,8 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                                           static_cast<std::uint32_t>(last.Flags);
                     }
                 }
-                if (ret) *ret = {0x40000, 0x10000};
+                if (ret) *ret = g_refuse_all ? D3D12_RESOURCE_ALLOCATION_INFO{UINT64_MAX, 0}
+                                             : D3D12_RESOURCE_ALLOCATION_INFO{0x40000, 0x10000};
                 if (info1 && count > 0) info1[0] = {0, 0x10000, 0x40000};
                 return a1;
             }
@@ -1317,8 +1319,11 @@ int check_placed_resource_x() {
     target.Height = 32;
     target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag);
+    target.Alignment = 0x1000;  // the 4 KiB a console-sized slot 108/25 answer let the title keep
     EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
     EXPECT(mock->calls[27] == 2 && g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    EXPECT(g_committed.desc.Alignment == 0);  // a committed texture's alignment is the PC device's to pick
+    target.Alignment = 0;
     EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
     EXPECT(g_committed.state == D3D12_RESOURCE_STATE_RENDER_TARGET && g_committed.clear == &clear);
     EXPECT(release(resource) == 0);
@@ -2220,6 +2225,19 @@ int check_texture_answers_108_56() {
     target.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     EXPECT(info2(&info, device, 1, 1, &target, &each) == &info);
     EXPECT(info.SizeInBytes != 0x384000);
+
+    // A PC device that refuses the 4 KiB try (its small-resource rule) does not stop the console answer, on slot 108
+    // and on slot 25, as slot 25 answered before the two shared it.
+    g_refuse_all = true;
+    narrow.Alignment = 0x1000;
+    EXPECT(info2(&info, device, 1, 1, &narrow, &each) == &info);
+    EXPECT(info.SizeInBytes == 0x4000 && info.Alignment == 0x1000 && each.SizeInBytes == 0x4000);
+    using Info25Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                              const D3D12_RESOURCE_DESC*);
+    EXPECT(reinterpret_cast<Info25Fn>(vtable[25])(&info, device, 0, 1, &narrow) == &info);
+    EXPECT(info.SizeInBytes == 0x4000 && info.Alignment == 0x1000);
+    g_refuse_all = false;
+    narrow.Alignment = 0;
 
     // Slot 56 (GetResourceAllocationInfo1, no title call measured) gives the same answer and places.
     const auto info1 = reinterpret_cast<InfoXFn>(vtable[56]);

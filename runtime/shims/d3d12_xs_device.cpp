@@ -4566,7 +4566,9 @@ void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12
 void apply_console_texture_answer(const D3D12_RESOURCE_DESC* title_descs, UINT count,
                                   D3D12_RESOURCE_ALLOCATION_INFO& info, D3D12_RESOURCE_ALLOCATION_INFO1* each,
                                   unsigned slot) {
-    if (!title_descs || !count || info.SizeInBytes == UINT64_MAX) return;
+    // Also over a PC refusal: the console answers a description the PC device refuses (a 4 KiB try the PC rule calls
+    // too large), as slot 25 did before slots 56/108 shared this.
+    if (!title_descs || !count) return;
     UINT64 size = 0, alignment = 0;
     if (!leonida::console_layout::console_texture_placement(title_descs, count, size, alignment, each)) return;
     if (size != info.SizeInBytes || alignment != info.Alignment) {
@@ -4642,7 +4644,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
             const D3D12_RESOURCE_DESC& d = descs[i];
             std::fprintf(stderr,
                          "[rt] d3d12_xs: slot 25 refused: dim %d align %llu %llux%ux%u mips %u format %d samples %u/%u "
-                         "layout 0x%x flags 0x%x (title flags 0x%x)\n",
+                         "layout 0x%x flags 0x%x (title layout 0x%x flags 0x%x)\n",
                          static_cast<int>(d.Dimension), static_cast<unsigned long long>(d.Alignment),
                          static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize, d.MipLevels,
                          static_cast<int>(d.Format), d.SampleDesc.Count, d.SampleDesc.Quality,
@@ -4689,7 +4691,8 @@ void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t
     }
     // Sampled textures from the title: the console's answer and places, as slot 25 gives (apply_console_texture_answer).
     // No measured call: no boot reached this slot (frontier7-1..3) and no call site goes through the title's device
-    // pointers; it follows slot 25 so the two cannot disagree.
+    // pointers. It follows slot 25 for the sampled-texture answer only; unlike 25 and 108 it still hands the PC device
+    // the title's descriptions uncleaned, so a console layout or flag word can make the PC part of its answer differ.
     if (call.console_abi) apply_console_texture_answer(descs, n, info, each, 56);
     return returned;
 }
