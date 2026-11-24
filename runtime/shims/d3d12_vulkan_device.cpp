@@ -2615,6 +2615,24 @@ public:
             buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
             gpu_va_ = buffer_va_;
         }
+        // A shader reaches the import at heap_base + (device address - heap_base), with a V# holding 48 bits and
+        // root views read as unsigned: an import the driver put below the arena (the RTX 3070 Laptop does) wraps to
+        // 0xffff..., which misses it (renderB-5: the composite's table V#s, base 0xfffd8e82de20). The arena shadow
+        // answers instead.
+        if (buffer_va_ && (buffer_va_ < device_.arena.address || ((buffer_va_ - device_.arena.address) >> 47))) {
+            log_once("a title-placed buffer imported below the GPU address arena is not reachable by a V#; using an "
+                     "arena shadow instead; size in KiB:",
+                     int(std::min<UINT64>(desc_.Width / 1024, INT_MAX)));
+            vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+            buffer_ = VK_NULL_HANDLE;
+            memory_ = VK_NULL_HANDLE;
+            memory_flags_ = 0;
+            mapped_ = nullptr;
+            host_import_ = false;
+            va_ = buffer_va_ = gpu_va_ = 0;
+            return E_NOTIMPL;
+        }
         device_.log_va("title-placed buffer", va_, desc_.Width);
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
