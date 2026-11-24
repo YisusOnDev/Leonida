@@ -33,6 +33,7 @@
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 #include "../src/title_va_alias.h"  // set_descriptor_source: title-written slots reach the layer heap
 #include "../src/console_texture_desc.h"  // slot 25: sampled textures at their console size
+#include "memory_describe_hook.h"         // slot 62: what a faulting copy's addresses are
 
 #ifdef LEONIDA_VULKAN_DEVICE
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
@@ -54,6 +55,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -2004,7 +2006,7 @@ struct ListProxy {
     // CopyMemoryToMemoryX calls (console slot 62) recorded since the last Reset: (destination, source, size), run on
     // the CPU each time the list is submitted (list_run_deferred), in record order.
     std::mutex deferred_mutex;
-    std::vector<std::array<std::uint64_t, 3>> deferred_copies;
+    std::vector<std::array<std::uint64_t, 4>> deferred_copies;  // (destination, source, size, recording caller)
 
     void pin_cursor_at_limit() {
         const std::uint64_t at_limit = static_cast<std::uint64_t>(
@@ -2151,34 +2153,80 @@ unsigned detect_list_slot_count(IUnknown* real) {
 // the list is submitted (queue ExecuteCommandLists, before the real lists go to the GPU), as VIctory does; on the
 // console it runs when the GPU reaches it in the list. The copy runs under __try: physical pages mapped into a window are committed on first touch by the xmem shim's
 // exception handler (which runs before this frame's handler), and a range nobody can touch is skipped and counted.
-bool guarded_memmove(void* destination, const void* source, size_t size) {
+// The access that faulted, when one did: [0] read (0) / write (1), [1] the address.
+struct CopyFault {
+    ULONG_PTR kind = 0, address = 0;
+};
+
+int copy_fault_filter(EXCEPTION_POINTERS* info, CopyFault& fault) {
+    const EXCEPTION_RECORD* record = info ? info->ExceptionRecord : nullptr;
+    if (!record || record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    if (record->NumberParameters >= 2) fault = {record->ExceptionInformation[0], record->ExceptionInformation[1]};
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+bool guarded_memmove(void* destination, const void* source, size_t size, CopyFault& fault) {
     __try {
         std::memmove(destination, source, size);
         return true;
-    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
-                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+    } __except (copy_fault_filter(GetExceptionInformation(), fault)) {
         return false;
     }
 }
 
-void list_copy_memory(std::uint64_t destination, std::uint64_t source, std::uint64_t size) {
+// module+RVA of a code address (a title call site), or the bare address outside every module.
+std::string code_address_text(std::uint64_t address) {
+    char text[MAX_PATH + 32];
+    if (rt::memory_describe::code_address(reinterpret_cast<const void*>(address), text, sizeof(text))) return text;
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(address), &module) && module) {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(module, path, MAX_PATH);
+        const char* name = std::strrchr(path, '\\');
+        std::snprintf(text, sizeof(text), "%s+0x%llx", name ? name + 1 : path,
+                      static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)));
+    } else {
+        std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+    }
+    return text;
+}
+
+// rt::memory_describe's account of an address (the physical-page window, what is mapped there, its last map or
+// unmap), or "" when xmem has none to give.
+std::string describe_title_address(std::uint64_t address) {
+    char text[512];
+    rt::memory_describe::describe(reinterpret_cast<const void*>(address), text, sizeof(text));
+    return text;
+}
+
+void list_copy_memory(std::uint64_t destination, std::uint64_t source, std::uint64_t size, std::uint64_t caller) {
     static std::atomic<std::uint64_t> copied{0}, skipped{0};
     static std::atomic<int> logged{0};
+    CopyFault fault;
     const bool ok = destination && source && size && size < (std::uint64_t{1} << 32) &&
                     guarded_memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source),
-                                    static_cast<size_t>(size));
+                                    static_cast<size_t>(size), fault);
     if (ok) {
         copied.fetch_add(1, std::memory_order_relaxed);
     } else {
         skipped.fetch_add(1, std::memory_order_relaxed);
     }
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || (!ok && skipped.load() <= 16))
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || (!ok && skipped.load() <= 16)) {
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: CopyMemoryToMemoryX 0x%llx <- 0x%llx, 0x%llx bytes: %s (copied %llu, skipped "
-                     "%llu)\n",
+                     "[rt] d3d12_xs: CopyMemoryToMemoryX 0x%llx <- 0x%llx, 0x%llx bytes (recorded by %s): %s (copied "
+                     "%llu, skipped %llu)\n",
                      static_cast<unsigned long long>(destination), static_cast<unsigned long long>(source),
-                     static_cast<unsigned long long>(size), ok ? "copied on the CPU" : "skipped (access violation)",
+                     static_cast<unsigned long long>(size), code_address_text(caller).c_str(),
+                     ok ? "copied on the CPU" : "skipped (access violation)",
                      static_cast<unsigned long long>(copied.load()), static_cast<unsigned long long>(skipped.load()));
+        if (!ok && fault.address)  // which side faulted, and what each address is now
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: CopyMemoryToMemoryX fault: %s of 0x%llx; source: %s; destination: %s\n",
+                         fault.kind == 1 ? "write" : fault.kind == 8 ? "execute" : "read",
+                         static_cast<unsigned long long>(fault.address), describe_title_address(source).c_str(),
+                         describe_title_address(destination).c_str());
+    }
 }
 
 template <unsigned Slot>
@@ -2211,8 +2259,14 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if constexpr (Slot == kConsoleAllocateUpload) {
                 return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
             } else if constexpr (Slot == kConsoleCopyMemoryToMemory) {
+                const std::uint64_t caller = reinterpret_cast<std::uint64_t>(_ReturnAddress());
+                static std::atomic<int> recorded_logged{0};
+                if (recorded_logged.fetch_add(1, std::memory_order_relaxed) < 4)  // what the source is when recorded
+                    std::fprintf(stderr, "[rt] d3d12_xs: CopyMemoryToMemoryX recorded by %s: source 0x%llx: %s\n",
+                                 code_address_text(caller).c_str(), static_cast<unsigned long long>(a2),
+                                 describe_title_address(a2).c_str());
                 const std::lock_guard lock(self->deferred_mutex);
-                self->deferred_copies.push_back({a1, a2, a3});
+                self->deferred_copies.push_back({a1, a2, a3, caller});
                 return 0;
             }
             return 0;  // unmodelled console slot: recorded above, never a PC call
@@ -2385,7 +2439,7 @@ void list_run_deferred(const void* object) {
     if (!is_list_proxy_impl(object)) return;
     auto* list = const_cast<ListProxy*>(static_cast<const ListProxy*>(object));
     const std::lock_guard lock(list->deferred_mutex);
-    for (const auto& c : list->deferred_copies) list_copy_memory(c[0], c[1], c[2]);
+    for (const auto& c : list->deferred_copies) list_copy_memory(c[0], c[1], c[2], c[3]);
 }
 
 IUnknown* list_real_or_null(const void* object) {
@@ -3769,6 +3823,9 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
         without_refused_combinations(pc_desc.Dimension, xbox_flags & kPcResourceFlagsMask));
+    // A committed texture's alignment is the PC device's to pick (the 4 KiB the title keeps from its console-sized
+    // slot 108/25 answer is refused by a PC device for a texture that is not small by its rule; see slot 133).
+    if (pc_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) pc_desc.Alignment = 0;
 
     static std::atomic<bool> logged{false};
     if (first_call(logged))
@@ -3963,6 +4020,10 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
         without_refused_combinations(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // A texture is made committed, so its placement alignment is the PC device's to pick. The title keeps the 4 KiB
+    // its slot 108/25 query was granted at its console size (+0xABFD8E, kept when the answer's alignment is 0x1000),
+    // which a PC device refuses for a texture that is not small by its own rule.
+    if (!buffer) pc_desc.Alignment = 0;
     if (!buffer) initial_state = pc_initial_layout(static_cast<std::uint32_t>(pc_desc.Flags), initial_state);
     const bool clearable =
         !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
@@ -4136,6 +4197,13 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
 // stride (sizeof(D3D12_RESOURCE_DESC)), each entry is expanded into a zeroed D3D12_RESOURCE_DESC1 with
 // SamplerFeedbackMipRegion cleared, and Xbox layout words (e.g. 0x101, 0x105) and console flag bits above the PC
 // D3D12_RESOURCE_FLAGS are normalized on the copy before the PC call.
+void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12_RESOURCE_ALLOCATION_INFO& info,
+                             D3D12_RESOURCE_ALLOCATION_INFO1* each,
+                             const std::function<D3D12_RESOURCE_ALLOCATION_INFO(UINT)>& pc_one, unsigned slot);
+void apply_console_texture_answer(const D3D12_RESOURCE_DESC* title_descs, UINT count,
+                                  D3D12_RESOURCE_ALLOCATION_INFO& info, D3D12_RESOURCE_ALLOCATION_INFO1* each,
+                                  unsigned slot);
+
 std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2,
                                                   std::uint64_t a3, std::uint64_t a4, std::uint64_t a5) {
     note_slot(108);
@@ -4190,10 +4258,41 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         descs_to_pass = cleaned.data();
     }
 
+    // The per-resource array is optional; the console answers below need the PC device's per-resource answers, so
+    // without one they go to a local array (as slot 56 does).
+    std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> local_info1;
+    if (!info1 && descs_to_pass) {
+        try {
+            local_info1.resize(count);
+            info1 = local_info1.data();
+        } catch (const std::bad_alloc&) {
+            info1 = nullptr;
+        }
+    }
     using Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
         ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
         D3D12_RESOURCE_ALLOCATION_INFO1*);
     reinterpret_cast<Fn>(proxy->real_vtable[68])(proxy->real, ret, visible_mask, count, descs_to_pass, info1);
+    // The console sizes, as slot 25 answers them: render targets as console tiles (apply_console_placement, on the
+    // cleaned descriptions), and, for the title's own calls, sampled textures at their console layout. Measured: the
+    // title's texture creation (+0x193E1DA through the wrapper +0xABFAE0) allocates the texture's memory by this
+    // answer's size and alignment, places the texture there, and DirectStorage then writes the console-sized data
+    // into it; a PC size smaller than the console layout would let that data run into the next allocation.
+    if (descs_to_pass && info1) {
+        std::vector<D3D12_RESOURCE_DESC> plain;
+        try {
+            plain.resize(count);
+        } catch (const std::bad_alloc&) {
+            plain.clear();
+        }
+        if (!plain.empty()) {
+            for (UINT i = 0; i < count; ++i) std::memcpy(&plain[i], &cleaned[i], sizeof(D3D12_RESOURCE_DESC));
+            apply_console_placement(plain.data(), count, *ret, info1, [&](UINT i) {
+                return D3D12_RESOURCE_ALLOCATION_INFO{info1[i].SizeInBytes, info1[i].Alignment};
+            }, 108);
+        }
+        if (proxy != self) apply_console_texture_answer(raw_descs, count, *ret, info1, 108);  // the C-ABI form
+    }
     // The retail title asserts on a refusal (game_scarlett_master.exe+0xabfe1b, after a 4 KiB then a default
     // alignment try): name the first refused descriptions as the console sent them. A refused 4 KiB try is expected
     // (the title then asks again with the default alignment), so a single-description 4 KiB query is not logged.
@@ -4457,6 +4556,48 @@ void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12
     if (console.SizeInBytes >= info.SizeInBytes) info = console;
 }
 
+// Sampled textures from the title (the C-ABI form of slots 25, 56 and 108): the console's answer, its layout's size at
+// its alignment (4 KiB for the 4 KiB modes), smaller or larger than the PC's, and every description's place in `each`
+// when given (src/console_texture_desc.h). The title pages its archive reads by slot 25's size (a PC-sized 128x4 4KB_S
+// class read 0x1000 bytes of a 0x4000-byte chunk and asserted at +0x4ffd879) and allocates a texture's own memory by
+// slot 108's (+0x193E1DA, through the wrapper +0xABFAE0, then places the texture there with slot 133 or 127). Computed
+// from the title's own descriptions: the cleaned copies have lost the Layout field that names the swizzle mode.
+// Logged once per distinct first description (up to 256 of them) whose answer changed.
+void apply_console_texture_answer(const D3D12_RESOURCE_DESC* title_descs, UINT count,
+                                  D3D12_RESOURCE_ALLOCATION_INFO& info, D3D12_RESOURCE_ALLOCATION_INFO1* each,
+                                  unsigned slot) {
+    if (!title_descs || !count || info.SizeInBytes == UINT64_MAX) return;
+    UINT64 size = 0, alignment = 0;
+    if (!leonida::console_layout::console_texture_placement(title_descs, count, size, alignment, each)) return;
+    if (size != info.SizeInBytes || alignment != info.Alignment) {
+        static std::mutex log_mutex;
+        static std::vector<std::pair<unsigned, D3D12_RESOURCE_DESC>> seen;
+        bool first_time = false;
+        {
+            std::lock_guard lock(log_mutex);
+            const bool known = std::any_of(seen.begin(), seen.end(), [&](const auto& s) {
+                return s.first == slot && std::memcmp(&s.second, &title_descs[0], sizeof(s.second)) == 0;
+            });
+            if (!known && seen.size() < 256) {
+                seen.emplace_back(slot, title_descs[0]);
+                first_time = true;
+            }
+        }
+        if (first_time)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot %u: console size 0x%llx align 0x%llx for PC 0x%llx align 0x%llx: "
+                         "%llux%ux%u mips %u format %d layout 0x%x align asked 0x%llx (%u description(s))\n",
+                         slot, static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment),
+                         static_cast<unsigned long long>(info.SizeInBytes),
+                         static_cast<unsigned long long>(info.Alignment),
+                         static_cast<unsigned long long>(title_descs[0].Width), title_descs[0].Height,
+                         title_descs[0].DepthOrArraySize, title_descs[0].MipLevels,
+                         static_cast<int>(title_descs[0].Format), static_cast<unsigned>(title_descs[0].Layout),
+                         static_cast<unsigned long long>(title_descs[0].Alignment), static_cast<unsigned>(count));
+    }
+    info = {size, alignment};
+}
+
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
@@ -4491,41 +4632,8 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
-    // Sampled textures from the title: the console's answer, its layout's size at its alignment (4 KiB for the 4 KiB
-    // modes), smaller or larger than the PC's. The title pages its archive reads by it (src/console_texture_desc.h:
-    // a PC-sized 128x4 4KB_S class read 0x1000 bytes of a 0x4000-byte chunk and asserted at +0x4ffd879). Computed from
-    // the title's own descriptions: the cleaned copies have lost the Layout field that names the swizzle mode.
-    if (call.console_abi && title_descs) {
-        UINT64 size = 0, alignment = 0;
-        if (leonida::console_layout::console_texture_placement(title_descs, desc_count, size, alignment)) {
-            // Logged once per distinct first description (up to 256 of them) where the answer changed.
-            static std::mutex log_mutex;
-            static std::vector<D3D12_RESOURCE_DESC> seen;
-            bool first_time = false;
-            if (size != info.SizeInBytes || alignment != info.Alignment) {
-                std::lock_guard lock(log_mutex);
-                const bool known = std::any_of(seen.begin(), seen.end(), [&](const D3D12_RESOURCE_DESC& s) {
-                    return std::memcmp(&s, &title_descs[0], sizeof(s)) == 0;
-                });
-                if (!known && seen.size() < 256) {
-                    seen.push_back(title_descs[0]);
-                    first_time = true;
-                }
-            }
-            if (first_time)
-                std::fprintf(stderr,
-                             "[rt] d3d12_xs: slot 25: console size 0x%llx align 0x%llx for PC 0x%llx align 0x%llx: "
-                             "%llux%ux%u mips %u format %d layout 0x%x align asked 0x%llx (%u description(s))\n",
-                             static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment),
-                             static_cast<unsigned long long>(info.SizeInBytes),
-                             static_cast<unsigned long long>(info.Alignment),
-                             static_cast<unsigned long long>(title_descs[0].Width), title_descs[0].Height,
-                             title_descs[0].DepthOrArraySize, title_descs[0].MipLevels,
-                             static_cast<int>(title_descs[0].Format), static_cast<unsigned>(title_descs[0].Layout),
-                             static_cast<unsigned long long>(title_descs[0].Alignment), static_cast<unsigned>(desc_count));
-            info = {size, alignment};
-        }
-    }
+    // Sampled textures from the title: the console's answer (apply_console_texture_answer).
+    if (call.console_abi) apply_console_texture_answer(title_descs, desc_count, info, nullptr, 25);
     // The retail title asserts (int3) when the upper half of the size is set, which is what the refusal (UINT64_MAX)
     // looks like to it: name the refused descriptions, a few of them.
     static std::atomic<int> refused_logged{0};
@@ -4573,12 +4681,16 @@ void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t
     }
     void* const returned = reinterpret_cast<Fn>(self->real_vtable[56])(
         self->real, call.ret, static_cast<UINT>(visible_mask), n, descs, each);
+    auto& info = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
     if (each) {
-        auto& info = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
         apply_console_placement(descs, n, info, each, [&](UINT i) {
             return D3D12_RESOURCE_ALLOCATION_INFO{each[i].SizeInBytes, each[i].Alignment};
         }, 56);
     }
+    // Sampled textures from the title: the console's answer and places, as slot 25 gives (apply_console_texture_answer).
+    // No measured call: no boot reached this slot (frontier7-1..3) and no call site goes through the title's device
+    // pointers; it follows slot 25 so the two cannot disagree.
+    if (call.console_abi) apply_console_texture_answer(descs, n, info, each, 56);
     return returned;
 }
 

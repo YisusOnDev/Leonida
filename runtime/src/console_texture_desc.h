@@ -83,8 +83,11 @@ inline bool console_allocation(const D3D12_RESOURCE_DESC& d, uint64_t& size, uin
 // class builder rounds the size up to the alignment and looks for a 64 KiB slab count it divides (+0x51FB926), which a
 // 256-byte alignment (the 256-byte modes) would turn into a multiple of the size. The size is not rounded to the
 // floor: the title's page count comes from it. False when any description is something else or has no console layout.
+//
+// `each`, when not null, receives every description's place (offset, alignment, size: GetResourceAllocationInfo1/2's
+// per-resource array, slots 56 and 108), written only when the whole list has a console answer.
 inline bool console_texture_placement(const D3D12_RESOURCE_DESC* descs, uint32_t count, uint64_t& size,
-                                      uint64_t& alignment) {
+                                      uint64_t& alignment, D3D12_RESOURCE_ALLOCATION_INFO1* each = nullptr) {
     if (!descs || !count) return false;
     uint64_t total = 0, largest = 0;
     bool floor = false;
@@ -97,6 +100,16 @@ inline bool console_texture_placement(const D3D12_RESOURCE_DESC* descs, uint32_t
         if (offset < total || offset > UINT64_MAX - one) return false;
         total = offset + one;
         largest = std::max(largest, a);
+    }
+    if (each) {  // a second pass, so a refused list leaves the caller's array as it was
+        uint64_t at = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint64_t one = 0, a = 0;
+            console_allocation(descs[i], one, a);
+            const uint64_t offset = (at + a - 1) / a * a;
+            each[i] = {offset, a, one};
+            at = offset + one;
+        }
     }
     size = total;
     alignment = floor ? std::max<uint64_t>(largest, 64 * 1024) : largest;
