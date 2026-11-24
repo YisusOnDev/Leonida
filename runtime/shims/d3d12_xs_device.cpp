@@ -1835,6 +1835,10 @@ constexpr unsigned kConsoleClearUavFloat = 54;
 constexpr unsigned kConsoleReset = 139;
 constexpr unsigned kConsoleBarrier = 146;
 constexpr unsigned kConsoleAllocateUpload = 148;
+// CopyMemoryToMemoryX(destination, source, size, flags) in the newer layout (older slot 60, +2 from ExecuteIndirect on).
+// Identified from VIctory's list table (crates/victory-gpu/src/list.rs, GPL-3, read for the slot only) and the retail
+// title's first call: two title addresses, 0x1000 bytes, a flags word whose low half is 0.
+constexpr unsigned kConsoleCopyMemoryToMemory = 62;
 
 constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot <= 26) return slot;               // PC order, measured
@@ -1981,6 +1985,50 @@ unsigned detect_list_slot_count(IUnknown* real) {
     return 60;
 }
 
+// Console list slot 62, CopyMemoryToMemoryX(destination, source, size, flags): a GPU copy between two title
+// addresses (memory is unified on the console). Shortcut: done on the CPU when the list records it, not when the GPU
+// reaches it in the list, so it sees the source as it is at record time (VIctory defers the same copy to submission).
+// Both ranges must be committed and writable/readable; anything else is skipped and counted.
+bool range_committed(std::uint64_t address, std::uint64_t size, bool write) {
+    std::uint64_t at = address;
+    const std::uint64_t end = address + size;
+    if (end < address) return false;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        const DWORD p = info.Protect & 0xFF;
+        const bool readable = p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+                              p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+        const bool writable = p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE ||
+                              p == PAGE_EXECUTE_WRITECOPY;
+        if (!(write ? writable : readable) || (info.Protect & PAGE_GUARD)) return false;
+        at = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+    }
+    return true;
+}
+
+void list_copy_memory(std::uint64_t destination, std::uint64_t source, std::uint64_t size) {
+    static std::atomic<std::uint64_t> copied{0}, skipped{0};
+    static std::atomic<int> logged{0};
+    const bool ok = destination && source && size && size < (std::uint64_t{1} << 32) &&
+                    range_committed(source, size, false) && range_committed(destination, size, true);
+    if (ok) {
+        std::memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source),
+                     static_cast<size_t>(size));
+        copied.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || (!ok && skipped.load() <= 16))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: CopyMemoryToMemoryX 0x%llx <- 0x%llx, 0x%llx bytes: %s (copied %llu, skipped "
+                     "%llu)\n",
+                     static_cast<unsigned long long>(destination), static_cast<unsigned long long>(source),
+                     static_cast<unsigned long long>(size), ok ? "copied on the CPU" : "skipped (not committed)",
+                     static_cast<unsigned long long>(copied.load()), static_cast<unsigned long long>(skipped.load()));
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2010,6 +2058,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         if constexpr (pc == kListNotForwarded) {
             if constexpr (Slot == kConsoleAllocateUpload) {
                 return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
+            } else if constexpr (Slot == kConsoleCopyMemoryToMemory) {
+                list_copy_memory(a1, a2, a3);
+                return 0;
             }
             return 0;  // unmodelled console slot: recorded above, never a PC call
         } else {

@@ -28,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <new>
 #include <set>
@@ -223,6 +224,11 @@ void count_error() {
 // asking, or asks and never sees an entry run.
 struct Heartbeat {
     std::atomic<uint64_t> enqueued[4]{}, done[4]{}, waited{0}, failed{0}, bytes{0}, unsubmitted_calls{0};
+    // Requests refused as not implemented, by kind: BCPack mode (index 1-7), swizzle mode (1-4), physical-page source.
+    std::atomic<uint64_t> bcpack[8]{}, swizzle[5]{}, source_pages{0}, bcpack_decoded{0};
+    // Failed entries by HRESULT.
+    std::mutex codes_mutex;
+    std::map<uint32_t, uint64_t> codes;
 };
 Heartbeat& heartbeat() {
     static auto* h = new Heartbeat;
@@ -247,6 +253,23 @@ void start_heartbeat() {
                              (unsigned long long)now[3], (unsigned long long)now[4], (unsigned long long)now[5],
                              (unsigned long long)now[6], (unsigned long long)now[7], (unsigned long long)now[8],
                              (unsigned long long)now[9], (unsigned long long)(h.bytes.load() >> 20));
+                std::string kinds;
+                for (int m = 1; m < 8; ++m)
+                    if (const uint64_t n = h.bcpack[m]) kinds += " bcpack" + std::to_string(m) + "=" + std::to_string(n);
+                for (int m = 1; m < 5; ++m)
+                    if (const uint64_t n = h.swizzle[m]) kinds += " swizzle" + std::to_string(m) + "=" + std::to_string(n);
+                if (const uint64_t n = h.source_pages) kinds += " source-pages=" + std::to_string(n);
+                if (const uint64_t n = h.bcpack_decoded) kinds += " (bcpack decoded=" + std::to_string(n) + ")";
+                {
+                    std::lock_guard lock(h.codes_mutex);
+                    for (const auto& [code, n] : h.codes) {
+                        char text[48];
+                        std::snprintf(text, sizeof(text), " 0x%08lx=%llu", static_cast<unsigned long>(code),
+                                      static_cast<unsigned long long>(n));
+                        kinds += text;
+                    }
+                }
+                if (!kinds.empty()) std::fprintf(stderr, "[rt] dstorage: failure kinds so far:%s\n", kinds.c_str());
             }
         }).detach();
     });
@@ -808,11 +831,33 @@ private:
         }
         if (FAILED(hr)) {
             heartbeat().failed++;
+            {
+                Heartbeat& h = heartbeat();
+                std::lock_guard lock(h.codes_mutex);
+                h.codes[static_cast<uint32_t>(hr)]++;
+            }
             DSTORAGE_ERROR_FIRST_FAILURE f{};
             f.HResult = hr;
             describe(e, f);
             record_failure(f);
         }
+    }
+
+    // The first 32 requests refused as not implemented, one line each (what a later stage needs to know of them).
+    static void log_unimplemented(const Entry& e) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) >= 32) return;
+        const DSTORAGE_REQUEST& r = e.request;
+        char name[48]{};
+        if (r.Name)
+            for (size_t i = 0; i + 1 < sizeof(name) && r.Name[i]; ++i) name[i] = r.Name[i];
+        std::fprintf(stderr,
+                     "[rt] dstorage: not implemented: options 0x%llx (zlib %d bcpack %u swizzle %u dst-pages %d) "
+                     "source %llu dest %u intermediate %u offset 0x%llx name '%s'\n",
+                     (unsigned long long)r.Options.AsUINT64, options::zlib(r.Options.AsUINT64) ? 1 : 0,
+                     (unsigned)options::bcpack(r.Options.AsUINT64), (unsigned)options::swizzle(r.Options.AsUINT64),
+                     (r.Options.AsUINT64 & options::kDestinationPages) ? 1 : 0, (unsigned long long)r.SourceSize,
+                     (unsigned)r.DestinationSize, (unsigned)r.IntermediateSize, (unsigned long long)r.FileOffset, name);
     }
 
     HRESULT execute_request(const Entry& e) {
@@ -824,10 +869,15 @@ private:
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
         if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
             log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+            if (options::bcpack(o) != 0) heartbeat().bcpack[options::bcpack(o)]++;
+            if (options::swizzle(o) != 0) heartbeat().swizzle[options::swizzle(o)]++;
+            log_unimplemented(e);
             return E_NOTIMPL;
         }
         if (o & options::kSourcePages) {
             log_once("pages", "requests whose source is physical pages are not implemented yet (E_NOTIMPL)");
+            heartbeat().source_pages++;
+            log_unimplemented(e);
             return E_NOTIMPL;
         }
         const bool pages = (o & options::kDestinationPages) != 0;
