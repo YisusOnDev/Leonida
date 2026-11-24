@@ -1610,7 +1610,20 @@ The copies:
 - Any **other address in the title's memory** gets a window: the 64 KiB-aligned pages it covers, clipped to the
   title's range, copied into the arena now and before every submission, through the same shadow refresh as slot 133
   (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
-  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default).
+  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). Windows into a slot-133 import the driver put below the arena have
+  their own budget, `LEONIDA_LOW_IMPORT_WINDOWS_MB` (256 MiB by default). Before this split they could starve the
+  vertex and index views: on renderB-8, the RTX 3070 Laptop with a 174 MiB import, 165 lists were refused with
+  "unknown resource".
+- A window is copied before a submission only while something names it: a root view resolved to it, a vertex or index
+  view replayed from it, or a table V# the scan finds already pointing at it. After 120 submissions with no such
+  lookup it is **retired**: it keeps its arena range and alias and is no longer copied. A V# rewritten in place may
+  still hold its address, so the range is never reused. The next lookup copies it again before use.
+  - Gap: a command list recorded once and executed again without any lookup reads a retired window stale.
+  - Reference: VIctory `crates/victory-gpu/src/shadow.rs` (GPL-3). It brings up to date only the ranges each
+    submission reads, and copies only the pages the title wrote, tracked by write watching. Only the idea is used
+    here; no code is taken.
+  - Finding: write watching is not done here. xmem forwards `MEM_WRITE_WATCH` only when the title asks for it, and a
+    reset would also clear the title's own `XMemGetWriteWatch` bits.
 - **Only the title's memory** gets a copy: the blocks and ranges the xmem shims hand the title (`XMemAlloc`,
   `XMemAllocDefault`, `XMemVirtualAlloc`, the title's `VirtualAlloc`). An address anywhere else, the runtime's or a
   host DLL's memory included, is left as it was and counted, as is an arena VA or a buffer the layer made.
