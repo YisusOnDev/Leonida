@@ -1205,6 +1205,8 @@ BOOL WINAPI get_file_attributes_ex_a(LPCSTR name, GET_FILEEX_INFO_LEVELS level, 
 }
 
 HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
+    static const bool io_log = std::getenv("LEONIDA_IO_LOG") != nullptr;
+    if (io_log && pattern) std::fprintf(stderr, "[rt] io-log: FindFirstFileW %ls\n", pattern);
     if (!pattern || !data) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
@@ -1239,6 +1241,8 @@ HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
 
 HANDLE WINAPI find_first_file_ex_w(LPCWSTR pattern, FINDEX_INFO_LEVELS info_level, LPVOID data,
                                    FINDEX_SEARCH_OPS search_op, LPVOID search_filter, DWORD additional_flags) {
+    static const bool io_log = std::getenv("LEONIDA_IO_LOG") != nullptr;
+    if (io_log && pattern) std::fprintf(stderr, "[rt] io-log: FindFirstFileExW %ls\n", pattern);
     if (!pattern || !data) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;

@@ -3280,7 +3280,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline)
                     return refuse("the device lacks pipeline binding or push constants");
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
-                if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+                if (!pipeline) return ReplayResult::unresolved_resource;
+                if (!pipeline->pipeline) {  // still compiling (see Dispatch below): left out alone
+                    p.skip = true;
+                    return ReplayResult::success;
+                }
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets)
                     return refuse("the pipeline's bindless set needs vkCmdBindDescriptorSets");
                 p.pipeline = *pipeline;
@@ -3369,7 +3373,18 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
                 return refuse("the device lacks pipeline binding, push constants or dispatch");
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
-            if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+            if (!pipeline) return ReplayResult::unresolved_resource;
+            if (!pipeline->pipeline) {
+                // Registered but not compiled yet (LEONIDA_LAZY_PSO compiles compute pipelines on a worker): this
+                // dispatch alone is left out, and counted, instead of the whole list.
+                static std::atomic<std::uint64_t> pending{0};
+                const std::uint64_t n = ++pending;
+                if ((n & (n - 1)) == 0)
+                    std::fprintf(stderr, "[rt] d3d12: %llu dispatch(es) skipped: compute pipeline still compiling\n",
+                                 static_cast<unsigned long long>(n));
+                p.skip = true;
+                return ReplayResult::success;
+            }
             if (pipeline->bindless_set && !vk.bind_descriptor_sets)
                 return refuse("the pipeline's bindless set needs vkCmdBindDescriptorSets");
             p.pipeline = *pipeline;

@@ -48,6 +48,10 @@
 #include <cctype>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -4046,6 +4050,16 @@ public:
     ~PipelineState() override {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
+        if (compute_job_) {  // a deferred compile: cancel it if queued, wait for it if running
+            std::unique_lock lock(compute_job_->mutex);
+            if (compute_job_->state == ComputeCompileJob::queued) compute_job_->state = ComputeCompileJob::cancelled;
+            compute_job_->cv.wait(lock, [this] {
+                return compute_job_->state == ComputeCompileJob::done ||
+                       compute_job_->state == ComputeCompileJob::cancelled;
+            });
+            pipeline_.pipeline = compute_job_->result;
+            compute_job_->owner_gone = true;
+        }
         if (registered_) device_.context->remove_pipeline(id());
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
@@ -4118,6 +4132,13 @@ public:
     }
 
     bool compute() const { return registered_ && !is_graphics_; }
+    // A compute PSO whose Vulkan pipeline exists (LEONIDA_LAZY_PSO compiles it on a worker; false until then).
+    bool compute_compiled() const {
+        if (!compute()) return false;
+        if (!compute_job_) return pipeline_.pipeline != VK_NULL_HANDLE;
+        std::lock_guard lock(compute_job_->mutex);
+        return compute_job_->result != VK_NULL_HANDLE;
+    }
     bool graphics() const { return registered_ && is_graphics_; }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
 
@@ -4958,21 +4979,6 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        const ULONGLONG compile_start = GetTickCount64();
-        const VkResult created =
-            vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline);
-        // One line per compile over 2 s, named by its program's hash: on a cold cache a single translated module can
-        // hold the driver for minutes (the threshold for LEONIDA_STUB_COMPUTE_WORDS is read off these lines).
-        if (const ULONGLONG ms = GetTickCount64() - compile_start; ms > 2000)
-            std::fprintf(stderr, "[rt] d3d12: slow compute pipeline compile: %llu ms, %zu SPIR-V words, program "
-                                 "sha256 %s, VkResult %d\n", ms, words.size(),
-                         leonida::sha256_hex(program.bytes).c_str(), int(created));
-        if (created != VK_SUCCESS) {
-            if (created == VK_ERROR_DEVICE_LOST)
-                device_.context->mark_device_lost("PipelineState::create_compute (vkCreateComputePipelines)", created);
-            return E_FAIL;
-        }
-
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
         const std::vector<std::uint8_t>& code = program.bytes;
@@ -4982,9 +4988,132 @@ public:
         code_bytes_ = code.size();
         code_base_ = offset;
         pipeline_.code_base = offset;
-        device_.context->add_pipeline(id(), pipeline_);
+
+        // LEONIDA_LAZY_PSO=1 also defers the compute compile: the PSO is registered at once without a Vulkan pipeline
+        // (a dispatch with it is skipped and counted, vulkan_replay.h) and the driver compiles it on a worker
+        // (compute_compile_pool), which registers the pipeline when it is done. On a cold cache the largest
+        // translated modules take minutes each (render4-1: 7 modules of ~1M SPIR-V words, 190-326 s), and the
+        // title's loading waited behind them.
+        const bool lazy_pso = GetEnvironmentVariableW(L"LEONIDA_LAZY_PSO", nullptr, 0) != 0;  // read per call
+        auto job = std::make_shared<ComputeCompileJob>();
+        job->info = pipeline_info;
+        job->required_size = required_size;
+        if (job->info.stage.pNext == &required_size) job->info.stage.pNext = &job->required_size;
+        job->words = words.size();
+        job->program_hash = leonida::sha256_hex(program.bytes);
+        job->base = pipeline_;
+        job->id = id();
+        if (!lazy_pso) {
+            if (!run_compute_compile(device_, *job, false)) return E_FAIL;
+            pipeline_.pipeline = job->result;
+            device_.context->add_pipeline(id(), pipeline_);
+            registered_ = true;
+            return S_OK;
+        }
+        device_.context->add_pipeline(id(), pipeline_);  // pending: no VkPipeline yet
         registered_ = true;
+        compute_job_ = job;
+        DeviceState* device = &device_;
+        compute_compile_pool().submit([device, job] {
+            {
+                std::lock_guard lock(job->mutex);
+                if (job->state == ComputeCompileJob::cancelled) return;
+                job->state = ComputeCompileJob::running;
+            }
+            run_compute_compile(*device, *job, true);
+            std::lock_guard lock(job->mutex);
+            job->state = ComputeCompileJob::done;
+            job->cv.notify_all();
+        });
         return S_OK;
+    }
+
+    // One deferred compute compile. `result` is the pipeline, or null when the compile failed.
+    struct ComputeCompileJob {
+        enum State { queued, running, done, cancelled };
+        VkComputePipelineCreateInfo info{};
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+        std::size_t words = 0;
+        std::string program_hash;
+        leonida::ComputePipeline base;
+        std::uintptr_t id = 0;
+        VkPipeline result = VK_NULL_HANDLE;
+        std::mutex mutex;
+        std::condition_variable cv;
+        State state = queued;
+        bool owner_gone = false;  // the PSO was released while this ran: the worker destroys the pipeline
+    };
+
+    // A few workers for the deferred compute compiles (the driver compiles one pipeline per call; several run at once).
+    class ComputeCompilePool {
+    public:
+        ComputeCompilePool() {
+            const unsigned n = std::max(2u, std::thread::hardware_concurrency() / 2);
+            for (unsigned i = 0; i < n; ++i) std::thread([this] { run(); }).detach();
+        }
+        void submit(std::function<void()> task) {
+            {
+                std::lock_guard lock(mutex_);
+                tasks_.push_back(std::move(task));
+            }
+            cv_.notify_one();
+        }
+
+    private:
+        void run() {
+            for (;;) {
+                std::function<void()> task;
+                {
+                    std::unique_lock lock(mutex_);
+                    cv_.wait(lock, [this] { return !tasks_.empty(); });
+                    task = std::move(tasks_.front());
+                    tasks_.pop_front();
+                }
+                task();
+            }
+        }
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        std::deque<std::function<void()>> tasks_;
+    };
+    static ComputeCompilePool& compute_compile_pool() {
+        static auto* pool = new ComputeCompilePool();  // process lifetime: its threads are detached
+        return *pool;
+    }
+
+    // Compiles a job's pipeline; `deferred`: on a worker, which registers it with the device context unless the PSO
+    // is gone. Returns whether a pipeline was made.
+    static bool run_compute_compile(DeviceState& device, ComputeCompileJob& job, bool deferred) {
+        auto& vk = device.context->vk;
+        const ULONGLONG compile_start = GetTickCount64();
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        const VkResult created =
+            vk.vkCreateComputePipelines(device.info.device, device.pipeline_cache(), 1, &job.info, nullptr, &pipeline);
+        // One line per compile over 2 s, named by its program's hash: on a cold cache a single translated module can
+        // hold the driver for minutes.
+        if (const ULONGLONG ms = GetTickCount64() - compile_start; ms > 2000)
+            std::fprintf(stderr, "[rt] d3d12: slow compute pipeline compile%s: %llu ms, %zu SPIR-V words, program "
+                                 "sha256 %s, VkResult %d\n", deferred ? " (deferred)" : "", ms, job.words,
+                         job.program_hash.c_str(), int(created));
+        if (created != VK_SUCCESS) {
+            if (created == VK_ERROR_DEVICE_LOST)
+                device.context->mark_device_lost("PipelineState::create_compute (vkCreateComputePipelines)", created);
+            return false;
+        }
+        if (!deferred) {
+            job.result = pipeline;
+            return true;
+        }
+        std::lock_guard lock(job.mutex);
+        if (job.owner_gone) {
+            vk.vkDestroyPipeline(device.info.device, pipeline, nullptr);
+            return false;
+        }
+        job.result = pipeline;
+        leonida::ComputePipeline ready = job.base;
+        ready.pipeline = pipeline;
+        device.context->add_pipeline(job.id, ready);
+        return true;
     }
 
 private:
@@ -5116,6 +5245,7 @@ private:
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
     VkShaderModule module_ = VK_NULL_HANDLE;  // shared (DeviceState::acquire_shared_module)
+    std::shared_ptr<ComputeCompileJob> compute_job_;  // LEONIDA_LAZY_PSO: the deferred compute compile
     std::vector<VkShaderModule> modules_;         // this PSO's own
     std::vector<VkShaderModule> shared_modules_;  // DeviceState::acquire_shared_module
     VkDeviceSize code_base_ = 0;
@@ -9988,6 +10118,11 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) 
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->compute() ? p->id() : 0;
+}
+
+bool compute_pipeline_compiled(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && p->compute_compiled();
 }
 
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {

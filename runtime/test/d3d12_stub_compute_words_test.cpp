@@ -119,6 +119,29 @@ int main() {
            !unknown.p);
     set_limit(nullptr);
 
+    // LEONIDA_LAZY_PSO=1: CreateComputePipelineState returns at once with the PSO registered, the pipeline is compiled
+    // on a worker, and a PSO released before or while its compile runs is cleaned up (cancelled or waited for).
+    SetEnvironmentVariableW(L"LEONIDA_LAZY_PSO", L"1");
+    {
+        Ref<ID3D12PipelineState> lazy;
+        EXPECT(device.p->CreateComputePipelineState(&desc, IID_PPV_ARGS(&lazy.p)) == S_OK && lazy.p);
+        EXPECT(rt::d3d12::compute_pipeline_id(lazy.p) != 0);
+        bool compiled = false;
+        for (int i = 0; i < 1000 && !compiled; ++i) {
+            compiled = rt::d3d12::compute_pipeline_compiled(lazy.p);
+            if (!compiled) Sleep(10);
+        }
+        EXPECT(compiled);
+        for (int i = 0; i < 32; ++i) {  // released at once: cancelled in the queue or waited for
+            Ref<ID3D12PipelineState> quick;
+            EXPECT(device.p->CreateComputePipelineState(&desc, IID_PPV_ARGS(&quick.p)) == S_OK && quick.p);
+        }
+        // Refusals are still decided at creation.
+        Ref<ID3D12PipelineState> unknown_lazy;
+        EXPECT(device.p->CreateComputePipelineState(&unknown_desc, IID_PPV_ARGS(&unknown_lazy.p)) == E_INVALIDARG);
+    }
+    SetEnvironmentVariableW(L"LEONIDA_LAZY_PSO", nullptr);
+
     std::printf("PASS: %llu-word module compiled at n=%llu and stubbed at n=%llu\n",
                 static_cast<unsigned long long>(words), static_cast<unsigned long long>(words),
                 static_cast<unsigned long long>(words - 1));
