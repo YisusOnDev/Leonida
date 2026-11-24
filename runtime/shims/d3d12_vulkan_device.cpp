@@ -891,6 +891,100 @@ struct DeviceState {
         return pipeline_cache_handle;
     }
 
+    // LEONIDA_PIPELINE_CACHE_SAVE=1: the cache is written back to pipeline_cache.bin (beside the executable, where
+    // pipeline_cache() seeds from) at most every 30 s while new pipelines are being made, so the next run finds the
+    // compute pipelines that take minutes on NVIDIA (renderC-1: ~40 of 45-230 s each before the UI). Saved while the
+    // title runs rather than at teardown, because a boot is usually ended by a kill. Each save writes a temporary file
+    // and renames it over the old one, so a kill mid-write leaves the previous cache whole.
+    std::mutex cache_saver_mutex;
+    std::condition_variable cache_saver_cv;
+    std::thread cache_saver;
+    bool cache_saver_stop = false;
+    bool cache_dirty = false;
+
+    void pipeline_made() {
+        static const bool enabled = GetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_SAVE", nullptr, 0) != 0;
+        if (!enabled || !pipeline_cache_handle || !context->vk.vkGetPipelineCacheData) return;
+        std::lock_guard lock(cache_saver_mutex);
+        cache_dirty = true;
+        if (!cache_saver.joinable() && !cache_saver_stop) cache_saver = std::thread([this] { run_cache_saver(); });
+    }
+
+    void stop_cache_saver() {
+        {
+            std::lock_guard lock(cache_saver_mutex);
+            cache_saver_stop = true;
+        }
+        cache_saver_cv.notify_all();
+        if (cache_saver.joinable()) cache_saver.join();
+    }
+
+    void run_cache_saver() {
+        std::unique_lock lock(cache_saver_mutex);
+        for (;;) {
+            cache_saver_cv.wait_for(lock, std::chrono::seconds(30), [this] { return cache_saver_stop; });
+            if (!cache_dirty) {
+                if (cache_saver_stop) return;
+                continue;
+            }
+            cache_dirty = false;
+            lock.unlock();
+            save_pipeline_cache();
+            lock.lock();
+            if (cache_saver_stop) return;
+        }
+    }
+
+    void save_pipeline_cache() {
+        const ULONGLONG start = GetTickCount64();
+        const auto get = context->vk.vkGetPipelineCacheData;
+        // Workers grow the cache between the size query and the read: room to spare, then retry on VK_INCOMPLETE
+        // (as runtime/test/pipeline_cache_snapshot.h).
+        std::vector<char> data;
+        for (int attempt = 0; attempt < 4 && data.empty(); ++attempt) {
+            size_t size = 0;
+            if (get(info.device, pipeline_cache_handle, &size, nullptr) != VK_SUCCESS ||
+                size < sizeof(VkPipelineCacheHeaderVersionOne))
+                return;
+            size_t capacity = size + (size >> (4 - attempt));
+            data.resize(capacity);
+            const VkResult read = get(info.device, pipeline_cache_handle, &capacity, data.data());
+            if (read == VK_INCOMPLETE) {
+                data.clear();
+                continue;
+            }
+            if (read != VK_SUCCESS || capacity < sizeof(VkPipelineCacheHeaderVersionOne) || capacity > data.size())
+                return;
+            data.resize(capacity);
+        }
+        const std::filesystem::path path = pipeline_cache_path();
+        if (data.empty() || path.empty()) return;
+        std::filesystem::path temp = path;
+        temp += L".tmp";
+        const HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            std::fprintf(stderr, "[rt] d3d12: pipeline cache not saved: cannot create %ls (%lu)\n", temp.c_str(),
+                         GetLastError());
+            return;
+        }
+        bool ok = true;
+        for (size_t at = 0; ok && at < data.size();) {
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - at, 64u << 20));
+            DWORD wrote = 0;
+            ok = WriteFile(file, data.data() + at, chunk, &wrote, nullptr) && wrote == chunk;
+            at += wrote;
+        }
+        CloseHandle(file);
+        if (!ok || !MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            std::fprintf(stderr, "[rt] d3d12: pipeline cache not saved to %ls (%lu)\n", path.c_str(), GetLastError());
+            DeleteFileW(temp.c_str());
+            return;
+        }
+        std::fprintf(stderr, "[rt] d3d12: saved %zu bytes of pipeline cache to pipeline_cache.bin in %llu ms\n",
+                     data.size(), static_cast<unsigned long long>(GetTickCount64() - start));
+    }
+
     QueueClock clock;  // what every queue's GetClockCalibration uses
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
@@ -5300,6 +5394,7 @@ public:
                 device.context->mark_device_lost("PipelineState::create_compute (vkCreateComputePipelines)", created);
             return false;
         }
+        device.pipeline_made();
         if (!deferred) {
             job.result = pipeline;
             return true;
@@ -5432,6 +5527,7 @@ private:
                 device_.context->mark_device_lost("PipelineState::build (vkCreateGraphicsPipelines)", pipe_res);
             return VK_NULL_HANDLE;
         }
+        device_.pipeline_made();
         return pipeline;
     }
 
@@ -6834,6 +6930,7 @@ public:
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
         }
+        state_.stop_cache_saver();  // its last save, if pipelines were made since the one before
         if (state_.pipeline_cache_handle)
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();

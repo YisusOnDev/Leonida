@@ -2253,6 +2253,10 @@ Pipeline creation:
 - Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
   the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
+  With `LEONIDA_PIPELINE_CACHE_SAVE=1` the runtime writes the cache back to that file (a temporary file renamed
+  over it) at most every 30 s while pipelines are being made, and once more at device teardown, so the next run
+  starts with the compute pipelines that take minutes to compile on NVIDIA. It saves during the run because a test
+  boot usually ends with a kill. The file is compiled game shaders, like the build stage's, and stays out of commits.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
