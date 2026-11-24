@@ -1675,7 +1675,10 @@ public:
     }
 
     UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
-        return context_.is_device_lost() ? UINT64_MAX : fence_.completed();
+        if (context_.is_device_lost()) return UINT64_MAX;
+        const UINT64 value = fence_.completed();
+        note_progress(value);
+        return value;
     }
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 
@@ -1748,6 +1751,34 @@ public:
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
 private:
+    // A stall, for the console title's own watchdog (game_scarlett_master.exe+0x10A0C0: a frame wait that sees no queue
+    // finish its submitted work for 10 s calls the fatal GPU-hang handler +0x2474500, which writes a dump and breaks
+    // at +0x2474606): a queue signal is pending and the completed value has not moved for 4 s. Logged once per stall,
+    // with how long it lasted when it ends (64 lines in all). Read where the value is read (the console fence
+    // mirror's refresh polls every 10 ms), so it costs a tick read and a few relaxed atomics.
+    void note_progress(UINT64 value) {
+        static std::atomic<int> logged{0};
+        const ULONGLONG now = GetTickCount64();
+        if (value != last_completed_.exchange(value, std::memory_order_relaxed) ||
+            queued_seen_.load(std::memory_order_relaxed) <= value) {
+            const ULONGLONG since = progress_tick_.exchange(now, std::memory_order_relaxed);
+            if (stall_logged_.exchange(false, std::memory_order_relaxed) && logged.fetch_add(1) < 64)
+                std::fprintf(stderr, "[rt] d3d12: fence %p: stall over, completed %llu after %llu ms\n",
+                             static_cast<void*>(this), static_cast<unsigned long long>(value),
+                             static_cast<unsigned long long>(now - since));
+            return;
+        }
+        ULONGLONG since = progress_tick_.load(std::memory_order_relaxed);
+        if (!since) progress_tick_.compare_exchange_strong(since, now, std::memory_order_relaxed);
+        if (since && now - since > 4000 && !stall_logged_.exchange(true, std::memory_order_relaxed) &&
+            logged.fetch_add(1) < 64)
+            std::fprintf(stderr, "[rt] d3d12: fence %p: stall, completed %llu with queue signal %llu pending, no "
+                         "progress for %llu ms\n",
+                         static_cast<void*>(this), static_cast<unsigned long long>(value),
+                         static_cast<unsigned long long>(queued_seen_.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(now - since));
+    }
+
     bool claim_locked(UINT64 value, bool queue) {
         if (value <= highest_) {
             std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
@@ -1755,7 +1786,10 @@ private:
             return false;
         }
         highest_ = value;
-        if (queue) queued_ = value;
+        if (queue) {
+            queued_ = value;
+            queued_seen_.store(value, std::memory_order_relaxed);
+        }
         return true;
     }
 
@@ -1770,6 +1804,9 @@ private:
     std::mutex claim_mutex_;
     UINT64 highest_;     // the highest value claimed, from either side
     UINT64 queued_ = 0;  // the highest value a queue will signal
+    std::atomic<UINT64> queued_seen_{0}, last_completed_{0};  // note_progress: queued_ outside the lock, last read
+    std::atomic<ULONGLONG> progress_tick_{0};                 // when the completed value last moved (or 0)
+    std::atomic<bool> stall_logged_{false};
     std::shared_ptr<std::atomic<int>> held_ = std::make_shared<std::atomic<int>>(0);  // CPU signals not applied yet
 };
 

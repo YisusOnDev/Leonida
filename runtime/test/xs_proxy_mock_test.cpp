@@ -265,6 +265,7 @@ D3D12_RESOURCE_DESC g_seen_descs[4];  // the first descriptions the mock device'
 std::uint32_t g_seen_desc_count = 0;
 std::uint32_t g_seen_calls = 0;  // slot 25 calls since the test cleared it; only the first is recorded
 
+bool g_refuse_all = false;  // the mock PC device refuses every description (slots 25 and 68)
 std::uint64_t g_texture_size_bias = 0;  // added to each texture's answer: a driver that pads more than the console
 
 std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::uint64_t descs_word) {
@@ -286,7 +287,7 @@ std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) total += g_texture_size_bias;
     }
     auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(ret);
-    *out = {refused ? UINT64_MAX : total, 65536};
+    *out = {refused || g_refuse_all ? UINT64_MAX : total, 65536};
     return ret;
 }
 
@@ -317,6 +318,11 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1 == kResourceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::resource, a2, a3));
                 return static_cast<std::uint32_t>(E_INVALIDARG);
             case 25: return mock_allocation_info(a1, a3, a4);  // GetResourceAllocationInfo (mask a2 is unused)
+            case 56: {  // GetResourceAllocationInfo1: the same total, each description 64 KiB after the previous one
+                auto* each = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
+                for (std::uint64_t i = 0; each && a4 && i < a3; ++i) each[i] = {i * 0x10000, 0x10000, 0x10000};
+                return mock_allocation_info(a1, a3, a4);
+            }
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
             case 26: {  // GetCustomHeapProperties, the PC method: (return buffer, node mask, heap type)
@@ -356,7 +362,8 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                                           static_cast<std::uint32_t>(last.Flags);
                     }
                 }
-                if (ret) *ret = {0x40000, 0x10000};
+                if (ret) *ret = g_refuse_all ? D3D12_RESOURCE_ALLOCATION_INFO{UINT64_MAX, 0}
+                                             : D3D12_RESOURCE_ALLOCATION_INFO{0x40000, 0x10000};
                 if (info1 && count > 0) info1[0] = {0, 0x10000, 0x40000};
                 return a1;
             }
@@ -1312,8 +1319,11 @@ int check_placed_resource_x() {
     target.Height = 32;
     target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag);
+    target.Alignment = 0x1000;  // the 4 KiB a console-sized slot 108/25 answer let the title keep
     EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
     EXPECT(mock->calls[27] == 2 && g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    EXPECT(g_committed.desc.Alignment == 0);  // a committed texture's alignment is the PC device's to pick
+    target.Alignment = 0;
     EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
     EXPECT(g_committed.state == D3D12_RESOURCE_STATE_RENDER_TARGET && g_committed.clear == &clear);
     EXPECT(release(resource) == 0);
@@ -2163,6 +2173,90 @@ int check_render_target_sizes() {
     return 0;
 }
 
+// ---- 10c2. Device slots 108 and 56 answer the title's sampled textures at their console size, as slot 25 does ----
+
+int check_texture_answers_108_56() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);  // ID3D12Device8 and on: slot 108 reaches PC slot 68
+    EXPECT(device);
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    using InfoXFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                             const D3D12_RESOURCE_DESC*,
+                                                             D3D12_RESOURCE_ALLOCATION_INFO1*);
+    // The title's texture creation (+0x193E1DA through +0xABFAE0): one description, 4 KiB asked first, the per-resource
+    // array on its stack, the device in RDX. The frontier5-3 class: 128x4 R16G16B16A16 in 4KB_S (0x105), 0x4000 bytes.
+    D3D12_RESOURCE_DESC narrow{};
+    narrow.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    narrow.Alignment = 0x1000;
+    narrow.Width = 128;
+    narrow.Height = 4;
+    narrow.DepthOrArraySize = 1;
+    narrow.MipLevels = 1;
+    narrow.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    narrow.SampleDesc.Count = 1;
+    narrow.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    narrow.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x300000u);  // console-only bits
+    const auto info2 = reinterpret_cast<InfoXFn>(vtable[108]);
+    D3D12_RESOURCE_ALLOCATION_INFO info{};
+    D3D12_RESOURCE_ALLOCATION_INFO1 each{7, 7, 7};
+    EXPECT(info2(&info, device, 1, 1, &narrow, &each) == &info);
+    EXPECT(mock->calls[68] == 1);  // the PC device is still asked
+    EXPECT(info.SizeInBytes == 0x4000 && info.Alignment == 0x1000);  // the title keeps its 4 KiB try
+    EXPECT(each.Offset == 0 && each.Alignment == 0x1000 && each.SizeInBytes == 0x4000);
+    // Its second try (+0xABFE07) asks no alignment: 64 KiB at the floor, the size unchanged.
+    narrow.Alignment = 0;
+    each = {7, 7, 7};
+    EXPECT(info2(&info, device, 1, 1, &narrow, nullptr) == &info);
+    EXPECT(info.SizeInBytes == 0x4000 && info.Alignment == 0x10000);
+    // A 1280x720 R32 in 256B_D (0x102): 0x384000 bytes where the mock PC device says 0x40000.
+    D3D12_RESOURCE_DESC r32 = narrow;
+    r32.Width = 1280;
+    r32.Height = 720;
+    r32.Format = DXGI_FORMAT_R32_FLOAT;
+    r32.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x102);
+    EXPECT(info2(&info, device, 1, 1, &r32, &each) == &info);
+    EXPECT(info.SizeInBytes == 0x384000 && info.Alignment == 0x10000 && each.SizeInBytes == 0x384000);
+    // The PC form (this in RCX) keeps the PC device's answer: the console sizes are for the title's own calls.
+    D3D12_RESOURCE_ALLOCATION_INFO pc{};
+    EXPECT(raw(device, 108, word(&pc), 1, 1, word(&r32), 0) == word(&pc));
+    EXPECT(pc.SizeInBytes == 0x40000 && pc.Alignment == 0x10000);
+    // A render-target texture keeps the PC/console-tile rule, not the sampled layout.
+    D3D12_RESOURCE_DESC target = r32;
+    target.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    EXPECT(info2(&info, device, 1, 1, &target, &each) == &info);
+    EXPECT(info.SizeInBytes != 0x384000);
+
+    // A PC device that refuses the 4 KiB try (its small-resource rule) does not stop the console answer, on slot 108
+    // and on slot 25, as slot 25 answered before the two shared it.
+    g_refuse_all = true;
+    narrow.Alignment = 0x1000;
+    EXPECT(info2(&info, device, 1, 1, &narrow, &each) == &info);
+    EXPECT(info.SizeInBytes == 0x4000 && info.Alignment == 0x1000 && each.SizeInBytes == 0x4000);
+    using Info25Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                              const D3D12_RESOURCE_DESC*);
+    EXPECT(reinterpret_cast<Info25Fn>(vtable[25])(&info, device, 0, 1, &narrow) == &info);
+    EXPECT(info.SizeInBytes == 0x4000 && info.Alignment == 0x1000);
+    g_refuse_all = false;
+    narrow.Alignment = 0;
+
+    // Slot 56 (GetResourceAllocationInfo1, no title call measured) gives the same answer and places.
+    const auto info1 = reinterpret_cast<InfoXFn>(vtable[56]);
+    D3D12_RESOURCE_DESC pair[2] = {narrow, r32};
+    D3D12_RESOURCE_ALLOCATION_INFO1 places[2]{};
+    EXPECT(info1(&info, device, 1, 2, pair, places) == &info);
+    EXPECT(mock->calls[56] == 1);
+    // Each at its own layout's alignment (4 KiB, then 256 bytes for 256B_D), the total at the 64 KiB floor.
+    EXPECT(info.SizeInBytes == 0x4000 + 0x384000 && info.Alignment == 0x10000);
+    EXPECT(places[0].Offset == 0 && places[0].SizeInBytes == 0x4000 && places[0].Alignment == 0x1000);
+    EXPECT(places[1].Offset == 0x4000 && places[1].SizeInBytes == 0x384000 && places[1].Alignment == 0x100);
+    EXPECT(info1(&info, device, 1, 2, pair, nullptr) == &info);  // the same total without the array
+    EXPECT(info.SizeInBytes == 0x4000 + 0x384000);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: device slots 108 and 56 answer the title's sampled textures at their console size\n", g_label);
+    return 0;
+}
+
 // ---- 10d. Device slot 25 hands the PC device clean descriptions and leaves the title's array alone ----
 
 int check_allocation_descriptions_cleaned() {
@@ -2947,7 +3041,8 @@ int main(int argc, char** argv) {
         check_open_shared() || check_alloc_failures() || check_allocators() || check_xbox_slots() ||
         check_custom_heap_properties() || check_lists() || check_signalx_detection() || check_list_tail_names() ||
         check_descriptor_heap_hooks() || check_slot70() || check_slot70_raw_buffer() ||
-        check_committed_resource3_x() || check_render_target_sizes() || check_allocation_descriptions_cleaned() ||
+        check_committed_resource3_x() || check_render_target_sizes() || check_texture_answers_108_56() ||
+        check_allocation_descriptions_cleaned() ||
         check_committed_resource_leases() || check_slot74() || check_fence_completed_value() ||
         check_list_cpu_handles() || check_queue_slot35())
         return 1;

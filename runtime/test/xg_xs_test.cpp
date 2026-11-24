@@ -221,6 +221,18 @@ int main() {
     D3D12_RESOURCE_DESC pair[2] = {desc(128, 4, 1, 11, 0x105), desc(512, 512, 9, 98, 0x10a, 32)};
     check(cl::console_texture_placement(pair, 2, bytes, align) && bytes == 0x10000 + 0xc00000 && align == 0x10000,
           "two descriptions: the 64 KiB-aligned array placed after the 4 KiB one, 64 KiB aligned in all");
+    // The per-description places (slots 56 and 108 fill GetResourceAllocationInfo1/2's array from them).
+    D3D12_RESOURCE_ALLOCATION_INFO1 each[2] = {{7, 7, 7}, {7, 7, 7}};
+    check(cl::console_texture_placement(pair, 2, bytes, align, each) && each[0].Offset == 0 &&
+              each[0].Alignment == 0x1000 && each[0].SizeInBytes == 0x4000 && each[1].Offset == 0x10000 &&
+              each[1].Alignment == 0x10000 && each[1].SizeInBytes == 0xc00000,
+          "per description: the 4 KiB texture at 0 (0x4000 bytes), the array at 64 KiB (0xc00000 bytes)");
+    D3D12_RESOURCE_DESC with_target[2] = {pair[0], pair[1]};
+    with_target[1].Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    each[0] = each[1] = {7, 7, 7};
+    check(!cl::console_texture_placement(with_target, 2, bytes, align, each) && each[0].Offset == 7 &&
+              each[1].SizeInBytes == 7,
+          "a list with a render target is refused and leaves the per-description array alone");
     narrow.Alignment = 0x1000;
     check(cl::console_texture_placement(&narrow, 1, bytes, align) && bytes == 0x4000 && align == 0x1000,
           "slot 25 with 4 KiB asked (the title's first try): 0x4000 bytes at 4 KiB");
