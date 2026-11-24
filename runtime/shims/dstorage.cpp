@@ -22,12 +22,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <new>
 #include <set>
@@ -36,6 +38,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../src/bcpack.h"          // leonida::bcpack::decode
 #include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "dstorage_xs_abi.h"
 #include "kernel_write_hook.h"
@@ -216,6 +219,68 @@ DSTORAGE_PRIORITY_STATS& priority_stats(DSTORAGE_STATS& s, DSTORAGE_PRIORITY p) 
 void count_error() {
     std::lock_guard lock(stats().mutex);
     ++stats().s.ErrorCount;
+}
+
+// Diagnostic counters (with --trace): entries enqueued and run per type, enqueues that waited for space and bytes
+// moved, printed every 5 s by a heartbeat thread when they changed, so a loading stall shows whether the title stops
+// asking, or asks and never sees an entry run.
+struct Heartbeat {
+    std::atomic<uint64_t> enqueued[4]{}, done[4]{}, waited{0}, failed{0}, bytes{0}, unsubmitted_calls{0};
+    // Requests refused as not implemented, by kind: BCPack mode (index 1-7), swizzle mode (1-4), physical-page source.
+    std::atomic<uint64_t> bcpack[8]{}, swizzle[5]{}, source_pages{0}, bcpack_decoded{0}, bcpack_provisional{0},
+        bcpack_malformed[8]{};
+    // Failed entries by HRESULT.
+    std::mutex codes_mutex;
+    std::map<uint32_t, uint64_t> codes;
+};
+Heartbeat& heartbeat() {
+    static auto* h = new Heartbeat;
+    return *h;
+}
+void start_heartbeat() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            uint64_t last[10]{};
+            for (int t = 5;; t += 5) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                Heartbeat& h = heartbeat();
+                const uint64_t now[10] = {h.enqueued[0], h.done[0], h.enqueued[1], h.done[1], h.enqueued[2],
+                                          h.done[2],     h.enqueued[3], h.done[3], h.waited,     h.failed};
+                if (std::memcmp(now, last, sizeof(now)) == 0) continue;
+                std::memcpy(last, now, sizeof(now));
+                std::fprintf(stderr,
+                             "[rt] dstorage: heartbeat +%d s: requests %llu/%llu run, status %llu/%llu, signal %llu/%llu, "
+                             "event %llu/%llu, enqueue waits %llu, failures %llu, %llu MiB written\n",
+                             t, (unsigned long long)now[0], (unsigned long long)now[1], (unsigned long long)now[2],
+                             (unsigned long long)now[3], (unsigned long long)now[4], (unsigned long long)now[5],
+                             (unsigned long long)now[6], (unsigned long long)now[7], (unsigned long long)now[8],
+                             (unsigned long long)now[9], (unsigned long long)(h.bytes.load() >> 20));
+                std::string kinds;
+                for (int m = 1; m < 8; ++m)
+                    if (const uint64_t n = h.bcpack[m]) kinds += " bcpack" + std::to_string(m) + "=" + std::to_string(n);
+                for (int m = 1; m < 5; ++m)
+                    if (const uint64_t n = h.swizzle[m]) kinds += " swizzle" + std::to_string(m) + "=" + std::to_string(n);
+                if (const uint64_t n = h.source_pages) kinds += " source-pages=" + std::to_string(n);
+                for (int m = 1; m < 8; ++m)
+                    if (const uint64_t n = h.bcpack_malformed[m])
+                        kinds += " bcpack" + std::to_string(m) + "-malformed=" + std::to_string(n);
+                if (const uint64_t n = h.bcpack_decoded)
+                    kinds += " (bcpack decoded=" + std::to_string(n) + ", provisional " +
+                             std::to_string(h.bcpack_provisional.load()) + ")";
+                {
+                    std::lock_guard lock(h.codes_mutex);
+                    for (const auto& [code, n] : h.codes) {
+                        char text[48];
+                        std::snprintf(text, sizeof(text), " 0x%08lx=%llu", static_cast<unsigned long>(code),
+                                      static_cast<unsigned long long>(n));
+                        kinds += text;
+                    }
+                }
+                if (!kinds.empty()) std::fprintf(stderr, "[rt] dstorage: failure kinds so far:%s\n", kinds.c_str());
+            }
+        }).detach();
+    });
 }
 
 // ---- Live objects ---------------------------------------------------------------------------------------------------
@@ -680,8 +745,10 @@ private:
     size_t used_locked() const { return entries_.size() + (in_flight_ ? 1 : 0); }
 
     void enqueue(Entry&& e) {
+        heartbeat().enqueued[static_cast<int>(e.type)]++;
         {
             std::unique_lock lock(mutex_);
+            if (!(closing_ || used_locked() < usable())) heartbeat().waited++;
             // A full queue waits for the worker to free a slot. With auto-submit on, half the queue is always
             // submitted by then; with it off, only a Submit from another thread frees one (as the reference warns).
             space_.wait(lock, [&] { return closing_ || used_locked() < usable(); });
@@ -750,6 +817,8 @@ private:
     // Runs on the worker. since_notify_ is the first failure since the last status entry or fence signal: the
     // HRESULT a status entry reports.
     void process(Entry& e) {
+        heartbeat().done[static_cast<int>(e.type)]++;
+        if (e.type == Entry::Type::Request) heartbeat().bytes += e.request.DestinationSize;
         HRESULT hr = e.enqueue_error;
         switch (e.type) {
             case Entry::Type::Request:
@@ -780,11 +849,44 @@ private:
                 break;
         }
         if (FAILED(hr)) {
+            heartbeat().failed++;
+            {
+                Heartbeat& h = heartbeat();
+                std::lock_guard lock(h.codes_mutex);
+                h.codes[static_cast<uint32_t>(hr)]++;
+            }
+            // The first 24 failed requests other than the not-implemented ones (log_unimplemented has those).
+            static std::atomic<int> logged{0};
+            if (e.type == Entry::Type::Request && hr != E_NOTIMPL && logged.fetch_add(1) < 24) {
+                const DSTORAGE_REQUEST& r = e.request;
+                std::fprintf(stderr,
+                             "[rt] dstorage: request failed 0x%08lx: options 0x%llx source %u dest %u intermediate %u "
+                             "offset 0x%llx\n",
+                             static_cast<unsigned long>(hr), (unsigned long long)r.Options.AsUINT64, (unsigned)r.SourceSize,
+                             (unsigned)r.DestinationSize, (unsigned)r.IntermediateSize, (unsigned long long)r.FileOffset);
+            }
             DSTORAGE_ERROR_FIRST_FAILURE f{};
             f.HResult = hr;
             describe(e, f);
             record_failure(f);
         }
+    }
+
+    // The first 32 requests refused as not implemented, one line each (what a later stage needs to know of them).
+    static void log_unimplemented(const Entry& e) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) >= 32) return;
+        const DSTORAGE_REQUEST& r = e.request;
+        char name[48]{};
+        if (r.Name)
+            for (size_t i = 0; i + 1 < sizeof(name) && r.Name[i]; ++i) name[i] = r.Name[i];
+        std::fprintf(stderr,
+                     "[rt] dstorage: not implemented: options 0x%llx (zlib %d bcpack %u swizzle %u dst-pages %d) "
+                     "source %llu dest %u intermediate %u offset 0x%llx name '%s'\n",
+                     (unsigned long long)r.Options.AsUINT64, options::zlib(r.Options.AsUINT64) ? 1 : 0,
+                     (unsigned)options::bcpack(r.Options.AsUINT64), (unsigned)options::swizzle(r.Options.AsUINT64),
+                     (r.Options.AsUINT64 & options::kDestinationPages) ? 1 : 0, (unsigned long long)r.SourceSize,
+                     (unsigned)r.DestinationSize, (unsigned)r.IntermediateSize, (unsigned long long)r.FileOffset, name);
     }
 
     HRESULT execute_request(const Entry& e) {
@@ -794,23 +896,34 @@ private:
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+        const unsigned bc = static_cast<unsigned>(options::bcpack(o));
+        // Swizzle (DSTORAGE_SWIZZLE_MODE 1-4) has no public description of the transform; BC2 (mode 2) has no block
+        // rebuilder in the BCPack decoder (no BC2 chunk occurs in the retail texture pools, docs/textures.md).
+        if (options::swizzle(o) != 0 || bc == DSTORAGE_BCPACK_MODE_BC2) {
+            log_once("decompress", "swizzle and BCPack-BC2 requests are not implemented (E_NOTIMPL)");
+            if (options::swizzle(o) != 0) heartbeat().swizzle[options::swizzle(o)]++;
+            else heartbeat().bcpack[bc]++;
+            log_unimplemented(e);
             return E_NOTIMPL;
         }
         if (o & options::kSourcePages) {
             log_once("pages", "requests whose source is physical pages are not implemented yet (E_NOTIMPL)");
+            heartbeat().source_pages++;
+            log_unimplemented(e);
             return E_NOTIMPL;
         }
         const bool pages = (o & options::kDestinationPages) != 0;
         const bool zlib = options::zlib(o);
         // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
-        // it is 0 for every request that gets here (BCPack is refused above).
-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        // it is 0 for every request without BCPack.
+        if (bc == 0 && r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
         // E_DSTORAGE_INVALID_DESTINATION_SIZE: without decompression DestinationSize must equal the source's length,
         // with it it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
-        if (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
+        // A BCPack decode's output size is DestinationSize itself (whole blocks; the decoder checks it).
+        if (bc != 0 ? r.DestinationSize == 0
+                    : (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize))
             return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if (bc != 0 && zlib && r.IntermediateSize > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
@@ -828,6 +941,7 @@ private:
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
+        if (bc != 0) return bcpack_request(e, memory, zlib, bc);
         if (zlib) return inflate_request(e, memory);
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
         if (!pages) {
@@ -884,6 +998,79 @@ private:
     // E_DSTORAGE_ZLIB_BAD_HEADER, bad or truncated deflate data E_DSTORAGE_ZLIB_BAD_DATA, an Adler-32 mismatch
     // E_DSTORAGE_ZLIB_PARITY_FAIL, and a stream that inflates to more or fewer bytes than DestinationSize
     // E_DSTORAGE_DECOMPRESSION_ERROR (no code names a size mismatch; this is the header's generic one).
+    // A BCPack request (DSTORAGE_BCPACK_MODE 1, 3-7) whose checks have passed. The console order is DEFLATE, then
+    // BCPack: with ZlibDecompress the source inflates first, to IntermediateSize bytes when that is given, and the
+    // result is one BCPack chunk; without it the source is the chunk. The chunk decodes (leonida::bcpack, the C++ port
+    // of tools/bcpack.py) into DestinationSize bytes of BCn blocks, still in the surface's tiled order, which go to
+    // the destination like any other request's bytes. Built-in history entries the repository marks provisional are
+    // accepted (allow_provisional); a chunk the decoder refuses as needing history it does not have (BC6H/BC7 initial
+    // history is not in the repository: docs/textures.md) fails with E_NOTIMPL, counted per mode, and a malformed one
+    // with E_DSTORAGE_DECOMPRESSION_ERROR; either way the destination is left as it was.
+    HRESULT bcpack_request(const Entry& e, bool memory, bool zlib, unsigned bc) {
+        const DSTORAGE_REQUEST& r = e.request;
+        std::vector<uint8_t> source, chunk, result;
+        try {
+            source.resize(r.SourceSize);
+            result.resize(r.DestinationSize);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (r.SourceSize != 0) {
+            if (memory) {
+                if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
+                       FAILED(hr)) {
+                return hr;
+            }
+        }
+        log_once("bcpack", "BCPack requests are decoded on the CPU (leonida::bcpack, provisional history accepted)");
+        set_decompression_pending(+1);
+        HRESULT hr = S_OK;
+        if (zlib) {
+            leonida::ZlibError why = leonida::ZlibError::none;
+            const size_t limit = r.IntermediateSize != 0 ? r.IntermediateSize : kMaxRequestBytes;
+            if (!leonida::zlib_inflate(source, chunk, limit, &why)) {
+                switch (why) {
+                    case leonida::ZlibError::header: hr = E_DSTORAGE_ZLIB_BAD_HEADER; break;
+                    case leonida::ZlibError::checksum: hr = E_DSTORAGE_ZLIB_PARITY_FAIL; break;
+                    case leonida::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;
+                    default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
+                }
+            } else if (r.IntermediateSize != 0 && chunk.size() != r.IntermediateSize) {
+                hr = E_DSTORAGE_DECOMPRESSION_ERROR;
+            }
+        } else {
+            chunk.swap(source);
+        }
+        if (SUCCEEDED(hr)) {
+            const leonida::bcpack::Result decoded =
+                leonida::bcpack::decode(chunk, static_cast<int>(bc), result, /*allow_provisional=*/true);
+            if (decoded) {
+                heartbeat().bcpack_decoded++;
+                if (!decoded.provisional.empty()) heartbeat().bcpack_provisional++;
+            } else {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 16)
+                    std::fprintf(stderr, "[rt] dstorage: BCPack mode %u chunk (%zu bytes -> %u) refused: %s\n", bc,
+                                 chunk.size(), static_cast<unsigned>(r.DestinationSize), decoded.message.c_str());
+                if (decoded.status == leonida::bcpack::Status::error) {
+                    hr = E_DSTORAGE_DECOMPRESSION_ERROR;
+                    heartbeat().bcpack_malformed[bc]++;
+                } else {
+                    hr = E_NOTIMPL;
+                    heartbeat().bcpack[bc]++;
+                }
+            }
+        }
+        set_decompression_pending(-1);
+        if (FAILED(hr)) {
+            std::lock_guard lock(stats().mutex);
+            ++stats().s.DecompressionErrors;
+            return hr;
+        }
+        return write_destination(r, result.data(), result.size());
+    }
+
     HRESULT inflate_request(const Entry& e, bool memory) {
         const DSTORAGE_REQUEST& r = e.request;
         std::vector<uint8_t> source, result;
@@ -1149,6 +1336,7 @@ private:
     HRESULT create_queue(const DSTORAGE_QUEUE_DESC1& desc, REFIID riid, void** ppv, const char* caller) {
         if (const HRESULT hr = validate_queue_desc(desc); FAILED(hr)) return bad_call(caller, hr, "invalid queue desc");
         if (!iid_policy().accept_creating(riid, Kind::Queue, caller)) return E_NOINTERFACE;
+        start_heartbeat();
         auto* q = new (std::nothrow) Queue(desc);
         if (!q) return E_OUTOFMEMORY;
         if (!q->start()) {

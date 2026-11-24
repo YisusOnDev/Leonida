@@ -135,6 +135,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/appnotify.cpp
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
+    src/bcpack.cpp
   )
   # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
   # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file
@@ -341,6 +342,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(dstorage_test
     test/dstorage_test.cpp
     shims/dstorage.cpp
+    src/bcpack.cpp
     shims/file_system.cpp
     shims/registry.cpp
     shims/xmem.cpp
@@ -598,6 +600,15 @@ if(BUILD_TESTING)
   # Releases parked while queues hold work (runtime/src/queue_holds.h, D3D-203): pure stdlib, no Vulkan instance.
   add_executable(queue_holds_test test/queue_holds_test.cpp)
   add_test(NAME queue_holds COMMAND queue_holds_test)
+  # Native BCPack decoder (RT-186): built-in checks, then a byte-for-byte comparison with tools/bcpack.py on
+  # synthetic chunks (tests/test_bcpack_native.py). Pure stdlib, no GPU or game files.
+  add_executable(bcpack_test test/bcpack_test.cpp src/bcpack.cpp)
+  add_test(NAME bcpack COMMAND bcpack_test)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME bcpack_native_vs_python COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_bcpack_cpp_native.py" --bin "$<TARGET_FILE:bcpack_test>")
+  endif()
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
@@ -2100,6 +2111,12 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_vertex_buffer_slot_range COMMAND d3d12_vertex_buffer_slot_range_test)
     set_tests_properties(d3d12_vertex_buffer_slot_range PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 45)
     set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_executable(d3d12_null_pso_noop_test test/d3d12_null_pso_noop_test.cpp)
+    target_link_libraries(d3d12_null_pso_noop_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_null_pso_noop_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_null_pso_noop_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_null_pso_noop COMMAND d3d12_null_pso_noop_test)
+    set_tests_properties(d3d12_null_pso_noop PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
     add_test(NAME d3d12_queue_wait_timeout COMMAND d3d12_queue_wait_test --timeout-control)
     set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 10)
     # ExecuteCommandLists refuses a list whose type isn't the queue's (debug-layer message 836).
