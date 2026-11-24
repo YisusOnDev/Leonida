@@ -103,6 +103,7 @@ struct DeviceProxy {
     void** dxgi_vtable;
     DxgiAdapterProvider adapter_provider;
     ResourceByVaProvider resource_provider;  // slot 70: a buffer by console VA; null leaves slot 70 on the null view
+    BufferViewAtVaWriter buffer_view_writer;  // slot 70: a buffer view of memory no buffer holds (the title's own)
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
@@ -2619,10 +2620,12 @@ const char* parse_raw_srv(std::uint64_t texture_words, std::uint64_t view_desc, 
     std::memcpy(&out.va, reinterpret_cast<const std::uint8_t*>(view_desc) + sizeof(out.view), sizeof(out.va));
     if (out.resource.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return "arg1 is not a buffer description";
     if (out.view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return "arg2 is not a buffer view";
-    if (out.view.Format != DXGI_FORMAT_R32_TYPELESS || !(out.view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW))
-        return "arg2 is not a raw R32_TYPELESS view";
     if (!out.resource.Width || !out.va) return "no width or no address";
     return nullptr;
+}
+
+bool is_raw_view(const RawSrvShape& shape) {
+    return shape.view.Format == DXGI_FORMAT_R32_TYPELESS && (shape.view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW);
 }
 
 void write_null_srv(DeviceProxy* self, std::uint64_t destination) {
@@ -2647,10 +2650,38 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     log_xbox_route_once(70, "CreateShaderResourceView from raw words", texture_words, view_desc, destination, 0, 0);
     if (!destination) return;
     // The console hands a CPU descriptor handle in the title's heap memory; #7021 translates it to the real heap's.
+    // What lands there is copied back over the title's backing (as slots 17-24 do), because the title builds the
+    // view in a staging heap and copies it into its shader-visible ring itself (the composite into the back buffer
+    // reads such a view, a 128-byte buffer in the title's memory, in its table slot 0).
+    const std::uint64_t title_destination = destination;
     destination = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)}).ptr;
+    struct Mirror {
+        DeviceProxy* self;
+        std::uint64_t title;
+        ~Mirror() { mirror_title_descriptors(self, static_cast<SIZE_T>(title), 1); }
+    } mirror{self, title_destination};
 
     RawSrvShape shape{};
     const char* why = parse_raw_srv(texture_words, view_desc, shape);
+    // Any buffer view of memory: the layer writes it directly when it can (a typed or structured view, or a raw one
+    // no buffer holds). Same view of placed memory as VIctory's View::Placed (descriptor.rs, GPL-3); no code taken.
+    if (!why && self->buffer_view_writer && (!is_raw_view(shape) || !self->resource_provider)) {
+        if (self->buffer_view_writer(&shape.view, shape.va, shape.resource.Width, destination)) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 70 wrote a buffer view of memory (va 0x%llx, width %llu, "
+                                     "format %d, stride %u, first %llu, %u elements, flags 0x%x)\n",
+                             static_cast<unsigned long long>(shape.va),
+                             static_cast<unsigned long long>(shape.resource.Width), int(shape.view.Format),
+                             shape.view.Buffer.StructureByteStride,
+                             static_cast<unsigned long long>(shape.view.Buffer.FirstElement),
+                             shape.view.Buffer.NumElements, unsigned(shape.view.Buffer.Flags));
+            return;
+        }
+        why = "the layer could not write that buffer view";
+    } else if (!why && !is_raw_view(shape)) {
+        why = "arg2 is not a raw R32_TYPELESS view";
+    }
     if (why || !self->resource_provider) {
         log_slot70_null_once(why ? why : "no resource provider", texture_words, view_desc);
         write_null_srv(self, destination);
@@ -2660,6 +2691,9 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     ID3D12Resource* resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
     if (!resource || shape.va < start || shape.va - start >= size) {
         if (resource) resource->Release();
+        if (self->buffer_view_writer &&
+            self->buffer_view_writer(&shape.view, shape.va, shape.resource.Width, destination))
+            return;
         log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
         write_null_srv(self, destination);
         return;
@@ -4653,6 +4687,7 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool co
     proxy->dxgi_vtable = get_dxgi_vtable();
     proxy->adapter_provider = nullptr;
     proxy->resource_provider = nullptr;
+    proxy->buffer_view_writer = nullptr;
     proxy->gpu_thread_priority.store(0, std::memory_order_relaxed);
     proxy->max_frame_latency.store(3, std::memory_order_relaxed);
 
@@ -4704,6 +4739,17 @@ bool set_device_resource_provider(void* device, ResourceByVaProvider provider) {
         return false;
     }
     proxy->resource_provider = provider;
+    return true;
+}
+
+bool set_device_buffer_view_writer(void* device, BufferViewAtVaWriter writer) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) {
+        std::fprintf(stderr, "[rt] d3d12_xs: set_device_buffer_view_writer: %p is not a device proxy; no writer set\n",
+                     device);
+        return false;
+    }
+    proxy->buffer_view_writer = writer;
     return true;
 }
 

@@ -158,6 +158,12 @@ using ResourceByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither. Without a provider slot
 // 70 writes only the null view.
 bool set_device_resource_provider(void* device, ResourceByVaProvider provider);
+// Writes a buffer shader-resource view of [va, va + width) at the layer's CPU descriptor handle `destination`, for
+// device slot 70 when no buffer resource holds `va` (memory the title placed itself) or the view is not a raw one.
+// False when it cannot (the slot is then a null view).
+using BufferViewAtVaWriter = bool (*)(const D3D12_SHADER_RESOURCE_VIEW_DESC* view, std::uint64_t va,
+                                      std::uint64_t width, std::uint64_t destination);
+bool set_device_buffer_view_writer(void* device, BufferViewAtVaWriter writer);
 // Private-data key (8 bytes, a console virtual address) that device slot 133 puts on a texture it creates. On the
 // console a placed texture's GetGPUVirtualAddress is the address it was placed at, which the title also reads as a
 // CPU pointer (it clears textures through it). The PC answer for a texture is 0, so a backend that honours this key

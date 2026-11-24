@@ -1039,6 +1039,7 @@ struct DeviceState {
     std::mutex cbv_heap_mutex;
     std::map<VkDeviceSize, VkDeviceSize> cbv_heaps;
     static constexpr VkDeviceSize kTableScanDescriptors = 1024;  // per table and submission
+    static constexpr std::uint32_t kTableScanMinimum = 8;
 
     // The buffer V#s of the table at `table_va` whose base is in the title's own memory get the address of a copy,
     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
@@ -1051,6 +1052,9 @@ struct DeviceState {
             if (it == cbv_heaps.begin()) return;
             --it;
             if (table_va >= it->second) return;
+            // At least kTableScanMinimum slots: a console shader may read past what the root signature declares
+            // (the composite into the back buffer reads slots 0-2 of a table its signature gives fewer).
+            descriptors = std::max(descriptors, kTableScanMinimum);
             end = std::min<VkDeviceSize>(
                 it->second, table_va + VkDeviceSize(std::min<std::uint32_t>(descriptors, kTableScanDescriptors)) *
                                            kDescriptorSize);
@@ -4327,6 +4331,9 @@ public:
                                  stage.name, hash.c_str(), raw_bytes.size());
                     return E_INVALIDARG;
                 }
+                // A console-compiled vertex program fetches its own vertices through the driver's vertex-buffer
+                // table at s[0:1] (src/console_vertex_table.h).
+                if (vertex) graphics_.console_vertex_table = true;
             } else {
                 log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
@@ -6575,6 +6582,12 @@ public:
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, kZeroPage, kQuadIndexCount);
+        // The console vertex-buffer tables of slot-57 vertex shaders (src/console_vertex_table.h): a ring of 2048.
+        constexpr VkDeviceSize kVertexTables = 2048ull * leonida::kConsoleVertexTableBytes;
+        if (VkDeviceSize at = 0; state_.arena_allocate(kVertexTables, 256, at, DeviceState::arena_buffer)) {
+            std::memset(arena.mapped + at, 0, std::size_t(kVertexTables));
+            state_.context->set_vertex_tables(arena.mapped + at, at, std::uint32_t(kVertexTables));
+        }
         return true;
     }
 
@@ -7599,6 +7612,77 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 
+    // A buffer shader-resource view of [base_va, base_va + width) at `destination` (a 16-byte GFX10 V#; raw, structured or
+    // typed): CreateShaderResourceView's buffer case, and Xbox device slot 70's view of memory with no resource object.
+    // False, with the slot left zero (a null V#), when the description does not fit the range.
+    static bool write_buffer_srv(UINT64 base_va, UINT64 width, const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
+                                 SIZE_T destination) {
+        const D3D12_SHADER_RESOURCE_VIEW_DESC* desc = &view;
+        std::memset(reinterpret_cast<void*>(destination), 0, kDescriptorSize);
+        if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return false;
+        leonida::gfx10::Buffer buffer{};
+        if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+            if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return false;
+            if (desc->Buffer.FirstElement > width / 4) return false;
+            const UINT64 byte_off = desc->Buffer.FirstElement * 4;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
+            if (byte_size > width - byte_off || byte_size > UINT32_MAX) return false;
+            buffer.address = base_va + byte_off;
+            buffer.stride = 0;
+            buffer.num_records = std::uint32_t(byte_size);
+            buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+            buffer.oob_select = leonida::gfx10::OobSelect::raw;
+        } else if (desc->Buffer.StructureByteStride != 0) {
+            if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return false;
+            const UINT64 stride = desc->Buffer.StructureByteStride;
+            if (desc->Buffer.FirstElement > width / stride) return false;
+            const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+            if (byte_size > width - byte_off) return false;
+            buffer.address = base_va + byte_off;
+            buffer.stride = std::uint32_t(stride);
+            buffer.num_records = desc->Buffer.NumElements;
+            buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+            buffer.oob_select = leonida::gfx10::OobSelect::structured;
+        } else {
+            const Format fmt = vulkan_format(desc->Format, false);
+            if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+                log_once("buffer SRV format not supported:", int(desc->Format));
+                return false;
+            }
+            const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
+            const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
+            const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
+                log_once("buffer SRV format not supported:", int(desc->Format));
+                return false;
+            }
+            const UINT64 stride = bf.bytes;
+            if (desc->Buffer.FirstElement > width / stride) return false;
+            const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+            if (byte_size > width - byte_off) return false;
+            buffer.address = base_va + byte_off;
+            buffer.stride = std::uint32_t(stride);
+            buffer.num_records = desc->Buffer.NumElements;
+            buffer.format = code;
+            const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
+            for (unsigned i = 0; i < 4; ++i) {
+                const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
+                buffer.swizzle[i] = from < 4 ? channels[from]
+                                    : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
+                                        ? leonida::gfx10::select_zero
+                                        : leonida::gfx10::select_one;
+            }
+            buffer.oob_select = leonida::gfx10::OobSelect::structured;
+        }
+        buffer.address = vsharp_address(
+            buffer.address, std::uint64_t(buffer.num_records) * (buffer.stride ? buffer.stride : 1));
+        const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+        std::memcpy(reinterpret_cast<void*>(destination), words.data(), sizeof(words));
+        return true;
+    }
+
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
     // dwords through its descriptor table and finds the image by them. A buffer SRV writes a 16-byte GFX10 V# in the
     // first half of the slot (raw, structured, or typed). A slot left as zeros is a null descriptor.
@@ -7641,67 +7725,7 @@ public:
             }
             const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
             const UINT64 width = r->desc().Width;
-            if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
-            leonida::gfx10::Buffer buffer{};
-            if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
-                if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
-                if (desc->Buffer.FirstElement > width / 4) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * 4;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
-                if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = 0;
-                buffer.num_records = std::uint32_t(byte_size);
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::raw;
-            } else if (desc->Buffer.StructureByteStride != 0) {
-                if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return;
-                const UINT64 stride = desc->Buffer.StructureByteStride;
-                if (desc->Buffer.FirstElement > width / stride) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
-                if (byte_size > width - byte_off) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = std::uint32_t(stride);
-                buffer.num_records = desc->Buffer.NumElements;
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
-            } else {
-                const Format fmt = vulkan_format(desc->Format, false);
-                if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
-                    log_once("buffer SRV format not supported:", int(desc->Format));
-                    return;
-                }
-                const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
-                const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
-                const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
-                if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
-                    log_once("buffer SRV format not supported:", int(desc->Format));
-                    return;
-                }
-                const UINT64 stride = bf.bytes;
-                if (desc->Buffer.FirstElement > width / stride) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
-                if (byte_size > width - byte_off) return;
-                buffer.address = base_va + byte_off;
-                buffer.stride = std::uint32_t(stride);
-                buffer.num_records = desc->Buffer.NumElements;
-                buffer.format = code;
-                const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
-                for (unsigned i = 0; i < 4; ++i) {
-                    const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
-                    buffer.swizzle[i] = from < 4 ? channels[from]
-                                        : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
-                                            ? leonida::gfx10::select_zero
-                                            : leonida::gfx10::select_one;
-                }
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
-            }
-            buffer.address = vsharp_address(
-                buffer.address, std::uint64_t(buffer.num_records) * (buffer.stride ? buffer.stride : 1));
-            const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
-            std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+            write_buffer_srv(base_va, width, *desc, destination.ptr);
             return;
         }
         TextureView view{};
@@ -10091,6 +10115,15 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
                       std::uint64_t* size) -> ID3D12Resource* {
                 Device* device = Device::from<Device>(real);
                 return device ? device->add_ref_buffer_at(va, bytes, *start, *size) : nullptr;
+            });
+    // And a view of memory no buffer holds (the title's own): a V# at that address, which vsharp_address points at
+    // the arena copy of the title's pages.
+    if (rt::d3d12_xs::is_device_proxy(outer))
+        rt::d3d12_xs::set_device_buffer_view_writer(
+            outer, [](const D3D12_SHADER_RESOURCE_VIEW_DESC* view, std::uint64_t va, std::uint64_t width,
+                      std::uint64_t destination) {
+                return view && destination &&
+                       Device::write_buffer_srv(va, width, *view, static_cast<SIZE_T>(destination));
             });
     // And for the same outer: its IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands
     // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
