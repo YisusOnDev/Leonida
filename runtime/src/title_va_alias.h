@@ -242,9 +242,17 @@ private:
 };
 
 // The process's table: the device's title ranges and hooks, read by the command lists and descriptor writers.
+// Immortal, and no function-local static guard: xmem's shims reach this on the title's threads, where TLS slot 0 is the
+// mapped executable's (RT-488). A constant-initialized atomic pointer takes no guard; a racing loser frees its copy.
 inline TitleVaAliases& title_va_aliases() {
-    static TitleVaAliases aliases;
-    return aliases;
+    static std::atomic<TitleVaAliases*> instance{nullptr};
+    TitleVaAliases* current = instance.load(std::memory_order_acquire);
+    if (!current) {
+        auto* fresh = new TitleVaAliases;
+        if (instance.compare_exchange_strong(current, fresh, std::memory_order_acq_rel)) current = fresh;
+        else delete fresh;
+    }
+    return *current;
 }
 
 }  // namespace leonida
