@@ -1949,7 +1949,9 @@ bool attach_keyboard_pad() {
 
 // LEONIDA_AUTO_PRESS=<s>[,<s>...] (diagnostic, with LEONIDA_KEYBOARD_PAD=always): at each of those seconds after the
 // keyboard pad's first poll it reports Enter (A) held for 300 ms, and 2 s later Esc (Menu) for 300 ms, so an
-// unattended boot can pass a "press a button" prompt. Each press is logged.
+// unattended boot can pass a "press a button" prompt. Each press is logged. LEONIDA_AUTO_PRESS_HOLD_MS holds each
+// press longer (a title presenting a frame every 2-3 s may never read a 300 ms press; Menu then follows 1 s after A is
+// released), and LEONIDA_AUTO_PRESS_MENU=0 leaves Menu out.
 bool auto_pressed(int vk) {
     static const std::vector<uint64_t> at = [] {
         std::vector<uint64_t> v;
@@ -1965,12 +1967,23 @@ bool auto_pressed(int vk) {
         return v;
     }();
     if (at.empty() || (vk != VK_RETURN && vk != VK_ESCAPE)) return false;
+    static const uint64_t hold = [] {
+        char buf[32]{};
+        const uint64_t ms = GetEnvironmentVariableA("LEONIDA_AUTO_PRESS_HOLD_MS", buf, sizeof buf)
+                                ? std::strtoull(buf, nullptr, 10) : 0;
+        return (ms ? ms : 300) * 1000;
+    }();
+    static const bool menu = [] {
+        char buf[8]{};
+        return !(GetEnvironmentVariableA("LEONIDA_AUTO_PRESS_MENU", buf, sizeof buf) && buf[0] == '0');
+    }();
+    if (vk == VK_ESCAPE && !menu) return false;
     static const uint64_t start = now_us();
     static std::atomic<uint64_t> logged{0};
     const uint64_t t = now_us() - start;
     for (size_t i = 0; i < at.size() && i < 64; ++i) {
-        const uint64_t from = at[i] + (vk == VK_ESCAPE ? 2'000'000u : 0u);
-        if (t >= from && t < from + 300'000) {
+        const uint64_t from = at[i] + (vk == VK_ESCAPE ? std::max<uint64_t>(2'000'000u, hold + 1'000'000u) : 0u);
+        if (t >= from && t < from + hold) {
             const uint64_t bit = uint64_t{1} << (i * 2 % 64 + (vk == VK_ESCAPE));
             if (!(logged.fetch_or(bit) & bit))
                 std::fprintf(stderr, "[rt] gameinput: auto press %s at %.1f s\n", vk == VK_RETURN ? "A" : "Menu",
