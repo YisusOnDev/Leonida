@@ -89,6 +89,7 @@ public:
         std::uint64_t to = shader_va(va);
         if (to != va) {
             translated_[kind].fetch_add(1, std::memory_order_relaxed);
+            touch(to);
             return to;
         }
         Resolver resolver;
@@ -189,6 +190,18 @@ public:
     }
     std::uint64_t pulled() const { return pulled_.load(std::memory_order_relaxed); }
 
+    // A use of the copy at `shader_va` (an arena offset): the device keeps refreshing a window of the title's memory
+    // only while something names it, and copies a retired one again here before it is used.
+    using Toucher = void (*)(void* context, std::uint64_t shader_va);
+    void set_toucher(void* context, Toucher toucher) {
+        toucher_context_.store(context, std::memory_order_relaxed);
+        toucher_.store(toucher, std::memory_order_release);
+    }
+    void touch(std::uint64_t shader_va) const {
+        if (const Toucher t = toucher_.load(std::memory_order_acquire))
+            t(toucher_context_.load(std::memory_order_relaxed), shader_va);
+    }
+
     // The first device to register keeps the hooks until it clears them.
     void set_hooks(void* context, Resolver resolver, TableScanner scanner) {
         std::lock_guard lock(hook_mutex_);
@@ -210,6 +223,8 @@ public:
     std::uint64_t untranslated(Kind kind) const { return untranslated_[kind].load(std::memory_order_relaxed); }
 
 private:
+    std::atomic<Toucher> toucher_{nullptr};
+    std::atomic<void*> toucher_context_{nullptr};
     struct Range {
         std::uint64_t end;        // exclusive
         std::uint64_t shader_va;  // what the range's first byte becomes

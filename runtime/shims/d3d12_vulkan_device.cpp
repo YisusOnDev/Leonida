@@ -942,6 +942,7 @@ struct DeviceState {
         std::erase_if(shadows, [mapped](const Shadow& s) { return s.mapped == mapped; });
     }
     void refresh_shadows() {
+        refresh_title_windows();
         std::lock_guard lock(shadow_mutex);
         for (const Shadow& s : shadows) {
             if (!shadow_sizes_logged.insert(s.size).second) {
@@ -969,12 +970,79 @@ struct DeviceState {
         std::uint64_t start;
         std::uint64_t shader_va;
     };
+    // Which windows are still named. A window no lookup named for kWindowRetireAfter submissions (a root view, a
+    // vertex or index view at replay, a table V# the scan finds already pointing at it) is retired: it keeps its
+    // arena range and its alias (a V# rewritten in place may still hold its address, so the range is never reused),
+    // but is no longer copied before every submission; the next lookup copies it again at once. Without this every
+    // window of the 174 MiB import below the arena on the laptop was copied at every submission (renderB-6: 130 ms).
+    // The idea of bringing up to date only what a submission reads is VIctory's (GPL-3.0,
+    // crates/victory-gpu/src/shadow.rs, "the ranges each submission reads"); no code is taken from it.
+    struct WindowUse {
+        std::uint64_t end;          // arena offset, exclusive
+        const std::uint8_t* pages;  // the title's
+        std::uint8_t* mapped;       // the window's memory in the arena
+        std::size_t size;
+        std::uint64_t last_used;    // submission number
+        bool retired;
+    };
+    static constexpr std::uint64_t kWindowRetireAfter = 120;
+    std::mutex window_use_mutex;  // a leaf: nothing else is taken under it
+    std::map<std::uint64_t, WindowUse> window_uses;  // arena offset -> use
+    std::uint64_t window_submission = 0;            // under window_use_mutex
+    std::uint64_t windows_retired = 0, windows_revived = 0;
+    void add_window_use(std::uint64_t offset, const std::uint8_t* pages, std::uint8_t* mapped, std::size_t size) {
+        std::lock_guard lock(window_use_mutex);
+        window_uses[offset] = {offset + size, pages, mapped, size, window_submission, false};
+    }
+    void touch_window(std::uint64_t shader_va) {
+        std::lock_guard lock(window_use_mutex);
+        auto it = window_uses.upper_bound(shader_va);
+        if (it == window_uses.begin()) return;
+        --it;
+        if (shader_va >= it->second.end) return;
+        WindowUse& use = it->second;
+        use.last_used = window_submission;
+        if (use.retired) {
+            copy_title_pages(use.mapped, use.pages, use.size);
+            use.retired = false;
+            ++windows_revived;
+        }
+    }
+    void refresh_title_windows() {
+        std::lock_guard lock(window_use_mutex);
+        ++window_submission;
+        std::size_t live = 0;
+        std::uint64_t live_bytes = 0;
+        for (auto& [offset, use] : window_uses) {
+            if (use.retired) continue;
+            if (window_submission - use.last_used > kWindowRetireAfter) {
+                use.retired = true;
+                ++windows_retired;
+                continue;
+            }
+            copy_title_pages(use.mapped, use.pages, use.size);
+            ++live;
+            live_bytes += use.size;
+        }
+        if (!(window_submission & (window_submission - 1)) && window_submission >= 64)
+            std::fprintf(stderr, "[rt] d3d12: title windows at submission %llu: %zu of %zu copied (%llu KiB), %llu "
+                                 "retired, %llu revived so far\n",
+                         static_cast<unsigned long long>(window_submission), live, window_uses.size(),
+                         static_cast<unsigned long long>(live_bytes >> 10),
+                         static_cast<unsigned long long>(windows_retired),
+                         static_cast<unsigned long long>(windows_revived));
+    }
     static constexpr std::uint64_t kTitleWindowAlign = 65536;
     static constexpr std::uint64_t kTitleWindowMax = 16ull << 20;  // the most one address pulls in
     std::mutex title_window_mutex;  // taken before shadow_mutex, never under it
     std::vector<TitleWindow> title_windows;
     std::uint64_t title_window_bytes = 0;
     std::uint64_t title_window_cap = 64ull << 20;
+    // Windows into an import below the arena have their own budget (LEONIDA_LOW_IMPORT_WINDOWS_MB, 256 MiB by
+    // default, more than the 182 MiB buffer), so they cannot starve the vertex and index views (renderB-8: 165 lists
+    // refused once the 64 MiB filled with windows into the import).
+    std::uint64_t low_window_bytes = 0;
+    std::uint64_t low_window_cap = 256ull << 20;
 
     // Title-placed buffers imported with a device address below the arena (create_host_buffer): [start, end). A
     // shader cannot reach them by their wrapped VA, so addresses in them get windows like any title memory.
@@ -1036,10 +1104,16 @@ struct DeviceState {
         end = std::min(end, hi);
         if (end <= va) return true;
         const std::uint64_t size = end - start;
-        if (title_window_bytes + size > title_window_cap) {
-            log_once("title memory named by a shader address is past LEONIDA_TITLE_WINDOWS_MB, left untranslated; "
-                     "MiB copied so far:",
-                     int(title_window_bytes >> 20));
+        const bool low = in_low_import(va);
+        if (low ? low_window_bytes + size > low_window_cap : title_window_bytes + size > title_window_cap) {
+            if (low)
+                log_once("an import below the arena named by a shader address is past LEONIDA_LOW_IMPORT_WINDOWS_MB, "
+                         "left untranslated; MiB copied so far:",
+                         int(low_window_bytes >> 20));
+            else
+                log_once("title memory named by a shader address is past LEONIDA_TITLE_WINDOWS_MB, left "
+                         "untranslated; MiB copied so far:",
+                         int(title_window_bytes >> 20));
             return true;
         }
         VkDeviceSize offset = 0;
@@ -1051,10 +1125,10 @@ struct DeviceState {
         auto* mapped = arena.mapped + offset;
         const auto* pages = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(start));
         copy_title_pages(mapped, pages, std::size_t(size));
-        add_shadow({pages, mapped, std::size_t(size)});
+        add_window_use(offset, pages, mapped, std::size_t(size));
         aliases.add(start, size, offset);
         title_windows.push_back({start, offset});
-        title_window_bytes += size;
+        (low ? low_window_bytes : title_window_bytes) += size;
         if (title_windows.size() <= 4 || !(title_windows.size() & (title_windows.size() - 1)))
             std::fprintf(stderr, "[rt] d3d12: a %llu KiB window of the title's memory, named by a shader address, is "
                                  "copied into the GPU address arena before every submission (%zu windows, %llu KiB)\n",
@@ -1139,7 +1213,10 @@ struct DeviceState {
             const std::uint32_t w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
             if (!(w0 | w1 | w2 | w3) || (w3 >> 30)) continue;  // null, or not a buffer V# (TYPE, dword 3 bits 30-31)
             const std::uint64_t base = std::uint64_t(w0) | (std::uint64_t(w1 & 0xFFFFu) << 32);
-            if (base < arena.size) continue;
+            if (base < arena.size) {
+                touch_window(base);  // a V# rewritten earlier: its window is still in use
+                continue;
+            }
             const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
             // A V# the title built over an UPLOAD buffer below the arena: its VA (device address minus heap_base) is
             // negative, and a V#'s 48 bits cannot carry it (render5L-2, RTX 3070 Laptop with ReBAR upload heaps: the
@@ -6388,7 +6465,12 @@ public:
             size_t length = 0;
             if (getenv_s(&length, text, "LEONIDA_TITLE_WINDOWS_MB") == 0 && length > 1)
                 state_.title_window_cap = std::strtoull(text, nullptr, 10) << 20;
+            if (getenv_s(&length, text, "LEONIDA_LOW_IMPORT_WINDOWS_MB") == 0 && length > 1)
+                state_.low_window_cap = std::strtoull(text, nullptr, 10) << 20;
         }
+        leonida::title_va_aliases().set_toucher(&state_, [](void* device, std::uint64_t shader_va) {
+            static_cast<DeviceState*>(device)->touch_window(shader_va);
+        });
         leonida::detail::g_draw_log_peek.store(&draw_log_peek, std::memory_order_relaxed);
         leonida::title_va_aliases().set_hooks(
             &state_,
@@ -6770,6 +6852,7 @@ public:
 
     ~Device() override {
         leonida::title_va_aliases().clear_hooks(&state_);
+        leonida::title_va_aliases().set_toucher(nullptr, nullptr);
         {
             std::lock_guard lock(state_.title_window_mutex);
             for (const auto& window : state_.title_windows)

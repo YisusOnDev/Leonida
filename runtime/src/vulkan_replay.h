@@ -838,6 +838,7 @@ template <class Vk>
 bool title_window_buffer(const Vk& vk, std::uint64_t va, VkBuffer& buffer, VkDeviceSize& offset) {
     const std::uint64_t to = title_va_aliases().shader_va(va);
     if (to == va || !vk.zero_buffer) return false;
+    title_va_aliases().touch(to);
     buffer = vk.zero_buffer;
     offset = vk.zero_offset + to;
     return true;
