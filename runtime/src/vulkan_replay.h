@@ -1149,6 +1149,8 @@ struct PreparedDraw {
 // Namespace-scope state, not guarded statics: replay may run on a title thread.
 // LEONIDA_DRAW_LOG_SKIP=M: the first M draws are not logged (to see the draws of a later frame).
 inline std::atomic<long> g_draw_log_left{-1};
+// Set by the device: a dispatch was left out because its compute pipeline (this id) is still queued for its compile.
+inline std::atomic<void (*)(std::uint64_t id)> g_compute_wanted{nullptr};
 inline std::atomic<long long> g_draw_log_skip{-1};
 // Set by the device: a guarded copy of `bytes` from a title address (false when a page is not readable).
 inline std::atomic<bool (*)(void* to, std::uint64_t from, std::size_t bytes)> g_draw_log_peek{nullptr};
@@ -3438,6 +3440,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if ((n & (n - 1)) == 0)
                     std::fprintf(stderr, "[rt] d3d12: %llu dispatch(es) skipped: compute pipeline still compiling\n",
                                  static_cast<unsigned long long>(n));
+                // The device moves this pipeline's compile to the front of its queue: a pipeline a frame
+                // dispatches should not wait behind hundreds a loading screen created and never uses.
+                if (const auto wanted = detail::g_compute_wanted.load(std::memory_order_relaxed))
+                    wanted(static_cast<std::uint64_t>(dispatch->pipeline));
                 p.skip = true;
                 return ReplayResult::success;
             }
