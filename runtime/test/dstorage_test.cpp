@@ -403,8 +403,8 @@ void test_reads_and_errors(Env& env) {
         r.Options.ZlibDecompress = 1;
         cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "zlib with DestinationSize equal to SourceSize"});
         r = file_request(b, 0, few.data(), 8);
-        r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
-        cases.push_back({r, E_NOTIMPL, "BCPack is not implemented yet"});
+        r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC2;
+        cases.push_back({r, E_NOTIMPL, "BCPack BC2 has no block rebuilder"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.SwizzleMode = DSTORAGE_SWIZZLE_MODE_4K_4K_8K;
         cases.push_back({r, E_NOTIMPL, "swizzle is not implemented yet"});
@@ -1327,7 +1327,8 @@ void test_zlib(Env& env) {
         {file.size() - 16, 32, 64, E_DSTORAGE_END_OF_FILE, nullptr, "a zlib source past the end of the file"},
         {at_dynamic, z, 3191, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, nullptr, "zlib with an IntermediateSize", 0,
          16},
-        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and BCPack is not implemented yet",
+        {at_dynamic, z, 3191, E_DSTORAGE_DECOMPRESSION_ERROR, nullptr,
+         "zlib and BCPack: the inflate is longer than IntermediateSize",
          static_cast<uint64_t>(DSTORAGE_BCPACK_MODE_BC1) << options::kBcpackShift, 64},
         {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and swizzle is not implemented yet",
          static_cast<uint64_t>(DSTORAGE_SWIZZLE_MODE_4K_4K_8K) << options::kSwizzleShift},
@@ -1411,18 +1412,65 @@ void test_zlib(Env& env) {
     ms->Release();
     mq->Release();
 
-    // Counted when the inflate starts: the 11 file requests (4 good, 7 bad streams) and 4 memory requests (all but the
-    // unreadable source) whose checks passed and whose source was read. Failed: the 7 bad file streams and the memory
-    // one with an Adler-32 mismatch; a destination the process cannot write is not a decompression error.
+    // Counted when the inflate starts: the 11 file requests (4 good, 7 bad streams), the zlib+BCPack one whose inflate
+    // overruns IntermediateSize, and 4 memory requests (all but the unreadable source) whose checks passed and whose
+    // source was read. Failed: the 7 bad file streams, the zlib+BCPack one and the memory one with an Adler-32
+    // mismatch; a destination the process cannot write is not a decompression error.
     DSTORAGE_STATS after{};
     env.factory->GetStats(&after);
-    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == 15,
+    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == 16,
           "TotalDecompressionRequestCount counts the zlib requests that reached the inflate");
-    check(after.DecompressionErrors - before.DecompressionErrors == 8, "DecompressionErrors counts the bad streams");
+    check(after.DecompressionErrors - before.DecompressionErrors == 9, "DecompressionErrors counts the bad streams");
     check(after.PendingDecompressionRequestCount == 0, "no decompression is pending afterwards");
 }
 
 }  // namespace
+
+// BCPack requests decode through leonida::bcpack. The chunk is the synthetic one-block BC7 stream of
+// docs/textures.md (tests/test_bcpack.py's encoder, no game data), strict and byte-exact there.
+void test_bcpack(Env& env) {
+    static const char kHex[] =
+        "101010101010101004040303030304040101010101010140"
+        "000000000000024002027546281800000101df5f4b7c0341"
+        "020202411010101004040403101010104004100103030304"
+        "4001080001010104000000080000000041020994e4db27a4"
+        "410511fe6b020005";
+    std::vector<uint8_t> packed;
+    for (size_t i = 0; kHex[i] && kHex[i + 1]; i += 2) {
+        auto nib = [](char c) { return static_cast<uint8_t>(c <= '9' ? c - '0' : c - 'a' + 10); };
+        packed.push_back(static_cast<uint8_t>(nib(kHex[i]) << 4 | nib(kHex[i + 1])));
+    }
+    const std::vector<uint8_t> want = {0x40, 0x31, 0x72, 0x04, 0xa5, 0x68, 0x19, 0xbe,
+                                       0x02, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0};
+    IDStorageQueueX2* q = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    IDStorageStatusArrayX* s = make_status(env, 2);
+    std::vector<uint8_t> out(16 + 16, 0xEE), bad(16 + 16, 0xEE);
+    DSTORAGE_REQUEST r{};
+    r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+    r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC7;
+    r.Source = packed.data();
+    r.SourceSize = static_cast<UINT32>(packed.size());
+    r.Destination = out.data();
+    r.DestinationSize = 16;
+    q->EnqueueRequest(&r);
+    q->EnqueueStatus(s, 0);
+    DSTORAGE_REQUEST cut = r;
+    cut.SourceSize = 8;
+    cut.Destination = bad.data();
+    q->EnqueueRequest(&cut);
+    q->EnqueueStatus(s, 1);
+    q->Submit();
+    check(wait_complete(s, 1), "the BCPack requests complete");
+    check_hr(s->GetHResult(0), S_OK, "a BC7 BCPack memory request");
+    check(std::equal(want.begin(), want.end(), out.begin()), "the BC7 chunk decodes to the documented block");
+    check(std::all_of(out.begin() + 16, out.end(), [](uint8_t b) { return b == 0xEE; }),
+          "nothing is written past DestinationSize");
+    check_hr(s->GetHResult(1), E_DSTORAGE_DECOMPRESSION_ERROR, "a cut BCPack chunk is refused");
+    check(std::all_of(bad.begin(), bad.end(), [](uint8_t b) { return b == 0xEE; }),
+          "a refused chunk leaves the destination untouched");
+    s->Release();
+    q->Release();
+}
 
 int main() {
     wchar_t temp[MAX_PATH];
@@ -1458,6 +1506,7 @@ int main() {
     test_stats_timing(env);
     test_stats(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
+    test_bcpack(env);
     test_destination_pages(env);
 
     fs::remove_all(env.root, ec);

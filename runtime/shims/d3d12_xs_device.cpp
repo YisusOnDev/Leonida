@@ -1988,34 +1988,25 @@ unsigned detect_list_slot_count(IUnknown* real) {
 // Console list slot 62, CopyMemoryToMemoryX(destination, source, size, flags): a GPU copy between two title
 // addresses (memory is unified on the console). Shortcut: done on the CPU when the list records it, not when the GPU
 // reaches it in the list, so it sees the source as it is at record time (VIctory defers the same copy to submission).
-// Both ranges must be committed and writable/readable; anything else is skipped and counted.
-bool range_committed(std::uint64_t address, std::uint64_t size, bool write) {
-    std::uint64_t at = address;
-    const std::uint64_t end = address + size;
-    if (end < address) return false;
-    while (at < end) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) || info.State != MEM_COMMIT)
-            return false;
-        const DWORD p = info.Protect & 0xFF;
-        const bool readable = p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
-                              p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
-        const bool writable = p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE ||
-                              p == PAGE_EXECUTE_WRITECOPY;
-        if (!(write ? writable : readable) || (info.Protect & PAGE_GUARD)) return false;
-        at = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+// The copy runs under __try: physical pages mapped into a window are committed on first touch by the xmem shim's
+// exception handler (which runs before this frame's handler), and a range nobody can touch is skipped and counted.
+bool guarded_memmove(void* destination, const void* source, size_t size) {
+    __try {
+        std::memmove(destination, source, size);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
     }
-    return true;
 }
 
 void list_copy_memory(std::uint64_t destination, std::uint64_t source, std::uint64_t size) {
     static std::atomic<std::uint64_t> copied{0}, skipped{0};
     static std::atomic<int> logged{0};
     const bool ok = destination && source && size && size < (std::uint64_t{1} << 32) &&
-                    range_committed(source, size, false) && range_committed(destination, size, true);
+                    guarded_memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source),
+                                    static_cast<size_t>(size));
     if (ok) {
-        std::memmove(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source),
-                     static_cast<size_t>(size));
         copied.fetch_add(1, std::memory_order_relaxed);
     } else {
         skipped.fetch_add(1, std::memory_order_relaxed);
@@ -2025,7 +2016,7 @@ void list_copy_memory(std::uint64_t destination, std::uint64_t source, std::uint
                      "[rt] d3d12_xs: CopyMemoryToMemoryX 0x%llx <- 0x%llx, 0x%llx bytes: %s (copied %llu, skipped "
                      "%llu)\n",
                      static_cast<unsigned long long>(destination), static_cast<unsigned long long>(source),
-                     static_cast<unsigned long long>(size), ok ? "copied on the CPU" : "skipped (not committed)",
+                     static_cast<unsigned long long>(size), ok ? "copied on the CPU" : "skipped (access violation)",
                      static_cast<unsigned long long>(copied.load()), static_cast<unsigned long long>(skipped.load()));
 }
 
