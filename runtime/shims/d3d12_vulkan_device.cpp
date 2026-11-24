@@ -2642,7 +2642,6 @@ public:
             vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &shadow) != VK_SUCCESS)
             return E_OUTOFMEMORY;
         title_shadow_ = static_cast<std::uint8_t*>(shadow);
-        const auto* pages = static_cast<const std::uint8_t*>(address);
         copy_title_pages(title_shadow_, pages, std::size_t(desc_.Width));
         // Map() answers the title's own pages, as the imported buffer does: a write to the shadow's memory would be
         // overwritten by the next copy.
