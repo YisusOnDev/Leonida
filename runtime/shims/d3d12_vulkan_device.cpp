@@ -4553,6 +4553,21 @@ public:
         if (!probe_vs.empty()) raster.cullMode = VK_CULL_MODE_NONE;  // the probe's winding is not the title's
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+        // LEONIDA_DRAW_LOG (src/vulkan_replay.h): the first graphics pipelines' raster, depth and RT0 state too.
+        if (leonida::detail::g_draw_log_left.load(std::memory_order_relaxed) > 0 ||
+            GetEnvironmentVariableW(L"LEONIDA_DRAW_LOG", nullptr, 0) != 0) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 64)
+                std::fprintf(stderr,
+                             "[rt] draw-log: pso vs %s ps %s topotype %u rect %d cull %d ccw %d depth %d/%d func %d "
+                             "rt0 fmt %d mask 0x%x blend %d\n",
+                             vs_stage.entry ? vs_stage.entry->name.c_str() : "-",
+                             ps_stage.entry ? ps_stage.entry->name.c_str() : "-", topology_type, int(rect_list),
+                             int(r.CullMode), int(r.FrontCounterClockwise), int(desc.DepthStencilState.DepthEnable),
+                             int(desc.DepthStencilState.DepthWriteMask), int(desc.DepthStencilState.DepthFunc),
+                             int(desc.RTVFormats[0]), unsigned(desc.BlendState.RenderTarget[0].RenderTargetWriteMask),
+                             int(desc.BlendState.RenderTarget[0].BlendEnable));
+        }
         // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
         // rasterizer's bias stays off and zero, so its clamp needs no depthBiasClamp feature either.
         raster.depthBiasEnable = !depth24_fragment && (r.DepthBias || r.SlopeScaledDepthBias != 0.0f);
