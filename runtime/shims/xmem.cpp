@@ -40,6 +40,7 @@
 #include "startup_trace.h"
 #include "xmem.h"
 #include "kernel_write_hook.h"
+#include "memory_describe_hook.h"
 #include "write_watch.h"
 #include "../src/title_va_alias.h"
 #include "xmem_pages.h"
@@ -301,6 +302,18 @@ struct MappedPage {
 
 std::unordered_map<uintptr_t, MappedPage> g_mapped;
 SRWLOCK g_fault_lock = SRWLOCK_INIT;
+
+// The last map (page != 0) or unmap (page 0) of each 64 KiB address by the title, with its caller and when, for
+// describe_physical_address (rt::memory_describe). With g_phys_mutex held.
+struct PageEvent {
+    uint64_t page;
+    const void* caller;
+    ULONGLONG tick;
+};
+std::unordered_map<uintptr_t, PageEvent> g_page_events;
+void note_page_event(uintptr_t address, uint64_t page, const void* caller) {
+    g_page_events[address] = PageEvent{page, caller, GetTickCount64()};
+}
 
 struct FaultLockExclusive {
     FaultLockExclusive() { AcquireSRWLockExclusive(&g_fault_lock); }
@@ -633,10 +646,68 @@ LONG CALLBACK physical_page_fault(EXCEPTION_POINTERS* info) {
 // write raises no first-touch fault.
 void commit_before_kernel_write(const void* address, size_t size) { rt::xmem::commit_physical_range(address, size); }
 
+// rt::memory_describe's hook: the window holding `address`, the page mapped at its 64 KiB page (or none), that page's
+// last map/unmap by the title (caller, how long ago), and the host's view of the address.
+size_t describe_physical_address(const void* address, char* out, size_t size) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t page_base = at & ~static_cast<uintptr_t>(kPhysicalPageSize - 1);
+    std::string text;
+    char buf[200];
+    {
+        const std::lock_guard lock(g_phys_mutex);
+        auto it = g_windows.upper_bound(at);
+        if (it != g_windows.begin() && (--it, at - it->first < it->second.size)) {
+            std::snprintf(buf, sizeof(buf), "window %llx+%llx prot %lx", static_cast<unsigned long long>(it->first),
+                          static_cast<unsigned long long>(it->second.size), static_cast<unsigned long>(it->second.protect));
+            text += buf;
+        } else {
+            text += "no physical-page window";
+        }
+        const auto mapped = g_mapped.find(page_base);
+        if (mapped != g_mapped.end())
+            std::snprintf(buf, sizeof(buf), ", page %llx mapped", static_cast<unsigned long long>(mapped->second.page));
+        else
+            std::snprintf(buf, sizeof(buf), ", nothing mapped");
+        text += buf;
+        const auto event = g_page_events.find(page_base);
+        if (event != g_page_events.end()) {
+            const std::string caller = rt::startup_trace::where(reinterpret_cast<uint64_t>(event->second.caller));
+            std::snprintf(buf, sizeof(buf), ", last %s %llx by %s %llu ms ago",
+                          event->second.page ? "map of page" : "unmap", static_cast<unsigned long long>(event->second.page),
+                          caller.c_str(), static_cast<unsigned long long>(GetTickCount64() - event->second.tick));
+            text += buf;
+        } else {
+            text += ", never mapped by the title";
+        }
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info))) {
+        std::snprintf(buf, sizeof(buf), ", host [alloc %p base %p size %llx state %lx type %lx prot %lx]",
+                      info.AllocationBase, info.BaseAddress, static_cast<unsigned long long>(info.RegionSize),
+                      static_cast<unsigned long>(info.State), static_cast<unsigned long>(info.Type),
+                      static_cast<unsigned long>(info.Protect));
+        text += buf;
+    }
+    const size_t n = (std::min)(text.size(), size - 1);
+    std::memcpy(out, text.data(), n);
+    out[n] = '\0';
+    return n;
+}
+
+size_t describe_code_address(const void* address, char* out, size_t size) {
+    const std::string text = rt::startup_trace::where(reinterpret_cast<uint64_t>(address));
+    const size_t n = (std::min)(text.size(), size - 1);
+    std::memcpy(out, text.data(), n);
+    out[n] = '\0';
+    return n;
+}
+
 bool install_physical_page_fault_handler() {
     static const bool installed = [] {
         if (!AddVectoredExceptionHandler(1, &physical_page_fault)) return false;
         rt::kernel_write::set_hook(&commit_before_kernel_write);
+        rt::memory_describe::set_hook(&describe_physical_address);
+        rt::memory_describe::set_code_hook(&describe_code_address);
         return true;
     }();
     return installed;
@@ -894,6 +965,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
                                 caller);
                 return nullptr;
             }
+            note_page_event(start + i * kPhysicalPageSize, 0, caller);
         }
         return address;
     }
@@ -919,6 +991,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
                             describe_pages(page_array, page_count), window, t_map_failure, i, caller);
             return nullptr;
         }
+        note_page_event(start + i * kPhysicalPageSize, page_array[i], caller);
     }
     return address;
 }
@@ -967,6 +1040,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
                             windows[i], t_map_failure, i, caller);
             return FALSE;
         }
+        note_page_event(address, page, caller);
     }
     return TRUE;
 }
