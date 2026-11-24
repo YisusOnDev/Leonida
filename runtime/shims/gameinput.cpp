@@ -1947,6 +1947,40 @@ bool attach_keyboard_pad() {
     return true;
 }
 
+// LEONIDA_AUTO_PRESS=<s>[,<s>...] (diagnostic, with LEONIDA_KEYBOARD_PAD=always): at each of those seconds after the
+// keyboard pad's first poll it reports Enter (A) held for 300 ms, and 2 s later Esc (Menu) for 300 ms, so an
+// unattended boot can pass a "press a button" prompt. Each press is logged.
+bool auto_pressed(int vk) {
+    static const std::vector<uint64_t> at = [] {
+        std::vector<uint64_t> v;
+        char buf[256]{};
+        if (GetEnvironmentVariableA("LEONIDA_AUTO_PRESS", buf, sizeof buf))
+            for (char* p = buf; *p;) {
+                char* end = nullptr;
+                const double sec = std::strtod(p, &end);
+                if (end == p) break;
+                v.push_back(static_cast<uint64_t>(sec * 1e6));
+                p = *end == ',' ? end + 1 : end;
+            }
+        return v;
+    }();
+    if (at.empty() || (vk != VK_RETURN && vk != VK_ESCAPE)) return false;
+    static const uint64_t start = now_us();
+    static std::atomic<uint64_t> logged{0};
+    const uint64_t t = now_us() - start;
+    for (size_t i = 0; i < at.size() && i < 64; ++i) {
+        const uint64_t from = at[i] + (vk == VK_ESCAPE ? 2'000'000u : 0u);
+        if (t >= from && t < from + 300'000) {
+            const uint64_t bit = uint64_t{1} << (i * 2 % 64 + (vk == VK_ESCAPE));
+            if (!(logged.fetch_or(bit) & bit))
+                std::fprintf(stderr, "[rt] gameinput: auto press %s at %.1f s\n", vk == VK_RETURN ? "A" : "Menu",
+                             static_cast<double>(t) / 1e6);
+            return true;
+        }
+    }
+    return false;
+}
+
 // Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
 void update_keyboard_pad() {
     float sens;
@@ -1972,7 +2006,7 @@ void update_keyboard_pad() {
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
     if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
-        for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+        for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key) || auto_pressed(b.virtual_key);
         lx = key_down('D') - key_down('A');  // opposite keys cancel
         ly = key_down('S') - key_down('W');  // SDL's +Y is down
         aim = key_down(VK_RBUTTON);
