@@ -15308,8 +15308,10 @@ def insert_late_constants(gen, out, written):
 def outline_main(gen, fn, types):
     """spirv_outline (SPIRV-SIZE-3): repeated instruction spans of %main become calls of shared functions. Rewrites
     gen.blocks (or the straight-line gen.body) in place, adds the struct and function types to `types` and returns
-    the functions' lines. Not under --wave64-emulate, whose rounds cut blocks into segments."""
-    if not OUTLINE or gen.emulate:
+    the functions' lines. Native compute shaders only: not under --wave64-emulate, whose rounds cut blocks into
+    segments, and not for other stages, whose later rewrites (spirv_gs_to_compute's capture pass, for one) only
+    look inside %main for the stage inputs and outputs they replace."""
+    if not OUTLINE or gen.emulate or gen.stage != "cs":
         return []
     import spirv_outline
     entry = "%entry"
