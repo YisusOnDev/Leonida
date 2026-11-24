@@ -2821,6 +2821,17 @@ void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
     self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
+    {  // bring-up: where the view lands (LEONIDA_DRAW_LOG)
+        static std::atomic<int> logged{0};
+        static const bool on = [] {
+            char text[16] = {};
+            std::size_t length = 0;
+            return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
+        }();
+        if (on && logged.fetch_add(1, std::memory_order_relaxed) < 60)
+            std::fprintf(stderr, "[rt] table-log: slot 17 view at title %p -> layer %p\n", reinterpret_cast<void*>(dest.ptr),
+                         reinterpret_cast<void*>(translate_cpu_handle(self, dest).ptr));
+    }
     mirror_title_descriptors(self, dest.ptr, 1);
 }
 
@@ -2828,6 +2839,17 @@ void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_S
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(18);
     self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
+    {  // bring-up: where the view lands (LEONIDA_DRAW_LOG)
+        static std::atomic<int> logged{0};
+        static const bool on = [] {
+            char text[16] = {};
+            std::size_t length = 0;
+            return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
+        }();
+        if (on && logged.fetch_add(1, std::memory_order_relaxed) < 60)
+            std::fprintf(stderr, "[rt] table-log: slot 18 view at title %p -> layer %p\n", reinterpret_cast<void*>(dest.ptr),
+                         reinterpret_cast<void*>(translate_cpu_handle(self, dest).ptr));
+    }
     mirror_title_descriptors(self, dest.ptr, 1);
 }
 

@@ -447,6 +447,17 @@ public:
     }
     void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable");
+        {  // bring-up: which table each graphics root parameter names (LEONIDA_DRAW_LOG)
+            static std::atomic<int> logged{0};
+            static const bool on = [] {
+                char text[16] = {};
+                std::size_t length = 0;
+                return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
+            }();
+            if (on && logged.fetch_add(1, std::memory_order_relaxed) < 60)
+                std::fprintf(stderr, "[rt] table-log: graphics root %u table 0x%llx\n", index,
+                             static_cast<unsigned long long>(table.ptr));
+        }
         address(graphics_, index, table.ptr, rt::rootsig::ParamType::Table);
     }
 
