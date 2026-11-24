@@ -214,16 +214,41 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                     first = false;
                 }
                 f += "}";
-                // An assert's locals live in its frame: the first 32 stack words, when the stack page is readable.
+                // An assert's locals live in its frame and its callers': the first 128 stack words, when the stack
+                // page holds them; and 0x40 bytes at each word (up to 16) that points at the asserting module's
+                // data (committed, not executable), where its tables are.
+                constexpr int kStackWords = 128;
                 MEMORY_BASIC_INFORMATION m{};
                 const auto* sp = reinterpret_cast<const DWORD64*>(c.Rsp);
                 if (r.ExceptionCode == EXCEPTION_BREAKPOINT && VirtualQuery(sp, &m, sizeof(m)) &&
                     m.State == MEM_COMMIT && (m.Protect & (PAGE_READWRITE | PAGE_READONLY)) &&
                     reinterpret_cast<const uint8_t*>(m.BaseAddress) + m.RegionSize >=
-                        reinterpret_cast<const uint8_t*>(sp + 32)) {
+                        reinterpret_cast<const uint8_t*>(sp + kStackWords)) {
                     f += ",\"stack_words\":[";
-                    for (int i = 0; i < 32; ++i) f += (i ? "," : "") + quote(hex(sp[i]));
+                    for (int i = 0; i < kStackWords; ++i) f += (i ? "," : "") + quote(hex(sp[i]));
                     f += "]";
+                    MEMORY_BASIC_INFORMATION code{};
+                    VirtualQuery(r.ExceptionAddress, &code, sizeof(code));
+                    f += ",\"module_data\":{";
+                    int dumped = 0;
+                    for (int i = 0; i < kStackWords && dumped < 16; ++i) {
+                        MEMORY_BASIC_INFORMATION d{};
+                        const auto* p = reinterpret_cast<const uint8_t*>(sp[i]);
+                        if (!code.AllocationBase || !VirtualQuery(p, &d, sizeof(d)) ||
+                            d.AllocationBase != code.AllocationBase || d.State != MEM_COMMIT ||
+                            !(d.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY)) ||
+                            reinterpret_cast<const uint8_t*>(d.BaseAddress) + d.RegionSize < p + 0x40)
+                            continue;
+                        std::string bytes;
+                        for (int b = 0; b < 0x40; ++b) {
+                            static const char* digits = "0123456789abcdef";
+                            bytes += digits[p[b] >> 4];
+                            bytes += digits[p[b] & 15];
+                        }
+                        f += (dumped ? ",\"" : "\"") + hex(sp[i]) + "\":" + quote(bytes);
+                        ++dumped;
+                    }
+                    f += "}";
                 }
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";

@@ -391,7 +391,7 @@ HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out) {
     *out = computer;  // see the top of the file: two measured callers use *out without checking the HRESULT
     if (!can_lay_out(*computer)) return kNotImpl;
     static std::atomic<int> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
         std::fprintf(stderr,
                      "[rt] xg_xs: XGCreateTextureComputer: linear layout for dimension %d %llux%u depth/array %u, "
                      "%u mip(s), format %d (caller %s)\n",
