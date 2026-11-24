@@ -14,7 +14,7 @@
 #include <cstring>
 #include <vector>
 
-#include "../src/console_texture_layout.h"
+#include "../src/console_texture_desc.h"
 #include "shims.h"
 
 namespace {
@@ -166,6 +166,67 @@ int main() {
     check(create(&d, &computer) == S_OK, "256x256 BC7 0x105: S_OK");
     check(slot<Slot10Fn>(computer, 10)(computer, &tiles, nullptr, nullptr, nullptr, 0, nullptr) == E_FAIL,
           "slot 10: a 4 KiB mode has no 64 KiB tiling (E_FAIL)");
+
+    // The streaming classes the title builds from slot 10 (+0x3441F0 into exe 0x149C3E1D0, boot frontier5-3): per
+    // standard mip a start tile and width x height tiles, the tail = tiles per slice - the standard mips' tiles, at
+    // tile 0, all in 64 KiB tiles the title stores as 16 pages of 4 KiB. The archive's chunks follow the console layout:
+    // the captured 512x512, 32-slice, 9-mip BC7 64KB_D array's mip 0 is one 0x40000-byte chunk.
+    struct ClassCase {
+        uint32_t w, h, array, mips, format;
+        UINT total, standard, packed, per_slice, tail;
+        UINT start[2], wide[2], high[2];
+        const char* what;
+    } classes[] = {
+        {512, 512, 32, 9, 98, 192, 2, 7, 6, 1, {2, 1}, {2, 1}, {2, 1},
+         "512x512x32 BC7 9 mips 0x10a (frontier5-3 class 0x149c3fbd8): 6 tiles a slice, mip 0 4 tiles at tile 2 "
+         "(one 0x40000 chunk), mip 1 at tile 1, the tail at 0"},
+        {256, 256, 32, 9, 83, 64, 1, 8, 2, 1, {1, 0}, {1, 0}, {1, 0},
+         "256x256x32 BC5 9 mips 0x10a: 2 tiles a slice, mip 0 at tile 1, mips 1-8 in the tail at 0"},
+    };
+    for (const ClassCase& k : classes) {
+        d = desc(k.w, k.h, static_cast<uint16_t>(k.mips), k.format, 0x10a, static_cast<uint16_t>(k.array));
+        bool ok = create(&d, &computer) == S_OK;
+        // The title's call: count 16 in, first 0, every output zeroed first.
+        UINT total = 0, count = 16;
+        D3D12_PACKED_MIP_INFO pm{};
+        D3D12_TILE_SHAPE ts{};
+        D3D12_SUBRESOURCE_TILING st[16]{};
+        ok = ok && slot<Slot10Fn>(computer, 10)(computer, &total, &pm, &ts, &count, 0, st) == S_OK;
+        ok = ok && total == k.total && pm.NumStandardMips == k.standard && pm.NumPackedMips == k.packed &&
+             pm.NumTilesForPackedMips == k.tail && pm.NumStandardMips + (pm.NumPackedMips ? 1 : 0) < 7;
+        UINT standard_tiles = 0;
+        for (UINT i = 0; ok && i < k.standard; ++i) {
+            ok = st[i].StartTileIndexInOverallResource == k.start[i] && st[i].WidthInTiles == k.wide[i] &&
+                 st[i].HeightInTiles == k.high[i] && st[i].DepthInTiles == 1;
+            standard_tiles += st[i].WidthInTiles * st[i].HeightInTiles;
+        }
+        ok = ok && total / k.array == k.per_slice && k.per_slice - standard_tiles == k.tail;
+        check(ok, k.what);
+    }
+
+    // GetResourceAllocationInfo of the device proxy (slot 25) answers sampled textures with these layouts
+    // (src/console_texture_desc.h). The frontier5-3 class 0x149c46708: a 128x4 R16G16B16A16 4KB_S texture, which the
+    // title asks for at 4 KiB alignment; its archive chunk is 0x4000 bytes (the PC device said 0x1000).
+    D3D12_RESOURCE_DESC narrow = desc(128, 4, 1, 11, 0x105);
+    narrow.Alignment = 0x1000;
+    uint64_t bytes = 0, align = 0;
+    check(cl::console_allocation(narrow, bytes, align) && bytes == 0x4000 && align == 0x1000,
+          "128x4 R16G16B16A16 0x105 at 4 KiB: 0x4000 bytes, 4 KiB aligned (4 blocks of 32x16 elements)");
+    narrow.Alignment = 0;
+    check(cl::console_allocation(narrow, bytes, align) && bytes == 0x4000 && align == 0x1000,
+          "the same with no alignment asked: still 4 KiB (the layout's own)");
+    narrow.Alignment = 0x10000;
+    check(cl::console_allocation(narrow, bytes, align) && bytes == 0x10000 && align == 0x10000,
+          "64 KiB asked: the size rounds up to it");
+    D3D12_RESOURCE_DESC pair[2] = {desc(128, 4, 1, 11, 0x105), desc(512, 512, 9, 98, 0x10a, 32)};
+    check(cl::console_texture_placement(pair, 2, bytes, align) && bytes == 0x10000 + 0xc00000 && align == 0x10000,
+          "two descriptions: the 64 KiB-aligned array placed after the 4 KiB one, 64 KiB aligned in all");
+    pair[0].Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    check(!cl::console_texture_placement(pair, 2, bytes, align), "a render target keeps the proxy's own rule");
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 4096;
+    check(!cl::console_texture_placement(&buffer, 1, bytes, align), "a buffer keeps the PC answer");
 
     // Slot 6: element offsets of a linear 128x4 R16G16B16A16 (rows of 1 KiB), 0 outside.
     d = desc(128, 4, 1, 11, 0x100);
