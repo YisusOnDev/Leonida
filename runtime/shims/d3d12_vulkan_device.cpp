@@ -989,8 +989,7 @@ struct DeviceState {
         if (!aliases.title_memory(va, title_lo, title_hi)) {
             if (bail_log.fetch_add(1, std::memory_order_relaxed) < 12)
                 std::fprintf(stderr, "[rt] d3d12: title VA 0x%llx (+0x%llx) left untranslated: not in the title's "
-                                     "xmem ranges
-",
+                                     "xmem ranges\n",
                              (unsigned long long)va, (unsigned long long)bytes);
             return true;
         }
@@ -999,8 +998,7 @@ struct DeviceState {
             mbi.State != MEM_COMMIT || !mbi.Protect || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
             if (bail_log.fetch_add(1, std::memory_order_relaxed) < 12)
                 std::fprintf(stderr, "[rt] d3d12: title VA 0x%llx (+0x%llx) left untranslated: state 0x%lx protect "
-                                     "0x%lx
-",
+                                     "0x%lx\n",
                              (unsigned long long)va, (unsigned long long)bytes, (unsigned long)mbi.State,
                              (unsigned long)mbi.Protect);
             return true;

@@ -3472,8 +3472,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             static std::atomic<std::uint64_t> left_out{0};
             const std::uint64_t n = left_out.fetch_add(1, std::memory_order_relaxed) + 1;
             if (n <= 32 || !(n & (n - 1)))
-                std::fprintf(stderr, "[rt] replay: left out command %zu of %zu (%s): %s (%llu so far)
-", i,
+                std::fprintf(stderr, "[rt] replay: left out command %zu of %zu (%s): %s (%llu so far)\n", i,
                              commands.size(), command_name(command), why ? why : "the replay does not implement it",
                              static_cast<unsigned long long>(n));
         }
