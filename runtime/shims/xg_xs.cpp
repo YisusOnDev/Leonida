@@ -42,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include "../src/console_texture_layout.h"
 #include "../src/console_texture_desc.h"
 #include "shims.h"
 
