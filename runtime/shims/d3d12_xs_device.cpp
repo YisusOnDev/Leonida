@@ -228,6 +228,21 @@ std::uint64_t pull_title_descriptors(void*, std::uint8_t* real, std::size_t byte
         const SIZE_T offset = at - r.real_start;
         const SIZE_T n = (std::min<SIZE_T>)(bytes, size - offset);
         const auto* from = reinterpret_cast<const std::uint8_t*>(r.custom_start + offset);
+        // Bring-up: a table pulled while all zero is shown again at later pulls, to see whether the title fills it
+        // after the submission that used it.
+        static std::atomic<const std::uint8_t*> zero_table{nullptr};
+        static std::atomic<int> zero_logged{0};
+        if (const std::uint8_t* z = zero_table.load(std::memory_order_relaxed); z && z != from &&
+            zero_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::uint32_t w[8];
+            std::memcpy(w, z, sizeof(w));
+            std::fprintf(stderr, "[rt] table-log: earlier zero table %p now %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                         static_cast<const void*>(z), w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            zero_table.store(nullptr, std::memory_order_relaxed);
+        }
+        bool all_zero = true;
+        for (SIZE_T i = 0; i < n; ++i) all_zero = all_zero && from[i] == 0;
+        if (all_zero) zero_table.store(from, std::memory_order_relaxed);
         if (std::memcmp(real, from, n) != 0) std::memcpy(real, from, n);
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
@@ -2828,7 +2843,8 @@ void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
             std::size_t length = 0;
             return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
         }();
-        if (on && logged.fetch_add(1, std::memory_order_relaxed) < 60)
+        if (on && ((dest.ptr & 0xFFFF) == 0xDEA0 || (dest.ptr & 0xFFFF) == 0xDEC0) &&
+            logged.fetch_add(1, std::memory_order_relaxed) < 20)
             std::fprintf(stderr, "[rt] table-log: slot 17 view at title %p -> layer %p\n", reinterpret_cast<void*>(dest.ptr),
                          reinterpret_cast<void*>(translate_cpu_handle(self, dest).ptr));
     }
@@ -2846,7 +2862,8 @@ void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_S
             std::size_t length = 0;
             return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
         }();
-        if (on && logged.fetch_add(1, std::memory_order_relaxed) < 60)
+        if (on && ((dest.ptr & 0xFFFF) == 0xDEA0 || (dest.ptr & 0xFFFF) == 0xDEC0) &&
+            logged.fetch_add(1, std::memory_order_relaxed) < 20)
             std::fprintf(stderr, "[rt] table-log: slot 18 view at title %p -> layer %p\n", reinterpret_cast<void*>(dest.ptr),
                          reinterpret_cast<void*>(translate_cpu_handle(self, dest).ptr));
     }
