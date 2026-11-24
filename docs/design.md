@@ -198,6 +198,14 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
   22 413 312 bytes). Why: the title sizes its archive reads from these answers (texture-class page counts built from
   slot 10); PC-sized answers made reads shorter than the archive chunks. Open: the Vulkan layer still reads
   title-filled textures as linear, so textures the title tiles through slot 8 sample scrambled until it detiles them.
+- The device proxy's `GetResourceAllocationInfo` (slot 25) answers the title's sampled-texture descriptions (no
+  render-target or depth flag) with the same console layouts (`runtime/src/console_texture_desc.h`, VIctory's
+  `footprint`, GPL-3.0): the layout size rounded up to the larger of the requested and the layout's alignment (4 KiB
+  for the 4 KiB modes). Why: the title's streaming classes (exe `0x149C3E1D0`, built at `+0x51FB680`) take their page
+  counts from slot 10 for tiled textures and from this size (`(size + 0xFFF) >> 12`, via `+0x343E80`, which first asks
+  for 4 KiB alignment) for the others; the PC answer for a 128x4 `R16G16B16A16` `SW_4KB_S` texture was 0x1000 bytes
+  where its archive chunk is 0x4000, the console size, and the archive read builder asserted (`+0x4ffd879`, boot
+  frontier5-3, class `0x149c46708`). Confirmed by `xg_xs_test` with the captured descriptions.
 - PSO metadata is a new variant (`PSIN`, `LSCH` schema, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`, little-endian).
   CodeWalker's parser reads the container but not the new schema; dump it once the exe gives the field names.
 
