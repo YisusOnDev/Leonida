@@ -1178,8 +1178,8 @@ const char kInstallChunksIdentity = 0, kMountWithUiIdentity = 1;  // different v
 // LEONIDA_CONTENT_PACKAGES. Anything else is ERROR_NOT_FOUND here as it is there.
 HRESULT package_installed(const char* id) {
     if (!id) return E_INVALIDARG;
-    char path[MAX_PATH];
-    const HRESULT hr = resolve_package_path(id, path, sizeof(path));
+    HRESULT hr = S_OK;
+    (void)resolve_package_path(id, hr);
     return hr == E_ACCESSDENIED ? S_OK : hr;  // E_ACCESSDENIED is the game's own id: installed, just not mountable
 }
 

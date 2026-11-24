@@ -2336,6 +2336,13 @@ UINT WINAPI get_drive_type_a(LPCSTR root_path) {
     return get_drive_type_w(wide.c_str());
 }
 
+// The volume shims answer for a console spelling (GAME:, G:\, T:\) only. A host path inside --game-dir is the package
+// to the file shims (game_dir_rest), but the title named the host volume, so the host answers for it.
+bool console_spelling(const std::wstring& name) {
+    size_t prefix = 0;
+    return console_drive(name, prefix) != Drive::None;
+}
+
 // Resolve the backing volume without exposing its host root to the title.
 bool volume_host_root(const std::wstring& name, std::wstring& result) {
     const Roots r = roots();
@@ -2367,7 +2374,7 @@ BOOL WINAPI get_volume_information_w(LPCWSTR name, LPWSTR label, DWORD label_siz
     if (!name) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts, false);
-    if (parsed == Parsed::Host) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Host || !console_spelling(name)) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     if (parsed == Parsed::Refused || !drive_root(name, parts)) return fail_bool(ERROR_INVALID_NAME);
     std::wstring root;
     if (!volume_host_root(name, root)) return FALSE;
@@ -2380,7 +2387,7 @@ BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size,
     const std::wstring wide = widen_ansi(name);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(wide, parts, false);
-    if (parsed == Parsed::Host) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Host || !console_spelling(wide)) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
     if (parsed == Parsed::Refused || !drive_root(wide, parts)) return fail_bool(ERROR_INVALID_NAME);
     std::wstring root;
     if (!volume_host_root(wide, root)) return FALSE;
@@ -2401,7 +2408,7 @@ BOOL WINAPI get_volume_path_name_w(LPCWSTR name, LPWSTR output, DWORD size) {
     if (!name) return ::GetVolumePathNameW(name, output, size);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts, false);
-    if (parsed == Parsed::Host) return ::GetVolumePathNameW(name, output, size);
+    if (parsed == Parsed::Host || !console_spelling(name)) return ::GetVolumePathNameW(name, output, size);
     if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
     size_t prefix = 0;
     console_drive(name, prefix);
@@ -2416,7 +2423,7 @@ BOOL WINAPI get_volume_path_name_a(LPCSTR name, LPSTR output, DWORD size) {
     const std::wstring wide = widen_ansi(name);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(wide, parts, false);
-    if (parsed == Parsed::Host) return ::GetVolumePathNameA(name, output, size);
+    if (parsed == Parsed::Host || !console_spelling(wide)) return ::GetVolumePathNameA(name, output, size);
     if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
     size_t prefix = 0;
     console_drive(wide, prefix);

@@ -2815,10 +2815,6 @@ void run_checks(const std::filesystem::path& root) {
         check(remove_with(host_file_rm.wstring(), true) && !std::filesystem::exists(host_file_rm),
               "a host file is deleted through the handle unchanged");
     }
-
-    std::filesystem::remove_all(root);
-    std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
-    return g_failures == 0 ? 0 : 1;
 }
 
 }  // namespace
