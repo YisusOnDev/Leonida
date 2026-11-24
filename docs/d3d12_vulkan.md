@@ -1920,7 +1920,20 @@ the vertices on the CPU into the vertex-table entry (`expand_rect_list`), six pe
 - Each dword of the fourth corner is `a + b - corner`. A dword with the same bits at all three corners is copied.
 - Slot 0's V# is pointed at the expanded vertices.
 
-This applies to non-indexed single-instance draws of at most three 24-byte rectangles.
+This applies to non-indexed single-instance draws of at most three 24-byte rectangles. It is the same approach as
+VIctory's `crates/victory-gpu/src/primitive.rs` (GPL-3, no code taken), which states the fourth corner as
+`v0 + v2 - v1`.
+
+`src/rect_list_geometry.h` uses `v2 + v3 - v1` (1-based) for pipelines of topology type 19, which is
+`V1 + V2 - V0` (0-based). For these rectangles that point is not the missing corner:
+`LEONIDA_PROBE=BlitColour` on renderB-7 showed `VS_Blit` covering half the screen.
+
+The table's slot 0 comes from device slot 70: a view of memory with no resource object. Leonida now writes typed,
+structured and raw buffer views of it, and copies the result back over the title's heap backing. This is the shape of
+VIctory's `View::Placed` (`descriptor.rs`, `descriptor/host.rs`). VIctory reaches title memory through on-demand host
+copies (`shadow.rs`). Leonida does the same in the GPU address arena: a slot-133 buffer the driver imports below the
+arena, as on the RTX 3070 Laptop, keeps its import, and every address in it that a shader is given gets a 64 KiB
+window.
 
 **Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
 each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the

@@ -57,6 +57,9 @@ std::uint32_t console_vertex_table(const std::array<VertexBufferView, 32>& views
 // same bits at all three vertices (a packed colour, say), which is copied. `in` holds 3 * rects vertices of `stride`
 // bytes (a multiple of 4, at least 8); `out` gets 6 * rects. The composite into the back buffer is one such rectangle:
 // (0,0), (0,2160), (3840,2160), right angle at the second vertex, fourth corner (3840,0).
+// Reference: VIctory (GPL-3) crates/victory-gpu/src/primitive.rs expands rectangles the same way on the CPU, from the
+// vertex inputs, with the fourth corner v0 + v2 - v1 (GTA VI's full-screen rectangles come top left, bottom left,
+// bottom right); here the right-angle corner is found instead of assumed. No code is taken from it.
 inline bool expand_rect_list(const std::uint8_t* in, std::uint32_t stride, std::uint32_t rects, std::uint8_t* out) {
     if (stride < 8 || stride % 4) return false;
     const std::uint32_t words = stride / 4;
