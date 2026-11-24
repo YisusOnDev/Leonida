@@ -1,30 +1,32 @@
-// Checks the registered xg_xs.dll shim against the call shapes measured in the game executable (runtime/shims/xg_xs.cpp).
+// Checks the registered xg_xs.dll shim (runtime/shims/xg_xs.cpp) and the console layouts behind it
+// (runtime/src/console_texture_layout.h).
 //
-// Both exports are resolved through rt::shims::find, so this is the table the runtime installs. The checks: both
-// return E_NOTIMPL for a description they cannot handle, XGSuggestSwizzleMode leaves the caller's field alone,
-// XGCreateTextureComputer still hands out a computer (two measured callers use it without checking the HRESULT), slots
-// 2 and 8 (and slot 10 on a description it cannot tile) return without writing what their arguments point to, slot 10
-// answers the PC tiling of a description it can tile (GetResourceTiling, compared with src/resource_tiling.h), and a
-// description it can lay out linearly gets S_OK, slot 2's whole layout structure and slots 8 and 9's linear copies.
+// Both exports are resolved through rt::shims::find, so this is the table the runtime installs. Expected numbers:
+// the suggestion, layout, copy and tiling cases are the ones VIctory's xg.rs and texture.rs tests check (VIctory,
+// github.com/Marvisak/VIctory, GPL-3.0; addrlib-derived); the sizes of the three BC7 chains are the ones VIctory's
+// xg module reported for the same descriptions in the oracle run (S\oracle\capture_102517, "texture computer ...
+// size="), which this repository does not ship.
 #include <windows.h>
 #include <d3d12.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
-#include "../src/resource_tiling.h"
+#include "../src/console_texture_layout.h"
 #include "shims.h"
 
 namespace {
 
 using CreateFn = HRESULT(__stdcall*)(const void*, void**);
 using SuggestFn = HRESULT(__stdcall*)(const void*, uint32_t, uint32_t*);
-using ReleaseFn = ULONG(__stdcall*)(void*);
 using Slot2Fn = HRESULT(__stdcall*)(void*, void*);
+using Slot6Fn = uint64_t(__stdcall*)(void*, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t*);
 using Slot8Fn = HRESULT(__stdcall*)(void*, void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
-using Slot10Fn = HRESULT(__stdcall*)(void*, uint32_t*, void*, void*, uint32_t*, uint32_t, void*);
-constexpr HRESULT kNotImpl = static_cast<HRESULT>(rt::shims::kENotImpl);
+using Slot9Fn = HRESULT(__stdcall*)(void*, void*, uint32_t, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+using Slot10Fn = HRESULT(__stdcall*)(void*, UINT*, D3D12_PACKED_MIP_INFO*, D3D12_TILE_SHAPE*, UINT*, UINT,
+                                     D3D12_SUBRESOURCE_TILING*);
 
 int g_checks = 0;
 int g_failures = 0;
@@ -35,15 +37,64 @@ void check(bool condition, const char* what) {
     if (!condition) ++g_failures;
 }
 
-bool all_bytes(const uint8_t* p, size_t n, uint8_t value) {
-    for (size_t i = 0; i < n; ++i)
-        if (p[i] != value) return false;
+D3D12_RESOURCE_DESC desc(uint64_t w, uint32_t h, uint16_t mips, uint32_t format, uint32_t layout, uint16_t array = 1) {
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = w;
+    d.Height = h;
+    d.DepthOrArraySize = array;
+    d.MipLevels = mips;
+    d.Format = static_cast<DXGI_FORMAT>(format);
+    d.SampleDesc.Count = 1;
+    d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(layout);
+    return d;
+}
+
+template <typename Fn>
+Fn slot(void* computer, size_t index) {
+    return reinterpret_cast<Fn>((*reinterpret_cast<void* const* const*>(computer))[index]);
+}
+
+// Every element of every mip and slice lands on its own address inside the texture, and tiling then detiling the
+// rows gives them back (texture.rs addresses_are_a_bijection_and_copies_round_trip, a subset).
+bool round_trip(const leonida::console_layout::Desc& d) {
+    namespace cl = leonida::console_layout;
+    auto l = cl::Layout::make(d);
+    if (!l) return false;
+    std::vector<uint8_t> seen(static_cast<size_t>(l->size), 0), tiled(static_cast<size_t>(l->size), 0);
+    const size_t n = d.element_bytes;
+    const uint32_t slices = d.dimension == cl::Dimension::tex3d ? 1 : d.depth;
+    for (uint32_t slice = 0; slice < slices; ++slice)
+        for (uint32_t mip = 0; mip < d.mips; ++mip) {
+            const cl::Mip& m = l->mips[mip];
+            const size_t active = size_t{m.width} * n, row = active + 13, plane = row * m.height + 11;
+            std::vector<uint8_t> linear(plane * m.depth);
+            for (size_t i = 0; i < linear.size(); ++i) linear[i] = static_cast<uint8_t>(i * 7 + mip * 13 + slice);
+            std::vector<cl::Run> runs;
+            uint32_t first = 0;
+            if (cl::plan_copy(*l, tiled.size(), mip, slice, linear.size(), row, plane, first, runs) != cl::Error::none)
+                return false;
+            for (uint32_t z = 0; z < m.depth; ++z)
+                for (uint32_t y = 0; y < m.height; ++y) {
+                    const uint64_t base = cl::row_base(*l, m, first, z, y);
+                    for (const cl::Run& r : runs)
+                        std::memcpy(&tiled[base + r.tiled], &linear[z * plane + y * row + r.linear], r.length);
+                    for (uint32_t x = 0; x < m.width; ++x) {
+                        uint64_t at = 0;
+                        if (l->offset(mip, x, y, slice + z, at) != cl::Error::none) return false;
+                        if (at + n > seen.size() || at % n || seen[at]) return false;
+                        if (std::memcmp(&tiled[at], &linear[z * plane + y * row + x * n], n)) return false;
+                        seen[at] = 1;
+                    }
+                }
+        }
     return true;
 }
 
 }  // namespace
 
 int main() {
+    namespace cl = leonida::console_layout;
     auto create = reinterpret_cast<CreateFn>(rt::shims::find("xg_xs.dll", "XGCreateTextureComputer"));
     auto suggest = reinterpret_cast<SuggestFn>(rt::shims::find("xg_xs.dll", "XGSuggestSwizzleMode"));
     check(create != nullptr, "XGCreateTextureComputer is registered");
@@ -51,195 +102,125 @@ int main() {
     check(rt::shims::owns_dll("xg_xs.dll"), "the registry owns xg_xs.dll");
     if (!create || !suggest) return 1;
 
-    uint8_t desc[0x38] = {};
-    uint32_t mode = 0x1234;
-    check(suggest(desc, 0, &mode) == kNotImpl, "XGSuggestSwizzleMode returns E_NOTIMPL");
-    check(mode == 0x1234, "XGSuggestSwizzleMode leaves the mode field as the caller set it");
+    // Suggestions follow the use: 4 KiB standard, render targets 64 KiB R_X, depth 64 KiB Z_X.
+    D3D12_RESOURCE_DESC d = desc(256, 256, 1, 98, 0);
+    uint32_t mode = 0;
+    check(suggest(&d, 0, &mode) == S_OK && mode == 0x105, "XGSuggestSwizzleMode: 0x105 for a plain texture");
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    check(suggest(&d, 0, &mode) == S_OK && mode == 0x11b, "XGSuggestSwizzleMode: 0x11b for a render target");
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    check(suggest(&d, 0, &mode) == S_OK && mode == 0x118, "XGSuggestSwizzleMode: 0x118 for depth");
 
-    check(create(desc, nullptr) == E_POINTER, "XGCreateTextureComputer(desc, nullptr) is E_POINTER");
+    // A description without a layout: E_INVALIDARG, but *out still holds a computer whose methods fail.
+    check(create(&d, nullptr) == E_POINTER, "XGCreateTextureComputer(desc, nullptr) is E_POINTER");
     void* computer = nullptr;
-    check(create(desc, &computer) == kNotImpl, "XGCreateTextureComputer returns E_NOTIMPL");
-    check(computer != nullptr, "XGCreateTextureComputer still stores a computer for the callers that do not check");
-    if (!computer) return 1;
+    D3D12_RESOURCE_DESC bad = desc(256, 256, 1, 0, 0x10a);
+    check(create(&bad, &computer) == E_INVALIDARG && computer, "unknown format: E_INVALIDARG with a computer");
+    bad = desc(256, 256, 1, 28, 0x103);
+    check(create(&bad, &computer) == E_INVALIDARG && computer, "a mode GFX10 lacks: E_INVALIDARG");
+    std::vector<uint8_t> scratch(0x1B40, 0xAB);
+    check(slot<Slot2Fn>(computer, 2)(computer, scratch.data()) == E_INVALIDARG && scratch[0] == 0xAB,
+          "slot 2 of a failed computer writes nothing");
 
-    void* const* vtable = *static_cast<void* const* const*>(computer);
-    uint8_t layout[0x800];
-    std::memset(layout, 0xcd, sizeof(layout));
-    check(reinterpret_cast<Slot2Fn>(vtable[2])(computer, layout) == kNotImpl, "slot 2 returns E_NOTIMPL");
-    check(all_bytes(layout, sizeof(layout), 0xcd), "slot 2 writes nothing to its output");
+    // 256x256 BC7, full chain, 64 KiB display mode: one tail block holding mips 1-8, then mip 0.
+    d = desc(256, 256, 0, 98, 0x10a);
+    check(create(&d, &computer) == S_OK, "256x256 BC7 0x10a: S_OK");
+    std::vector<uint8_t> layout(0x1B40, 0xCD);
+    check(slot<Slot2Fn>(computer, 2)(computer, layout.data()) == S_OK, "slot 2 answers the layout");
+    auto u64 = [&](size_t at) { uint64_t v; std::memcpy(&v, &layout[at], 8); return v; };
+    auto u32 = [&](size_t at) { uint32_t v; std::memcpy(&v, &layout[at], 4); return v; };
+    check(u64(0) == 131072 && u64(8) == 65536 && u32(0x10) == 9 && u32(0x14) == 1,
+          "layout: 128 KiB, 64 KiB aligned, 9 mips, 1 plane");
+    const size_t plane = 0x18, mips = plane + 0x38;
+    check(u32(plane) == 1 && u32(plane + 0x28) == 16 && u32(plane + 0x2C) == 1 && u32(plane + 0x30) == 8,
+          "plane: data, 16-byte elements, 1 standard mip, 8 in the tail");
+    check(u64(mips + 0x08) == 65536 && u32(mips + 0x1C) == 1024, "mip 0 at 64 KiB, 1024-byte rows");
+    check(u64(mips + 0x70 + 0x08) == 32768 && u32(mips + 0x70 + 0x64) == 1, "mip 1 in the tail at 32 KiB");
+    check(u32(0x1B38) == 3, "dimension at +0x1B38");
 
-    uint8_t dst[64];
-    std::memset(dst, 0xcd, sizeof(dst));
-    const uint8_t src[64] = {};
-    check(reinterpret_cast<Slot8Fn>(vtable[8])(computer, dst, 0, 0, src, 16, 64) == kNotImpl,
-          "slot 8 returns E_NOTIMPL");
-    check(all_bytes(dst, sizeof(dst), 0xcd), "slot 8 writes nothing to its destination");
+    std::vector<uint8_t> tiled(131072, 0);
+    bool copies = true;
+    for (uint32_t mip = 0; mip < 9; ++mip) {
+        const uint32_t elements = u32(mips + 0x70 * mip + 0x30), rows_n = u32(mips + 0x70 * mip + 0x34);
+        const uint32_t row = elements * 16;
+        std::vector<uint8_t> rows(size_t{row} * rows_n), back(rows.size(), 0);
+        for (size_t i = 0; i < rows.size(); ++i) rows[i] = static_cast<uint8_t>(i ^ mip);
+        copies &= slot<Slot8Fn>(computer, 8)(computer, tiled.data(), 0, mip, rows.data(), row, 0) == S_OK;
+        copies &= slot<Slot9Fn>(computer, 9)(computer, back.data(), 0, mip, 0, tiled.data(), row, 0) == S_OK;
+        copies &= back == rows;
+    }
+    check(copies, "slots 8 and 9: every mip copies in and back out unchanged");
 
-    uint32_t count = 0, inout = 0x10;
-    uint8_t a[12] = {}, b[12] = {}, list[0xc0] = {};
-    check(reinterpret_cast<Slot10Fn>(vtable[10])(computer, &count, a, b, &inout, 0, list) == kNotImpl,
-          "slot 10 returns E_NOTIMPL");
-    check(count == 0 && inout == 0x10 && all_bytes(a, 12, 0) && all_bytes(b, 12, 0) &&
-              all_bytes(list, sizeof(list), 0),
-          "slot 10 leaves the caller's zero-filled outputs as they were");
-    check(reinterpret_cast<Slot2Fn>(vtable[31])(computer, layout) == kNotImpl, "the last slot (31) is traced too");
-
-    // Slot 10 on a description it can tile: the first one measured at the game's call sites, 256 x 128 R8_UNORM, one
-    // mip, 4 KiB alignment, with the console layout word and console flag bits set. An 8-bit texel's 64 KiB tile is
-    // 256 x 256, so the texture is one tile and its one mip is standard (wider than half a tile).
-    D3D12_RESOURCE_DESC r8{};
-    r8.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    r8.Alignment = 0x1000;
-    r8.Width = 256;
-    r8.Height = 128;
-    r8.DepthOrArraySize = 1;
-    r8.MipLevels = 1;
-    r8.Format = DXGI_FORMAT_R8_UNORM;
-    r8.SampleDesc.Count = 1;
-    r8.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
-    r8.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x300000);
-    uint8_t console_desc[0x58];
-    std::memset(console_desc, 0x5a, sizeof(console_desc));  // the console's own fields after the PC description
-    std::memcpy(console_desc, &r8, sizeof(r8));
-    void* r8_computer = nullptr;
-    create(console_desc, &r8_computer);
-    void* const* r8_vtable = r8_computer ? *static_cast<void* const* const*>(r8_computer) : nullptr;
-    UINT total = 0, n = 16;
+    UINT tiles = 0, n = 4;
     D3D12_PACKED_MIP_INFO packed{};
     D3D12_TILE_SHAPE shape{};
-    D3D12_SUBRESOURCE_TILING tilings[16] = {};
-    check(r8_vtable && reinterpret_cast<Slot10Fn>(r8_vtable[10])(r8_computer, &total, &packed, &shape, &n, 0, tilings) == S_OK,
-          "slot 10 tiles a 256 x 128 R8_UNORM description");
-    check(total == 1 && packed.NumStandardMips == 1 && packed.NumPackedMips == 0 && packed.NumTilesForPackedMips == 0,
-          "one tile, one standard mip, nothing packed");
-    check(shape.WidthInTexels == 256 && shape.HeightInTexels == 256 && shape.DepthInTexels == 1, "the 8-bit tile shape");
-    check(n == 1 && tilings[0].WidthInTiles == 1 && tilings[0].HeightInTiles == 1 && tilings[0].DepthInTiles == 1 &&
-              tilings[0].StartTileIndexInOverallResource == 0,
-          "one subresource tiling, starting at tile 0");
+    D3D12_SUBRESOURCE_TILING subs[4]{};
+    check(slot<Slot10Fn>(computer, 10)(computer, &tiles, &packed, &shape, &n, 0, subs) == S_OK, "slot 10: S_OK");
+    check(tiles == 2 && packed.NumStandardMips == 1 && packed.NumPackedMips == 8 && packed.NumTilesForPackedMips == 1,
+          "slot 10: 2 tiles, 1 standard mip, 8 packed in 1 tile");
+    check(shape.WidthInTexels == 256 && shape.HeightInTexels == 256 && shape.DepthInTexels == 1 && n == 1 &&
+              subs[0].StartTileIndexInOverallResource == 1,
+          "slot 10: 256x256 tile shape, mip 0 starts at tile 1");
 
-    // A full mip chain (MipLevels 0), from the second subresource on: the same numbers as src/resource_tiling.h gives.
-    D3D12_RESOURCE_DESC chain = r8;
-    chain.Width = 256;
-    chain.Height = 256;
-    chain.MipLevels = 0;
-    chain.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    void* chain_computer = nullptr;
-    create(&chain, &chain_computer);
-    leonida::TilingDesc expect_desc{};
-    expect_desc.width = 256;
-    expect_desc.height = 256;
-    expect_desc.mips = 9;
-    expect_desc.element_bytes = 4;
-    leonida::ResourceTiling expect;
-    check(leonida::resource_tiling(expect_desc, expect), "the reference tiling of 256 x 256 RGBA8 with 9 mips");
-    n = 16;
-    std::memset(tilings, 0, sizeof(tilings));
-    check(reinterpret_cast<Slot10Fn>(r8_vtable[10])(chain_computer, &total, &packed, &shape, &n, 2, tilings) == S_OK &&
-              total == expect.total_tiles && packed.NumStandardMips == expect.standard_mips &&
-              packed.NumPackedMips == expect.packed_mips && packed.NumTilesForPackedMips == expect.packed_tiles &&
-              packed.StartTileIndexInOverallResource == expect.packed_start && shape.WidthInTexels == expect.shape.width,
-          "a full chain (MipLevels 0) answers the reference tiling");
-    check(n == 7 && tilings[0].WidthInTiles == expect.subresources[2].width &&
-              tilings[0].StartTileIndexInOverallResource == expect.subresources[2].start,
-          "the subresource tilings start at the first one asked for");
+    d = desc(256, 256, 0, 98, 0x105);
+    check(create(&d, &computer) == S_OK, "256x256 BC7 0x105: S_OK");
+    check(slot<Slot10Fn>(computer, 10)(computer, &tiles, nullptr, nullptr, nullptr, 0, nullptr) == E_FAIL,
+          "slot 10: a 4 KiB mode has no 64 KiB tiling (E_FAIL)");
 
-    // A description it can lay out linearly: S_OK, and slot 2 fills the whole 0x1B40-byte layout structure.
-    D3D12_RESOURCE_DESC rgba = r8;
-    rgba.Width = 8;
-    rgba.Height = 4;
-    rgba.MipLevels = 2;
-    rgba.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    void* rgba_computer = nullptr;
-    check(create(&rgba, &rgba_computer) == S_OK && rgba_computer, "a description it can lay out gives S_OK");
-    void* const* sv = rgba_computer ? *static_cast<void* const* const*>(rgba_computer) : vtable;
-    static uint8_t big[0x1C00];
-    std::memset(big, 0xcd, sizeof(big));
-    check(reinterpret_cast<Slot2Fn>(sv[2])(rgba_computer, big) == S_OK, "slot 2 answers the linear layout");
-    auto u64 = [&](size_t at) { uint64_t v = 0; std::memcpy(&v, big + at, 8); return v; };
-    auto u32 = [&](size_t at) { uint32_t v = 0; std::memcpy(&v, big + at, 4); return v; };
-    constexpr size_t kMip0 = 0x18 + 0x38, kMip1 = kMip0 + 0x70;
-    // Rows are 256 bytes apart (src/console_linear_layout.h): mip 0 is 4 rows (1024 bytes), mip 1 2 rows (512 bytes).
-    check(u64(kMip0) == 1024 && u64(kMip0 + 0x10) == 1024 && u32(kMip0 + 0x1C) == 256 && u64(kMip1) == 512 &&
-              u32(kMip1 + 0x1C) == 256,
-          "mip 0 is 8 x 4 RGBA8 (256-byte pitch, 1024 bytes), mip 1 4 x 2 (256-byte pitch, 512 bytes) at the measured "
-          "offsets");
-    check(u64(kMip0 + 0x08) == 0 && u64(kMip1 + 0x08) == 1024, "mip 1 starts after mip 0");
-    check(u32(kMip0 + 0x18) == 64 && u32(kMip0 + 0x24) == 64 && u32(kMip0 + 0x30) == 8 && u32(kMip0 + 0x38) == 8 &&
-              u32(kMip0 + 0x3C) == 4 && u32(kMip1 + 0x38) == 4 && u32(kMip1 + 0x3C) == 2 && u32(kMip0 + 0x40) == 1 &&
-              u32(kMip0 + 0x44) == 1 && u32(kMip0 + 0x48) == 0,
-          "pitch and padded width in texels, width in elements, sizes in texels, array size, one sample, linear mode");
-    check(u64(0x00) == 1536 && u64(0x08) == 0x1000 && u32(0x10) == 2 && u32(0x14) == 1 && u32(0x1B38) == 3,
-          "the total size (both mips), the alignment, the mip and plane counts and the dimension");
-    check(u32(0x18) == 1 && u64(0x18 + 0x08) == 1536 && u64(0x18 + 0x10) == 1536 && u64(0x18 + 0x18) == 0 &&
-              u32(0x18 + 0x28) == 4 && u32(0x18 + 0x2C) == 2 && u32(0x18 + 0x30) == 0,
-          "plane 0: data, its size, array-slice size, offset, element bytes, two standard mips and no tail");
-    check(all_bytes(big + kMip0 + 2 * 0x70, 0x1B38 - (kMip0 + 2 * 0x70), 0) && all_bytes(big + 0x1B3C, 4, 0),
-          "the rest of the structure (other mips, planes 1-3) is zeroed, not left as the caller's stack held it");
-    check(all_bytes(big + 0x1B40, sizeof(big) - 0x1B40, 0xcd), "nothing past the 0x1B40-byte structure is written");
+    // Slot 6: element offsets of a linear 128x4 R16G16B16A16 (rows of 1 KiB), 0 outside.
+    d = desc(128, 4, 1, 11, 0x100);
+    check(create(&d, &computer) == S_OK, "128x4 linear: S_OK");
+    uint32_t bit = 7;
+    check(slot<Slot6Fn>(computer, 6)(computer, 0, 0, 3, 1, 0, 0, &bit) == (128 + 3) * 8 && bit == 0,
+          "slot 6: (3, 1) is 131 elements in");
+    check(slot<Slot6Fn>(computer, 6)(computer, 0, 0, 128, 0, 0, 0, nullptr) == 0, "slot 6: outside is 0");
 
-    // A 2-slice array: the plane holds both slices, each slice's mips at the same offsets.
-    D3D12_RESOURCE_DESC arr = rgba;
-    arr.DepthOrArraySize = 2;
-    void* arr_computer = nullptr;
-    check(create(&arr, &arr_computer) == S_OK && arr_computer, "a 2-slice array can be laid out");
-    std::memset(big, 0xcd, sizeof(big));
-    check(arr_computer && reinterpret_cast<Slot2Fn>((*static_cast<void* const* const*>(arr_computer))[2])(arr_computer, big) == S_OK &&
-              u64(0x00) == 3072 && u64(0x18 + 0x08) == 3072 && u64(0x18 + 0x10) == 1536 && u32(kMip0 + 0x40) == 2,
-          "the array's total is two slices of 1536 bytes and the mips report the array size");
+    // Sizes VIctory's library answered for full BC7 chains in 0x10a (oracle run).
+    struct { uint32_t w, h; uint64_t size; } chains[] = {{1024, 1024, 1441792}, {2048, 2048, 5636096},
+                                                         {4096, 4096, 22413312}};
+    for (const auto& c : chains) {
+        d = desc(c.w, c.h, 0, 98, 0x10a);
+        create(&d, &computer);
+        slot<Slot2Fn>(computer, 2)(computer, layout.data());
+        char what[96];
+        std::snprintf(what, sizeof(what), "%ux%u BC7 full chain 0x10a is %llu bytes", c.w, c.h,
+                      static_cast<unsigned long long>(c.size));
+        check(u64(0) == c.size, what);
+    }
 
-    // The plane the retail title writes back over align256(width) * height bytes (+0x532F140): a 1920x1080 R8 texture
-    // takes 2048-byte rows, 0x21C000 bytes, not the tight 0x1FA400.
-    D3D12_RESOURCE_DESC plane = r8;
-    plane.Width = 1920;
-    plane.Height = 1080;
-    plane.MipLevels = 1;
-    plane.DepthOrArraySize = 1;
-    void* plane_computer = nullptr;
-    check(create(&plane, &plane_computer) == S_OK && plane_computer, "a 1920x1080 R8 plane can be laid out");
-    std::memset(big, 0xcd, sizeof(big));
-    check(plane_computer &&
-              reinterpret_cast<Slot2Fn>((*static_cast<void* const* const*>(plane_computer))[2])(plane_computer, big) ==
-                  S_OK &&
-              u32(kMip0 + 0x1C) == 2048 && u64(kMip0) == 0x21C000 && u64(0x00) == 0x21C000,
-          "a 1920x1080 R8 plane has 2048-byte rows, 0x21C000 bytes");
+    // Layout-level round trips over the addressable modes (texture.rs cases).
+    auto ld = [](uint32_t w, uint32_t h, uint32_t m, uint32_t bpe, uint32_t s) {
+        cl::Desc x;
+        x.width = w, x.height = h, x.mips = m, x.element_bytes = bpe, x.swizzle = s;
+        return x;
+    };
+    cl::Desc cases[] = {ld(64, 64, 7, 16, cl::kSw64kbD), ld(100, 60, 7, 4, cl::kSw64kbD), ld(250, 175, 8, 8, cl::kSw4kbS),
+                        ld(33, 17, 6, 1, cl::kSw4kbD),   ld(40, 9, 3, 2, cl::kSw64kbS),   ld(30, 20, 5, 4, cl::kLinear),
+                        ld(83, 31, 6, 1, cl::kSw256bS),  ld(109, 71, 6, 16, cl::kSw256bD), ld(70, 70, 4, 16, cl::kSw4kbS),
+                        ld(64, 32, 7, 4, cl::kSw4kbS)};
+    cases[7].block = 4;
+    cases[8].depth = 3;
+    cases[9].dimension = cl::Dimension::tex3d;
+    cases[9].depth = 16;
+    bool all = true;
+    for (const cl::Desc& c : cases) all &= round_trip(c);
+    check(all, "addresses are a bijection and copies round-trip (10 layouts)");
 
-    // Slot 8 writes mip 1 from a wider source into the texture memory, after mip 0; slot 9 reads it back.
-    static uint8_t memory[1536];
-    std::memset(memory, 0xcd, sizeof(memory));
-    uint8_t source[48];
-    for (int i = 0; i < 48; ++i) source[i] = static_cast<uint8_t>(i);
-    check(reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 0, 1, source, 24, 48) == S_OK,
-          "slot 8 copies a subresource in");
-    check(all_bytes(memory, 1024, 0xcd) && memory[1024] == 0 && memory[1039] == 15 && memory[1040] == 0xcd &&
-              memory[1280] == 24 && memory[1295] == 39 && memory[1296] == 0xcd,
-          "mip 1's two rows land 256 bytes apart after mip 0, read at the caller's row pitch, the padding untouched");
-    check(reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 0, 2, source, 24, 48) == kNotImpl &&
-              reinterpret_cast<Slot8Fn>(sv[8])(rgba_computer, memory, 1, 0, source, 24, 48) == kNotImpl,
-          "slot 8 refuses a subresource past the description or another plane");
-
-    // Slot 9 copies mip 1 (the bytes after mip 0) into a wider destination with the caller's row pitch.
-    using Slot9Fn = HRESULT(__stdcall*)(void*, void*, UINT, UINT, const void*, const void*, UINT, UINT);
-    static uint8_t texels[1536];
-    for (int i = 0; i < 1536; ++i) texels[i] = static_cast<uint8_t>(i % 251);
-    uint8_t out[64];
-    std::memset(out, 0xcd, sizeof(out));
-    check(reinterpret_cast<Slot9Fn>(sv[9])(rgba_computer, out, 0, 1, nullptr, texels, 24, 48) == S_OK,
-          "slot 9 copies a subresource out");
-    check(out[0] == 1024 % 251 && out[15] == 1039 % 251 && out[16] == 0xcd && out[24] == 1280 % 251 &&
-              out[39] == 1295 % 251 && out[40] == 0xcd,
-          "mip 1's two rows land at the caller's row pitch, nothing between them");
-    check(reinterpret_cast<Slot9Fn>(sv[9])(rgba_computer, out, 0, 2, nullptr, texels, 24, 48) == kNotImpl,
-          "slot 9 refuses a subresource past the description");
-
-    void* again = nullptr;
-    create(console_desc, &again);
-    check(again == r8_computer && chain_computer != r8_computer, "one computer per description, kept for the run");
-
-    auto release = reinterpret_cast<ReleaseFn>(vtable[1]);
-    release(computer);
-    release(computer);
-    check(reinterpret_cast<Slot2Fn>(vtable[2])(computer, layout) == kNotImpl,
-          "the computer stays usable after more Releases than it was handed out");
+    // Hand-checked addresses: 64 KiB D, 4-byte elements; 4 KiB S, 16-byte elements is 16x16 with y first.
+    auto l = cl::Layout::make(ld(128, 128, 1, 4, cl::kSw64kbD));
+    uint64_t at = 0;
+    bool hand = l && l->offset(0, 1, 0, 0, at) == cl::Error::none && at == 4 && l->offset(0, 4, 0, 0, at) == cl::Error::none &&
+                at == 64 && l->offset(0, 0, 4, 0, at) == cl::Error::none && at == 128 &&
+                l->offset(0, 64, 64, 0, at) == cl::Error::none && at == ((1u << 15) | (1u << 14));
+    l = cl::Layout::make(ld(32, 32, 1, 16, cl::kSw4kbS));
+    hand = hand && l && l->block[0] == 16 && l->block[1] == 16 && l->offset(0, 0, 1, 0, at) == cl::Error::none &&
+           at == 16 && l->offset(0, 16, 0, 0, at) == cl::Error::none && at == 4096 &&
+           l->offset(0, 0, 16, 0, at) == cl::Error::none && at == 8192;
+    check(hand, "hand-checked element addresses");
+    l = cl::Layout::make(ld(64, 64, 9, 16, cl::kSw4kbS));
+    check(l && l->first_tail_mip == 3 && l->mips[2].offset == 4096 && l->mips[1].offset == 8192 &&
+              l->mips[0].offset == 8192 + 16384,
+          "4 KiB blocks hold fewer tail mips");
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
