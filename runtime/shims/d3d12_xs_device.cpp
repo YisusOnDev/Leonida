@@ -549,6 +549,7 @@ HRESULT WINAPI dxgi_get_private_data(void* self, const GUID* name, UINT* size, v
 }
 HRESULT WINAPI dxgi_get_parent(void* self, const IID* riid, void** out) {
     note_dxgi("XboxIDXGIDevice::GetParent");
+    if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure
     if (!riid) return E_POINTER;
     return dxgi_adapter(dxgi_owner(self), *riid, out);
 }
@@ -2293,7 +2294,6 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
 // (S_FALSE for a valid description on the PC), as #558 does for slot 14.
 HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
                                    void** out) {
-    note_slot(8);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
     // The caller's null output goes to the real device on purpose: its answer (S_FALSE, E_UNEXPECTED, ...) is the
@@ -2942,7 +2942,11 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
                                            {1, xbox_desc->kind1, xbox_desc->kind1_size},
                                            {6, xbox_desc->kind6, xbox_desc->kind6_size},
                                            {7, xbox_desc->kind7, xbox_desc->kind7_size}};
-        payload = leonida::fspx_payload_from_parts(parts);
+        try {
+            payload = leonida::fspx_payload_from_parts(parts);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
         if (payload.empty()) {
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true, std::memory_order_relaxed))
@@ -2957,6 +2961,9 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
         }
         pc_desc.CS.pShaderBytecode = payload.data();
         pc_desc.CS.BytecodeLength = payload.size();
+    } else if ((!xbox_desc->kind6 && xbox_desc->kind6_size) || (!xbox_desc->kind1 && xbox_desc->kind1_size) ||
+               (!xbox_desc->kind7 && xbox_desc->kind7_size)) {
+        return E_INVALIDARG;
     }
 
     pc_desc.NodeMask = 0;
@@ -3577,6 +3584,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 2) {
         return proxy_release(self);
     } else if constexpr (Slot == 8) {
+        note_slot(8);
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                     reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 9) {
