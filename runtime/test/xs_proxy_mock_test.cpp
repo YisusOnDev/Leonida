@@ -1129,10 +1129,19 @@ int check_console_command_list() {
 
     // Console slot 32 (SetDescriptorHeaps) -> PC slot 28
     // Pass descriptor heap proxy to ensure UnwrappedArray unwrap_object works
-    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
-    void* heap_proxy = nullptr;
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
-    EXPECT(hr_of(raw(device, 14, word(&heap_desc), word(&heap_iid), word(&heap_proxy))) == S_OK);
+    // An ordinary descriptor with unrelated, nonzero adjacent bytes must still forward normally.
+    struct OrdinaryWithCanary {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        std::uint64_t canary[2];
+    } ordinary{heap_desc, {0x1111111111111111ull, 0x2222222222222222ull}};
+    const auto calls_before = mock_device->calls[14];
+    void* heap_proxy = nullptr;
+    EXPECT(hr_of(raw(device, 14, word(&ordinary.desc), word(&heap_iid), word(&heap_proxy))) == S_OK);
+    EXPECT(mock_device->calls[14] == calls_before + 1);
+    EXPECT(mock_device->args[14][0] == word(&ordinary.desc));
+    EXPECT(ordinary.canary[0] == 0x1111111111111111ull && ordinary.canary[1] == 0x2222222222222222ull);
     EXPECT(heap_proxy != nullptr && xs::is_heap_proxy(heap_proxy));
     ID3D12DescriptorHeap* real_heap = xs::heap_proxy_real_heap(heap_proxy);
     void* heap_ptrs[2] = {heap_proxy, real_heap};
