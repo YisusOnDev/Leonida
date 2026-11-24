@@ -96,7 +96,12 @@ def _multi_fragment_stream(rng, syms, dw):
             q = _pick_q(rng, w, piece)
         flush = k == len(pieces) - 1 or rng.random() < 0.5
         fragments.append((piece, w, q, flush))
-    return enc._encode_lane_stream(fragments, dw)
+    try:
+        return enc._encode_lane_stream(fragments, dw)
+    except ValueError:
+        # test_bcpack.py's encoder refuses a fragment whose payload comes out empty; one fragment then.
+        q = _pick_q(rng, dw, syms)
+        return enc._encode_lane_stream([(syms, dw, q, True)], dw)
 
 
 def encode(rng, lanes, codec):
