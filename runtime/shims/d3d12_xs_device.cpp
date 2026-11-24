@@ -3646,7 +3646,7 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const
     // as D32. Without depth the pipeline leaves the depth attachment alone. LEONIDA_SLOT57_DEPTH=1 restores the
     // old default.
     static const bool keep_depth = GetEnvironmentVariableW(L"LEONIDA_SLOT57_DEPTH", nullptr, 0) != 0;
-    if (!keep_depth) {
+    if (!keep_depth && pc_desc.PS.pShaderBytecode) {  // a depth-only pipeline keeps its depth
         pc_desc.DepthStencilState.DepthEnable = FALSE;
         pc_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         pc_desc.DSVFormat = DXGI_FORMAT_UNKNOWN;
