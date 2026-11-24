@@ -2018,6 +2018,26 @@ register, masks, system value, component type), `fssm_sha256`, and `descriptor_a
 bits 25/26 plus table-load and high-dword-truncation flags). A missing or malformed ISG1 signature leaves the vertex shader
 without recorded inputs. In that case the runtime accepts any input layout when filtering shader candidates.
 
+**The console's vertex-buffer table (measured on one program).** The vertex programs that the slot-57 pipeline
+library ships precompiled for the console (`fspx_gfx`) do not call a fetch shader. They load one 16-byte buffer V# per
+input slot from the 40-bit pointer `s[0:1]` (`s0`, plus bits 0-7 of `s1`), add `s2` to the vertex index, and fetch
+each attribute themselves. They use the stride from V# word 1 and check NUM_RECORDS and OOB_SELECT. This was measured
+on the program that composites into the back buffer, which reads a 24-byte vertex with position at +0, colour at +12
+and uv at +16. On the console the driver fills that table from `IASetVertexBuffers`.
+
+`src/console_vertex_table.h` holds the CPU side of this; `console_vertex_table_test` checks it without a GPU:
+- `console_vertex_table` writes one V# per input slot from the bound views: the shader-visible VA, the stride,
+  `size / stride` records and a non-zero format.
+- `console_vertex_user_words` sets `s[0:1]` to the table, `s2` to the first vertex (the base vertex when indexed) and
+  `s3` to the first instance.
+- `expand_rect_list` expands a rectangle list (topology 17, three vertices per rectangle) into two triangles. The
+  fourth corner is the one opposite the right angle, which is found from the positions. Each of its dwords is
+  `a + b - corner`, and a dword with the same bits at all three vertices (a packed colour) is copied. This follows the
+  approach of VIctory's `crates/victory-gpu/src/primitive.rs` (GPL-3); no code was taken.
+
+The replay does not use these helpers yet. Wiring them in needs a way for shaders to reach the title's memory (title
+VA windows in the arena) and slot-57 pipelines that carry their code base, and neither is on main yet.
+
 ### 3.6 Shader identity, PSOs and feature selection
 
 A D3D12 PSO carries DXBC containers, not SPIR-V. The layer identifies a shader by hashing the **FSSM payload** (the

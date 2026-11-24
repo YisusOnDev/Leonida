@@ -3326,6 +3326,11 @@ if(TARGET Vulkan::Headers)
       endif()
     endif()
     add_test(NAME vk_queue_constructor_oom COMMAND vk_queue_constructor_oom_test)
+    # The console vertex-buffer table of slot-57 vertex programs and the rectangle-list expansion
+    # (src/console_vertex_table.h).
+    add_executable(console_vertex_table_test test/console_vertex_table_test.cpp)
+    target_link_libraries(console_vertex_table_test PRIVATE Vulkan::Headers)
+    add_test(NAME console_vertex_table COMMAND console_vertex_table_test)
   endif()
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
