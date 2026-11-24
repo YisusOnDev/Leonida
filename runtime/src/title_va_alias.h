@@ -193,9 +193,18 @@ public:
     // A use of the copy at `shader_va` (an arena offset): the device keeps refreshing a window of the title's memory
     // only while something names it, and copies a retired one again here before it is used.
     using Toucher = void (*)(void* context, std::uint64_t shader_va);
+    // The first device to register keeps it until it clears it, as with set_hooks.
     void set_toucher(void* context, Toucher toucher) {
+        std::lock_guard lock(hook_mutex_);
+        if (toucher_context_.load(std::memory_order_relaxed)) return;
         toucher_context_.store(context, std::memory_order_relaxed);
         toucher_.store(toucher, std::memory_order_release);
+    }
+    void clear_toucher(void* context) {
+        std::lock_guard lock(hook_mutex_);
+        if (toucher_context_.load(std::memory_order_relaxed) != context) return;
+        toucher_.store(nullptr, std::memory_order_release);
+        toucher_context_.store(nullptr, std::memory_order_relaxed);
     }
     void touch(std::uint64_t shader_va) const {
         if (const Toucher t = toucher_.load(std::memory_order_acquire))

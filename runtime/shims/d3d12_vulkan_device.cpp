@@ -6801,7 +6801,7 @@ public:
 
     ~Device() override {
         leonida::title_va_aliases().clear_hooks(&state_);
-        leonida::title_va_aliases().set_toucher(nullptr, nullptr);
+        leonida::title_va_aliases().clear_toucher(&state_);
         {
             std::lock_guard lock(state_.title_window_mutex);
             for (const auto& window : state_.title_windows)
