@@ -188,7 +188,8 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
     EXPECT(SUCCEEDED(create(readback_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_COPY_DEST, readback)));
 
     // Without a pointer a texture maps only in a CPU-visible heap, as on D3D12; with one (the console's rule) any
-    // texture maps, to the start of its tight linear copy, which Unmap writes back to the image.
+    // texture maps, to the start of its linear copy (rows 256 bytes apart, src/console_linear_layout.h), which Unmap
+    // writes back to the image.
     void* pointer = nullptr;
     EXPECT(tex->Map(0, nullptr, nullptr) == S_OK);
     EXPECT(tex->Map(1, nullptr, nullptr) == S_OK);
@@ -198,8 +199,9 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
     EXPECT(gpu_only->Map(0, nullptr, &pointer) == S_OK && pointer);
     if (pointer) {
         auto* texels = static_cast<std::uint8_t*>(pointer);
-        EXPECT(texels[0] == 0 && texels[4 * 4 * 4 - 1] == 0);  // a new texture reads back zero-filled
-        for (int i = 0; i < 4 * 4 * 4; ++i) texels[i] = static_cast<std::uint8_t>(i + 1);
+        EXPECT(texels[0] == 0 && texels[3 * 256 + 15] == 0);  // a new texture reads back zero-filled
+        for (int y = 0; y < 4; ++y)  // 4x4 RGBA8: 16-byte rows at a 256-byte pitch, 1024 bytes in all
+            for (int x = 0; x < 16; ++x) texels[y * 256 + x] = static_cast<std::uint8_t>(y * 16 + x + 1);
         gpu_only->Unmap(0, nullptr);
         std::vector<std::uint8_t> back(4 * 4 * 4, 0xcd);
         void* again = nullptr;

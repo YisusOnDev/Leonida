@@ -16,6 +16,7 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
+#include "../src/console_linear_layout.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
@@ -2273,7 +2274,8 @@ public:
     // WriteToSubresource/ReadFromSubresource.
     // A texture: without a pointer, as on D3D12 (a CPU-visible heap only). With one, as on the console, where a
     // texture's memory is the CPU's: the pointer is the start of the whole texture (whatever the subresource) in
-    // the tight linear layout xg_xs.dll answers the title (subresources in D3D12 order, rows of whole blocks). The
+    // the linear layout xg_xs.dll answers the title (subresources in D3D12 order, rows of whole blocks at 256-byte
+    // pitches: src/console_linear_layout.h, which also says why the title needs that pitch). The
     // bytes live in a host copy kept for the resource, read from the image on the first Map and written back to
     // every subresource on each Unmap. Measured: game_scarlett_master.exe+0x5121690 maps a texture with a pointer
     // (vtable slot 8, from +0x5121891 and +0x512176b) to lock it for a CPU fill (+0x13363b0); with E_INVALIDARG the
@@ -2287,15 +2289,24 @@ public:
             const std::lock_guard lock(shadow_mutex_);
             if (shadow_.empty()) {
                 Region r{};
-                std::uint64_t total = 0;
+                std::uint64_t total = 0, tight = 0;
                 for (UINT i = 0; region(i, nullptr, r); ++i) {
                     shadow_offsets_.push_back(total);
-                    total += r.row_bytes * r.rows * r.slices;
+                    total += leonida::console_linear_size(r.row_bytes, r.rows, r.slices);
+                    tight += r.row_bytes * r.rows * r.slices;
                 }
                 if (!total) return E_INVALIDARG;
                 shadow_.assign(total, std::byte{0});
                 for (UINT i = 0; i < shadow_offsets_.size(); ++i)
                     shadow_rows(false, i);
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: texture Map copy %p: %ux%u format %d, %zu subresource(s), 0x%llx bytes "
+                                 "at 256-byte row pitches (0x%llx tight)\n",
+                                 static_cast<void*>(shadow_.data()), binding_.width, binding_.height,
+                                 int(desc_.Format), shadow_offsets_.size(), static_cast<unsigned long long>(total),
+                                 static_cast<unsigned long long>(tight));
             }
             ++shadow_maps_;
             *data = shadow_.data();
@@ -2533,12 +2544,13 @@ private:
         return release(S_OK);
     }
 
-    // One subresource between the image and its place in the Map copy (see Map), at tight pitches.
+    // One subresource between the image and its place in the Map copy (see Map), at the console's linear pitches.
     void shadow_rows(bool write, UINT subresource) {
         Region r{};
         if (!region(subresource, nullptr, r)) return;
-        cpu_copy(write, subresource, nullptr, shadow_.data() + shadow_offsets_[subresource],
-                 static_cast<UINT>(r.row_bytes), static_cast<UINT>(r.row_bytes * r.rows));
+        const std::uint64_t pitch = leonida::console_linear_pitch(r.row_bytes);
+        cpu_copy(write, subresource, nullptr, shadow_.data() + shadow_offsets_[subresource], static_cast<UINT>(pitch),
+                 static_cast<UINT>(pitch * r.rows));
     }
 
     bool cpu_visible() const {
