@@ -773,6 +773,51 @@ int main() {
         EXPECT(wait.get().token == 6);
     }
 
+    // WaitFrameEventX with wait_flag_current_token (0x2): non-blocking current-token poll.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        std::uint64_t token = 0;
+
+        // Invalid event and null output pointer still fail with invalid_arg.
+        EXPECT(pacer.wait_frame_event(99, 0, wait_flag_current_token, &token) == pacer_hr::invalid_arg);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, nullptr) == pacer_hr::invalid_arg);
+
+        // Before an interval or origin event is armed, flag 0x2 still returns a fresh presentable token.
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok);
+        EXPECT(token == 1);
+        FramePacer::TokenIssue issue{};
+        EXPECT(pacer.check_present_token(token, &issue) == pacer_hr::ok && issue == FramePacer::TokenIssue::none);
+
+        // Armed, between origins, and with latency already full: flag 0 (timeout 0) times out, flag 0x2 succeeds at once.
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period);  // origin 1
+        std::uint64_t t_origin1 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &t_origin1) == pacer_hr::ok && t_origin1 == 2);
+        pacer.commit_present_token(t_origin1, 1);  // 1 frame in flight == latency
+        EXPECT(pacer.frames_in_flight() == 1);
+        clock.advance_us(period / 2);  // t = 1.5 * period (between origins 1 and 2)
+        std::uint64_t blocked_token = 777;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &blocked_token) == pacer_hr::timeout);
+        EXPECT(blocked_token == 777);
+
+        std::uint64_t polled = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &polled) == pacer_hr::ok);
+        EXPECT(polled == 3);
+        EXPECT(pacer.check_present_token(polled, &issue) == pacer_hr::ok && issue == FramePacer::TokenIssue::none);
+        FrameStatistic stat{};
+        std::uint32_t count = 1;
+        EXPECT(pacer.get_frame_statistics(polled, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(count == 1 && stat.token == polled && stat.time_us == period);
+
+        // While suspended, even flag 0x2 returns invalid_state and leaves the caller's token unchanged.
+        pacer.suspend();
+        std::uint64_t untouched = 999;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &untouched) ==
+               pacer_hr::invalid_state);
+        EXPECT(untouched == 999);
+    }
+
     // Real clock: five 10 ms vblanks take about 50 ms.
     {
         SteadyFrameClock clock;
