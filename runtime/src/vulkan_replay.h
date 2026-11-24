@@ -42,6 +42,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -1060,6 +1064,9 @@ inline constexpr std::size_t max_render_targets = 8;  // D3D12_SIMULTANEOUS_REND
 
 // What a draw needs beyond Prepared, kept apart in PreparedList::draws: every command's entry is refilled on every
 // ExecuteCommandLists, and most commands are not draws.
+struct PreparedDraw;
+inline void log_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipeline& graphics);
+
 struct PreparedDraw {
     struct Attachment {
         ResourceBinding binding;
@@ -1098,6 +1105,50 @@ struct PreparedDraw {
         layers = 1;
     }
 };
+
+// LEONIDA_DRAW_LOG=N: the first N draws the replay emits, one line each (bring-up: why a frame stays the clear colour).
+// Namespace-scope state, not guarded statics: replay may run on a title thread.
+inline std::atomic<long> g_draw_log_left{-1};
+inline void log_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipeline& graphics) {
+    long left = g_draw_log_left.load(std::memory_order_relaxed);
+    if (left == -1) {
+        char text[16] = {};
+        std::size_t length = 0;
+        long n = 0;
+#ifdef _WIN32
+        if (getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1) n = std::atol(text);
+#else
+        (void)length;
+        if (const char* env = std::getenv("LEONIDA_DRAW_LOG")) n = std::atol(env);
+#endif
+        long expected = -1;
+        g_draw_log_left.compare_exchange_strong(expected, n);
+        left = g_draw_log_left.load(std::memory_order_relaxed);
+    }
+    if (left <= 0 || g_draw_log_left.fetch_sub(1) <= 0) return;
+    std::string colors;
+    for (std::size_t i = 0; i < d.colors.size(); ++i) {
+        const auto& a = d.colors[i];
+        char one[96];
+        std::snprintf(one, sizeof(one), " c%zu{id %llu view %d fmt %d}", i, static_cast<unsigned long long>(a.id),
+                      a.view != VK_NULL_HANDLE, i < graphics.color_formats.size() ? int(graphics.color_formats[i]) : -1);
+        colors += one;
+    }
+    std::string user;
+    for (int i = 0; i < 16; ++i) {
+        char one[16];
+        std::snprintf(one, sizeof(one), " %x", draw.user_data[i]);
+        user += one;
+    }
+    std::fprintf(stderr,
+                 "[rt] draw-log: %s count %u inst %u first %u topo %u vp %.0f,%.0f %.0fx%.0f d%.2f-%.2f sc %d,%d-%d,%d "
+                 "area %ux%u pipe %d depth{id %llu fmt %d}%s vbs %zu user%s\n",
+                 draw.indexed ? "indexed" : "draw", draw.count, draw.instances, draw.first, draw.topology,
+                 draw.viewport.x, draw.viewport.y, draw.viewport.width, draw.viewport.height, draw.viewport.min_depth,
+                 draw.viewport.max_depth, draw.scissor.left, draw.scissor.top, draw.scissor.right, draw.scissor.bottom,
+                 d.area.width, d.area.height, d.pipeline != VK_NULL_HANDLE, static_cast<unsigned long long>(d.depth.id),
+                 int(graphics.depth_format), colors.c_str(), d.vertex_buffers.size(), user.c_str());
+}
 
 // D3D converts a float clear value to a normalised format by rounding to nearest even, so an exact tie goes to the
 // even neighbour (0.5 on 8 bits is 128). Vulkan leaves the rounding of ties to the GPU, and NVIDIA writes 127, one
@@ -4342,6 +4393,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
+            detail::log_draw(*draw, d, graphics);
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
             if (graphics.bindless_set) {
                 const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
