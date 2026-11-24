@@ -102,6 +102,7 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 F16_HALVES = False
 F16_HALF_TOP = 29
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
+OUTLINE = True          # --no-outline turns it off: repeated instruction bodies become shared functions (SPIRV-SIZE-3)
 
 
 # The heap base as one %ulong, in the entry block of %main: the push constants don't change during the invocation, and
@@ -370,8 +371,8 @@ class Gen:
         self.lane_either = {}      # id(instruction) -> SGPRs holding constant 0/-1 (EITHER) there
         self.cur_either = ()
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
-        self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
-        self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
+        self.scc_live = None       # set of id(ins) whose SCC write is live-out (wave64_emulate_opt); None = all
+        self.cur_scc_live = True   # whether the current instruction's SCC result is live-out
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
         self.uses_heap = False
@@ -386,6 +387,12 @@ class Gen:
         self.pixel_interpolants = None  # PS: (count, fp16_mask) from the FSSM pixel-input table; None = no table
         self.v_interp_copy = {}   # PS: vgpr -> (root barycentric register v0/v1, program-order index of its
                                   # single defining plain v_mov of it); valid I/J sources (SHADER-177)
+        self.lane_hoist = False  # CS: %h_li / %h_wl / %h_up are defined once in %entry (lane_hoisted)
+        self.helper_depth = 0    # > 0 while a helper function's body is built (no %main ids such as %h_li there)
+        self.spans = []          # (start, end) in self.body of each top-level instruction's lines (spirv_outline)
+        self.span_depth = 0
+        self.block_spans = {}    # basic block -> its spans, kept with gen.blocks[n]
+        self.outlined = (0, 0)   # (spans outlined, functions) by outline_main
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
@@ -2728,8 +2735,10 @@ class Gen:
         if width not in self.tbuffer_norm_fns:
             parameter = f"{function}_m"
             outer_body, self.body = self.body, []
+            self.helper_depth += 1
             result = self.norm_bits(parameter, width)
             lines, self.body = self.body, outer_body
+            self.helper_depth -= 1
             self.tbuffer_norm_fns[width] = [
                 f"{function} = OpFunction %uint Pure %fn_tbuffer_norm",
                 f"{parameter} = OpFunctionParameter %uint", f"{function}_entry = OpLabel",
@@ -3275,8 +3284,10 @@ class Gen:
         """The shared %fmt_norm_bits(m, n): the exact quotient by 2^n - 1 for a run-time width."""
         if self.fmt_norm_fn is None:
             saved, self.body = self.body, []
+            self.helper_depth += 1
             res = self.fmt_norm_bits_dyn("%fn_m", "%fn_n")
             lines, self.body = self.body, saved
+            self.helper_depth -= 1
             self.fmt_norm_fn = (["%fmt_norm_bits = OpFunction %uint None %fn_fmt_norm",
                                  "%fn_m = OpFunctionParameter %uint", "%fn_n = OpFunctionParameter %uint",
                                  "%fmt_norm_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
@@ -3429,9 +3440,11 @@ class Gen:
             fns = list(self.fmt_norm_function())
             for k in range(4):
                 saved, self.body = self.body, []
+                self.helper_depth += 1
                 params = [f"%fd{k}_fmt", f"%fd{k}_words"]
                 res = self.fmt_dec_component(k, params)
                 lines, self.body = self.body, saved
+                self.helper_depth -= 1
                 fns += ([f"%fmt_dec_c{k} = OpFunction %uint None %fn_fmt_dec"] +
                         [f"{params[0]} = OpFunctionParameter %uint", f"{params[1]} = OpFunctionParameter %v4uint_fmt"] +
                         [f"%fmt_dec_c{k}_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
@@ -4309,6 +4322,7 @@ class Gen:
         if self.fmt_enc_fn is None:
             names = ["%fe_fmt"] + [f"%fe_{g}{i}" for g in "fnvis" for i in range(4)] + [f"%fe_t{i}" for i in range(8)]
             saved, self.body = self.body, []
+            self.helper_depth += 1
             params = names[1:21]
             tw = names[21:29]       # the channels a two-component V# store takes: norm, float, int, signed int (2 each)
             lists = [params[4 * g:4 * g + 4] for g in range(5)]
@@ -4339,8 +4353,10 @@ class Gen:
             self.emit(f"{zero} = OpCompositeConstruct %v4uint_fmt " + " ".join([self.cu(0)] * 4))
             self.emit(f"OpReturnValue {zero}")
             lines, self.body = self.body, saved
+            self.helper_depth -= 1
             size_lines = []
             outer, self.body = self.body, []
+            self.helper_depth += 1
             sz = self.cu(0)
             for code, (size, _, _) in self.FORMATS.items():
                 e, n2 = self.tmp(), self.tmp()
@@ -4348,6 +4364,7 @@ class Gen:
                 self.emit(f"{n2} = OpSelect %uint {e} {self.cu(size)} {sz}")
                 sz = n2
             size_lines, self.body = self.body, outer
+            self.helper_depth -= 1
             self.fmt_enc_fn = (["%fmt_encode_fn = OpFunction %v4uint_fmt None %fn_fmt_encode"] +
                                [f"{q} = OpFunctionParameter %uint" for q in names] + ["%fe_entry = OpLabel"] + lines +
                                ["OpFunctionEnd", "%fmt_size_fn = OpFunction %uint Pure %fn_tbuffer_norm",
@@ -5299,9 +5316,35 @@ class Gen:
         self.uses_psb = True
         return self.lconsts[v]
 
+    def lane_hoisted(self):
+        """Whether the lane index, wave lane and upper-half bool of a compute shader come from ids computed once in
+        %entry (%h_li, %h_wl, %h_up) instead of being rebuilt from LocalInvocationId at every use (SPIRV-SIZE-1).
+        They are invariant for the invocation and %entry dominates all of %main. Not under --wave64-emulate, whose
+        rounds have their own prologue, nor with hoisting off (direct Gen() callers keep the inline form)."""
+        if (not (self.hoist_reg_ptrs and self.stage == "cs" and not self.emulate and self.cs is not None)
+                or self.helper_depth):
+            return False
+        self.lane_hoist = True
+        return True
+
+    def lane_upper(self, lane=None):
+        """Bool id: wave lane `lane` (default: this invocation's, wave_lane()) is 32..63, the high half of a wave64
+        lane mask. The hoisted lane gives the hoisted %h_up."""
+        lane = lane or self.wave_lane()
+        if lane == "%h_wl":
+            return "%h_up"
+        up = self.tmp()
+        self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+        return up
+
     def local_index(self):
         """LocalInvocationIndex of a compute or mesh shader invocation (thread i of its workgroup): the mesh shader
         loads the built-in; a compute shader flattens LocalInvocationId with the group size from its header."""
+        if self.lane_hoisted():
+            sx, sy, _ = self.cs["size"]
+            self.cu(sx)
+            self.cu(sx * sy)
+            return "%h_li"
         li = self.tmp()
         if self.stage == "ms":
             self.emit(f"{li} = OpLoad %uint %local_index")
@@ -5333,6 +5376,11 @@ class Gen:
         """This invocation's hardware lane within its wave. Compute and mesh shaders: LocalInvocationIndex mod the
         wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane; wave32
         pixel shaders use the lane within either 32-lane half."""
+        if self.lane_hoisted():
+            self.local_index()
+            self.cu(63 if self.wave64 else 31)
+            self.cu(32)
+            return "%h_wl"
         lane = self.tmp()
         if self.stage in ("cs", "ms"):
             self.emit(f"{lane} = OpBitwiseAnd %uint {self.local_index()} {self.cu(63 if self.wave64 else 31)}")
@@ -5511,6 +5559,7 @@ class Gen:
         params = {k: f"%xp_{kind}_{k}" for k in p_names}
         p_it, p_li = params["it"], params["li"]
         saved, self.body = self.body, []
+        self.helper_depth += 1
         n1, sn = self.tmp(), self.tmp()
         self.emit(f"{n1} = OpIAdd %uint {p_it} {self.cu(1)}")
         self.emit(f"{sn} = OpUMod %uint {n1} {self.cu(3)}")
@@ -5583,6 +5632,7 @@ class Gen:
                 self.emit(f"{old1} = OpAtomicOr %uint {p1} {self.cu(2)} {self.cu(0)} {params['b1']}")
             ret_id = rm
         lines, self.body = self.body, saved
+        self.helper_depth -= 1
         self.x_round_fns[kind] = (
             [f"{fn_name} = OpFunction %uint None {fn_type}"] +
             [f"{params[k]} = OpFunctionParameter %uint" for k in p_names] +
@@ -6351,8 +6401,7 @@ class Gen:
             if self.holds_lane_mask(a):
                 if self.wave64 and wide and a.get("n") == 2:
                     lo, hi = self.load_reg("sgpr", a["r"]), self.load_reg("sgpr", a["r"] + 1)
-                    up, sel = self.tmp(), self.tmp()
-                    self.emit(f"{up} = OpUGreaterThanEqual %bool {self.wave_lane()} {self.cu(32)}")
+                    up, sel = self.lane_upper(), self.tmp()
                     self.emit(f"{sel} = OpSelect %uint {up} {hi} {lo}")
                     return sel
                 return self.load_reg("sgpr", a["r"])
@@ -6364,8 +6413,7 @@ class Gen:
             lane = self.wave_lane()
             word = self.load_reg("sgpr", a["r"])
             if a.get("n", 1) == 2 and wide and self.wave64:
-                hi, up, sel = self.load_reg("sgpr", a["r"] + 1), self.tmp(), self.tmp()
-                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                hi, up, sel = self.load_reg("sgpr", a["r"] + 1), self.lane_upper(lane), self.tmp()
                 self.emit(f"{sel} = OpSelect %uint {up} {hi} {word}")
                 word = sel
             sh, shr, bit, r = (self.tmp() for _ in range(4))
@@ -6392,8 +6440,7 @@ class Gen:
             sh, word, shr, bit, r = (self.tmp() for _ in range(5))
             self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
             if w64 and hi != lo:
-                up = self.tmp()
-                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                up = self.lane_upper(lane)
                 self.emit(f"{word} = OpSelect %uint {up} {self.cu(hi)} {self.cu(lo)}")
             else:
                 self.emit(f"{word} = OpCopyObject %uint {self.cu(lo)}")
@@ -7028,6 +7075,19 @@ class Gen:
                 "WORD_0": (0, 16), "WORD_1": (16, 16), "DWORD": (0, 32)}
 
     def insn(self, ins):
+        """One instruction; its lines are recorded as a span of self.body for spirv_outline (SPIRV-SIZE-3)."""
+        if self.span_depth:
+            return self._insn_one(ins)
+        start, body = len(self.body), self.body
+        self.span_depth = 1
+        try:
+            return self._insn_one(ins)
+        finally:
+            self.span_depth = 0
+            if self.body is body:
+                self.spans.append((start, len(body)))
+
+    def _insn_one(self, ins):
         """SDWA (sub-dword addressing): each source is narrowed to src<i>_sel (zero-extended, or sign-extended
         under sext()) before the op and its neg/abs, and a VGPR result is placed at dst_sel with dst_unused
         deciding the other bits (PAD = zero, SEXT = sign-extend, PRESERVE = keep the old bits). VOPC has no
@@ -7036,7 +7096,7 @@ class Gen:
         self.cur_masks = self.lane_masks.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
-        self.cur_scc_live = (not self.emulate) or (self.scc_live is None) or (id(ins) in self.scc_live)
+        self.cur_scc_live = (self.scc_live is None) or (id(ins) in self.scc_live)
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
         self.cur_either = self.lane_either.get(id(ins), ())
@@ -12513,8 +12573,10 @@ class Gen:
         if self.desc_fn is None:
             params = [f"%dl_w{i}" for i in range(8)]
             saved, self.body = self.body, []
+            self.helper_depth += 1
             result = self.desc_probe(params)
             lines, self.body = self.body, saved
+            self.helper_depth -= 1
             self.desc_fn = (["%desc_lookup_fn = OpFunction %uint None %fn_desc_lookup"] +
                             [f"{p} = OpFunctionParameter %uint" for p in params] + ["%dl_entry = OpLabel"] +
                             lines + [f"         OpReturnValue {result}", "OpFunctionEnd"])
@@ -15241,6 +15303,44 @@ def insert_late_constants(gen, out, written):
     out[at:at] = [f"{gen.consts[v]} = OpConstant %uint {v}" for v in late]
 
 
+def outline_main(gen, fn, types):
+    """spirv_outline (SPIRV-SIZE-3): repeated instruction spans of %main become calls of shared functions. Rewrites
+    gen.blocks (or the straight-line gen.body) in place, adds the struct and function types to `types` and returns
+    the functions' lines. Not under --wave64-emulate, whose rounds cut blocks into segments."""
+    if not OUTLINE or gen.emulate:
+        return []
+    import spirv_outline
+    entry = "%entry"
+    for line in fn:
+        t = line.split()
+        if len(t) >= 3 and t[1] == "=" and t[2] == "OpLabel":
+            entry = t[0]
+    if gen.blocks:
+        which = [n for n, b in enumerate(gen.blocks) if b and gen.block_spans.get(n)]
+        units = [(gen.blocks[n], gen.block_spans[n], f"%blk{n}") for n in which]
+        # The blocks' own labels come with their placement: name them so a reference to one is a label.
+        main_lines = ([f"%blk{n} = OpLabel" for n in range(len(gen.blocks) + len(gen.x_segs) + 1)] +
+                      [l for b in gen.blocks if b for l in b] + [l for seg in gen.x_segs.values() for l in seg])
+    else:
+        which = None
+        units = [(gen.body, gen.spans, entry)] if gen.spans else []
+        main_lines = list(gen.body)
+    if not units:
+        return []
+    outliner = spirv_outline.Outliner(list(fn) + main_lines, types)
+    new = spirv_outline.outline_units(units, outliner, gen.tmp)
+    if not outliner.outlined:
+        return []
+    if which is None:
+        gen.body = new[0]
+    else:
+        for n, lines in zip(which, new):
+            gen.blocks[n] = lines
+    gen.outlined = (outliner.outlined, len(outliner.functions))
+    types.extend(outliner.type_lines)
+    return [line for f in outliner.functions.values() for line in f[3]]
+
+
 def assemble(gen):
     vs = gen.stage == "vs"
     cs = gen.stage == "cs"
@@ -16005,13 +16105,26 @@ def assemble(gen):
     for (kind, r), p in gen.reg_ptrs.items():
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
         fn.append(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {gen.cu(r)}")
+    if gen.lane_hoist:
+        # Gen.lane_hoisted: the invocation's lane ids, once for all of %main (their constants were registered at use).
+        sx, sy, _ = gen.cs["size"]
+        c = lambda v: gen.consts[v & 0xFFFFFFFF]                                      # noqa: E731
+        fn += ["%h_lid = OpLoad %v3uint %local_id", "%h_lx = OpCompositeExtract %uint %h_lid 0",
+               "%h_ly = OpCompositeExtract %uint %h_lid 1", "%h_lz = OpCompositeExtract %uint %h_lid 2",
+               f"%h_ty = OpIMul %uint %h_ly {c(sx)}", f"%h_tz = OpIMul %uint %h_lz {c(sx * sy)}",
+               "%h_lxy = OpIAdd %uint %h_lx %h_ty", "%h_li = OpIAdd %uint %h_lxy %h_tz",
+               f"%h_wl = OpBitwiseAnd %uint %h_li {c(63 if gen.wave64 else 31)}",
+               f"%h_up = OpUGreaterThanEqual %bool %h_wl {c(32)}"]
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
+    helpers += outline_main(gen, fn, types)
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
+    if gen.lane_hoist and any("%h_" in line for line in helpers):
+        raise AssertionError("a helper function uses a lane id hoisted into %main's %entry (Gen.lane_hoisted)")
     tree, nesting = (capped_tree(gen.succ) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
@@ -17632,8 +17745,10 @@ def translate(path):
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
     folds, fold_chain, absorbed = {}, {}, set()
+    # SCC liveness gates the subgroup vote that gives SCC after a lane-mask op (scc_from_mask, scc_any_half): a
+    # vote whose SCC is overwritten before any read is not emitted (SPIRV-SIZE-2). Native and emulated alike.
+    g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
     if g.emulate:
-        g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
         folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(
             blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes)
         if STRUCTURED:
@@ -17773,6 +17888,7 @@ def translate(path):
     for n, blk in enumerate(blocks):
         if n in absorbed:
             g.blocks.append(None)
+            g.block_spans[len(g.blocks) - 1] = []
             g.succ.append(succ[n])
             continue
         plan = g.emulate_plan
@@ -17781,6 +17897,7 @@ def translate(path):
         mini_set = plan["mini_blocks"][mini_idx] if mini_idx is not None else None
         in_tail = bool(plan is not None and n in plan["tail_blocks"])
         g.body = []
+        g.spans = []
         g.block_label = f"%blk{n}"
         g.x_marks = []
         g.x_dirty = set(plan["dirty_in"].get(n, ())) if g.emulate_inline else set()
@@ -17884,6 +18001,7 @@ def translate(path):
                 elif in_tail:
                     g.tail_segs.append(seg)
         else:
+            g.block_spans[len(g.blocks)] = g.spans
             g.blocks.append(lines)
     g.emulate_inline = False
     assert succ == g.succ, "the lane-mask analysis ran on a different graph"
@@ -18821,6 +18939,9 @@ def main():
     ap.add_argument("--opt", action="store_true",
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
+    ap.add_argument("--no-outline", action="store_true",
+                    help="emit every instruction inline instead of sharing repeated instruction bodies as SPIR-V "
+                         "functions (SPIRV-SIZE-3, tools/spirv_outline.py; to compare module size and compile time)")
     a = ap.parse_args()
     # A file at --out (or one above it) can never become a folder. Refuse it here, before
     # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
@@ -18856,6 +18977,8 @@ def main():
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
     OPT_SPIRV = a.opt
+    global OUTLINE
+    OUTLINE = not a.no_outline
     if a.merge:
         try:
             merged = merge_shard_parts(a.out)
