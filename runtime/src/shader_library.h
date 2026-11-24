@@ -127,9 +127,10 @@ struct Huffman {
     std::array<std::uint16_t, kFastSize> fast{};
 };
 
+inline constexpr std::uint8_t kRev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};  // 4-bit reversal
+
 // Canonical Huffman table from code lengths. Returns false for an over-subscribed set.
-inline bool build_huffman(Huffman& h, const std::int16_t* lengths, int n) {
-    static constexpr std::uint8_t kRev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+inline constexpr bool build_huffman(Huffman& h, const std::int16_t* lengths, int n) {
     h.count.fill(0);
     int max_len = 0;
     for (int i = 0; i < n; ++i) {
@@ -252,6 +253,26 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
     }
 }
 
+struct FixedHuffmanTables {
+    Huffman litlen{};
+    Huffman dist{};
+};
+
+// Constexpr at file scope so deflate fixed-Huffman decompression never uses a function-local static init guard
+// (which depends on host CRT TLS slot 0).
+inline constexpr FixedHuffmanTables kFixedHuffmanTables = []() constexpr {
+    FixedHuffmanTables t{};
+    std::int16_t lengths[288]{};
+    for (int i = 0; i < 144; ++i) lengths[i] = 8;
+    for (int i = 144; i < 256; ++i) lengths[i] = 9;
+    for (int i = 256; i < 280; ++i) lengths[i] = 7;
+    for (int i = 280; i < 288; ++i) lengths[i] = 8;
+    build_huffman(t.litlen, lengths, 288);
+    for (int i = 0; i < 30; ++i) lengths[i] = 5;
+    build_huffman(t.dist, lengths, 30);
+    return t;
+}();
+
 } // namespace detail
 
 // Inflates a zlib stream (RFC 1950: header, deflate data, Adler-32). Returns false for a malformed stream, a
@@ -291,19 +312,8 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 out.push_back(x);
             }
         } else if (type == 1) {  // fixed Huffman
-            static const auto tables = [] {
-                std::pair<detail::Huffman, detail::Huffman> t;
-                std::int16_t lengths[288];
-                for (int i = 0; i < 144; ++i) lengths[i] = 8;
-                for (int i = 144; i < 256; ++i) lengths[i] = 9;
-                for (int i = 256; i < 280; ++i) lengths[i] = 7;
-                for (int i = 280; i < 288; ++i) lengths[i] = 8;
-                detail::build_huffman(t.first, lengths, 288);
-                for (int i = 0; i < 30; ++i) lengths[i] = 5;
-                detail::build_huffman(t.second, lengths, 30);
-                return t;
-            }();
-            if (const ZlibError e = detail::inflate_codes(reader, out, tables.first, tables.second, limit);
+            if (const ZlibError e = detail::inflate_codes(reader, out, detail::kFixedHuffmanTables.litlen,
+                                                          detail::kFixedHuffmanTables.dist, limit);
                 e != ZlibError::none)
                 return fail(e);
         } else if (type == 2) {  // dynamic Huffman
@@ -352,9 +362,16 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     const std::size_t at = 2 + reader.position();
     if (at + 4 > in.size()) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
-    for (const std::uint8_t x : out) {
-        a = (a + x) % 65521;
-        b = (b + a) % 65521;
+    // Delay the reductions for at most 5552 bytes: even starting with a = b = 65520 and every byte 255,
+    // 255*n*(n+1)/2 + (n+1)*65520 fits uint32_t for n <= 5552 (the Adler-32 bound used by zlib).
+    for (std::size_t begin = 0; begin < out.size();) {
+        const std::size_t end = begin + std::min<std::size_t>(5552, out.size() - begin);
+        for (; begin < end; ++begin) {
+            a += out[begin];
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
     }
     const std::uint32_t expected = (std::uint32_t(in[at]) << 24) | (std::uint32_t(in[at + 1]) << 16) |
                                    (std::uint32_t(in[at + 2]) << 8) | in[at + 3];

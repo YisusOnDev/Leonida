@@ -2,7 +2,8 @@
 //
 // A GDK title names its files on the console's drives, "GAME:\\data\\x.sps" being one in the installed game folder, so
 // the imports it makes of CreateFile*, FindFirstFile*/FindNextFile*/FindClose, GetFileAttributes*/GetFileAttributesEx*,
-// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes*, and the
+// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2, SetFileAttributes* and
+// SetFileInformationByHandle's delete requests (std::filesystem::remove deletes through a handle), and the
 // Universal CRT's fopen/_open families and its remove/rename/_stat/_access/_mkdir/_rmdir, are answered here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
@@ -15,7 +16,8 @@
 //     prefer, while an open of a deleted name that fails leaves the name deleted;
 //   - FILE_FLAG_DELETE_ON_CLOSE is a delete whatever access the open asks for: the open uses the overlay copy and a
 //     package name gets its marker once the open has succeeded;
-//   - reads prefer the overlay copy and then the package;
+//   - PLS: names only the private persistent storage folder in the overlay;
+//   - GAME: reads prefer the overlay copy and then the package;
 //   - FindFirstFile merges the two folders, the overlay winning on a name, and hides deleted names and the marker
 //     folder;
 //   - folders are made in the overlay; a removed package folder is hidden by a marker, a moved package file is
@@ -34,6 +36,7 @@
 #include <share.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -43,10 +46,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -217,25 +222,7 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
-Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& parts, Drive* out_drive = nullptr,
-                           bool create_scratch = true) {
-    if (std::wstring rest; game_dir_rest(path, rest))
-        return parse_console_parts(std::wstring(kGamePrefix) + rest, parts, out_drive, create_scratch);
-    size_t prefix_length = 0;
-    const Drive drive = console_drive(path, prefix_length);
-    if (out_drive) *out_drive = drive;
-    if (drive == Drive::None) return Parsed::Host;
-    parts.clear();
-    if (drive == Drive::Scratch) {
-        parts.push_back(kScratchDir);
-        if (create_scratch) {
-            const std::filesystem::path overlay = roots().overlay;
-            const DWORD last_error = ::GetLastError();
-            std::error_code ec;
-            if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
-            ::SetLastError(last_error);
-        }
-    }
+bool parse_relative(std::wstring_view path, size_t prefix_length, std::vector<std::wstring>& parts) {
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
     auto flush = [&]() -> bool {
@@ -257,12 +244,35 @@ Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& 
     for (size_t i = prefix_length; i < path.size(); ++i) {
         const wchar_t c = path[i];
         if (is_separator(c)) {
-            if (!flush()) return Parsed::Refused;
+            if (!flush()) return false;
         } else {
             part.push_back(c);
         }
     }
-    if (!flush()) return Parsed::Refused;
+    if (!flush()) return false;
+    return true;
+}
+
+Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& parts, Drive* out_drive = nullptr,
+                           bool create_scratch = true) {
+    if (std::wstring rest; game_dir_rest(path, rest))
+        return parse_console_parts(std::wstring(kGamePrefix) + rest, parts, out_drive, create_scratch);
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(path, prefix_length);
+    if (out_drive) *out_drive = drive;
+    if (drive == Drive::None) return Parsed::Host;
+    parts.clear();
+    if (drive == Drive::Scratch) {
+        parts.push_back(kScratchDir);
+        if (create_scratch) {
+            const std::filesystem::path overlay = roots().overlay;
+            const DWORD last_error = ::GetLastError();
+            std::error_code ec;
+            if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
+            ::SetLastError(last_error);
+        }
+    }
+    if (!parse_relative(path, prefix_length, parts)) return Parsed::Refused;
     // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
     // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
@@ -270,8 +280,8 @@ Parsed parse_console_parts(const std::wstring& path, std::vector<std::wstring>& 
     return Parsed::Console;
 }
 
-Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
-    return parse_console_parts(path, parts);
+Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts, bool create_scratch = true) {
+    return parse_console_parts(path, parts, nullptr, create_scratch);
 }
 
 std::filesystem::path join(const std::filesystem::path& root, const std::vector<std::wstring>& parts) {
@@ -331,6 +341,64 @@ Target fail(DWORD error) {
     Target t;
     t.error = error;
     return t;
+}
+
+// PLS is its own guest namespace. Its backing directory stays outside the package view and file operations
+// use the host's ordinary semantics on that directory, without package copy-up or deletion markers.
+constexpr std::wstring_view kPersistentPrefix = L"PLS:";
+
+bool persistent_guest_path(std::wstring_view path) {
+    return path.size() >= kPersistentPrefix.size() &&
+           _wcsnicmp(path.data(), kPersistentPrefix.data(), kPersistentPrefix.size()) == 0;
+}
+
+std::filesystem::path extended_path(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(path, ec).lexically_normal().make_preferred();
+    if (ec) return {};
+    const auto& wide = absolute.native();
+    if (wide.starts_with(L"\\\\?\\") || wide.starts_with(L"\\\\.\\")) return absolute;
+    if (wide.starts_with(L"\\\\")) return std::filesystem::path(L"\\\\?\\UNC\\" + wide.substr(2));
+    return std::filesystem::path(L"\\\\?\\" + wide);
+}
+
+// Check every existing component in the storage subtree. Never follow a preexisting directory junction
+// or symlink from the guest alias, including one in place of the storage directory itself.
+DWORD check_persistent_component(const std::filesystem::path& path) {
+    const DWORD saved_error = ::GetLastError();
+    const DWORD attributes = ::GetFileAttributesW(path.c_str());
+    const DWORD error = ::GetLastError();
+    ::SetLastError(saved_error);
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+        return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? ERROR_SUCCESS : error;
+}
+
+std::optional<Target> persistent_target(std::wstring_view name, bool allow_root = true) {
+    if (!persistent_guest_path(name)) return std::nullopt;
+    const size_t prefix_length = kPersistentPrefix.size();
+    if (name.size() > prefix_length && !is_separator(name[prefix_length]))
+        return fail(ERROR_INVALID_NAME);
+
+    std::vector<std::wstring> parts;
+    if (!parse_relative(name, prefix_length, parts)) return fail(ERROR_INVALID_NAME);
+    if (parts.empty() && !allow_root) return fail(ERROR_ACCESS_DENIED);
+
+    const auto overlay = roots().overlay;
+    if (overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
+    auto path = extended_path(overlay / kPersistentStorageDir);
+    if (path.empty()) return fail(ERROR_PATH_NOT_FOUND);
+    if (const DWORD error = check_persistent_component(path)) return fail(error);
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const bool wildcard = parts[i].find_first_of(L"*?") != std::wstring::npos;
+        if (wildcard && i + 1 != parts.size()) return fail(ERROR_INVALID_NAME);
+        path /= parts[i];
+        // FindFirstFile accepts a wildcard in the last component; its parent was already checked.
+        if (!wildcard) {
+            if (const DWORD error = check_persistent_component(path)) return fail(error);
+        }
+    }
+    return Target{std::move(path)};
 }
 
 // The overlay keeps one empty marker per deleted package path, outside the mirrored tree so it cannot collide with a
@@ -543,6 +611,7 @@ BOOL fail_bool(DWORD error) {
 }
 
 Target read_target(const std::wstring& path) {
+    if (auto target = persistent_target(path)) return std::move(*target);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(path, parts);
     if (parsed == Parsed::Host) {
@@ -573,6 +642,7 @@ Target read_target(const std::wstring& path) {
 }
 
 Target write_target(const std::wstring& path, bool copy_up) {
+    if (auto target = persistent_target(path, false)) return std::move(*target);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(path, parts);
     if (parsed == Parsed::Host) {
@@ -614,9 +684,22 @@ Target write_target(const std::wstring& path, bool copy_up) {
     const std::filesystem::path package_path = disk_path(r.game, parts);
     // One copy-up at a time: a second thread writing the same file waits here and then finds the first one's copy, so
     // it neither fails on the taken name nor collides with that file's open through a rename of its own.
-    static std::mutex s_copy_mutex;
-    std::unique_lock copy_lock(s_copy_mutex, std::defer_lock);
-    if (copy_up) copy_lock.lock();
+    static SRWLOCK s_copy_lock = SRWLOCK_INIT;
+    struct DeferredSrwLock {
+        SRWLOCK* lock;
+        bool held = false;
+        explicit DeferredSrwLock(SRWLOCK& l) noexcept : lock(&l) {}
+        void acquire() noexcept {
+            AcquireSRWLockExclusive(lock);
+            held = true;
+        }
+        ~DeferredSrwLock() {
+            if (held) ReleaseSRWLockExclusive(lock);
+        }
+        DeferredSrwLock(const DeferredSrwLock&) = delete;
+        DeferredSrwLock& operator=(const DeferredSrwLock&) = delete;
+    } copy_lock(s_copy_lock);
+    if (copy_up) copy_lock.acquire();
     if (copy_up && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
         std::filesystem::is_regular_file(package_path, ec)) {
         // Copied to a private name, then renamed into place: a process killed mid-copy leaves only a hidden leftover,
@@ -643,6 +726,11 @@ Target write_target(const std::wstring& path, bool copy_up) {
             std::filesystem::remove(tmp, ec);
             if (!std::filesystem::exists(t.path, ec)) t.error = error;
         }
+    } else if (copy_up && !deleted(r.overlay, parts) && std::filesystem::is_directory(package_path, ec)) {
+        // A package folder is mirrored, as SetFileAttributes does, so a handle opened on it for DELETE or attribute
+        // writes (std::filesystem::remove) names the overlay folder and never the package's.
+        std::filesystem::create_directories(t.path, ec);
+        if (ec) t.error = static_cast<DWORD>(ec.value());
     }
     return t;
 }
@@ -897,6 +985,19 @@ std::filesystem::path overlay_dir() {
     return g_overlay_dir;
 }
 
+std::filesystem::path ensure_persistent_storage(std::filesystem::path* host_path) {
+    const auto overlay = overlay_dir();
+    if (overlay.empty()) return {};
+    const auto configured = overlay / kPersistentStorageDir;
+    const auto path = extended_path(configured);
+    if (path.empty()) return {};
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    if (ec) return {};
+    if (host_path) *host_path = configured;
+    return path;
+}
+
 // gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
 // path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
 // file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
@@ -1089,6 +1190,13 @@ HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
+    if (auto target = persistent_target(pattern)) {
+        if (target->error) {
+            SetLastError(target->error);
+            return INVALID_HANDLE_VALUE;
+        }
+        return ::FindFirstFileW(target->path.c_str(), data);
+    }
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(pattern, parts);
     if (parsed == Parsed::Host) return ::FindFirstFileW(pattern, data);
@@ -1115,6 +1223,13 @@ HANDLE WINAPI find_first_file_ex_w(LPCWSTR pattern, FINDEX_INFO_LEVELS info_leve
     if (!pattern || !data) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
+    }
+    if (auto target = persistent_target(pattern)) {
+        if (target->error) {
+            SetLastError(target->error);
+            return INVALID_HANDLE_VALUE;
+        }
+        return ::FindFirstFileExW(target->path.c_str(), info_level, data, search_op, search_filter, additional_flags);
     }
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(pattern, parts);
@@ -1167,8 +1282,7 @@ HANDLE WINAPI find_first_file_ex_a(LPCSTR pattern, FINDEX_INFO_LEVELS info_level
     }
     const std::wstring wide = widen_ansi(pattern);
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(wide, parts);
-    if (parsed == Parsed::Host)
+    if (!persistent_guest_path(wide) && parse_console(wide, parts) == Parsed::Host)
         return ::FindFirstFileExA(pattern, info_level, data, search_op, search_filter, additional_flags);
     WIN32_FIND_DATAW wide_data{};
     const HANDLE h = find_first_file_ex_w(wide.c_str(), info_level, &wide_data, search_op, search_filter, additional_flags);
@@ -1235,6 +1349,8 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    if (auto target = persistent_target(name, false))
+        return target->error ? fail_bool(target->error) : ::DeleteFileW(target->path.c_str());
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
     if (parsed == Parsed::Host) return ::DeleteFileW(name);
@@ -1296,6 +1412,71 @@ BOOL WINAPI delete_file_a(LPCSTR name) {
     return delete_file_w(wide.c_str());
 }
 
+// ---- Delete through a handle (RT-369)
+//
+// std::filesystem::remove, which msvcprt.lib links into the title itself (filesystem.obj), deletes through a handle:
+// CreateFileW with DELETE, then SetFileInformationByHandle with FileDispositionInfoEx or FileDispositionInfo. DELETE
+// makes the open a write, so the handle names the overlay copy of a package file; deleting only that copy would bring
+// the package file back into view. A delete request on a handle under the overlay therefore also leaves the marker
+// DeleteFile and RemoveDirectory leave.
+
+std::wstring final_path(HANDLE h) {
+    const DWORD n = ::GetFinalPathNameByHandleW(h, nullptr, 0, FILE_NAME_NORMALIZED);
+    if (n == 0) return {};
+    std::wstring path(n, L'\0');
+    const DWORD got = ::GetFinalPathNameByHandleW(h, path.data(), n, FILE_NAME_NORMALIZED);
+    path.resize(got < n ? got : 0);
+    return path;
+}
+
+// The overlay-relative components of the file a handle names. False when it is not below the overlay root or is in
+// one of the overlay's own folders: a host file, or a package file opened for reading.
+bool overlay_parts(HANDLE file, const std::filesystem::path& overlay, std::vector<std::wstring>& parts) {
+    const HANDLE root_handle =
+        ::CreateFileW(overlay.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (root_handle == INVALID_HANDLE_VALUE) return false;
+    const std::wstring root = final_path(root_handle);
+    ::CloseHandle(root_handle);
+    const std::wstring path = final_path(file);
+    if (root.empty() || path.size() <= root.size() + 1 || path[root.size()] != L'\\' ||
+        ::CompareStringOrdinal(path.c_str(), static_cast<int>(root.size()), root.c_str(),
+                               static_cast<int>(root.size()), TRUE) != CSTR_EQUAL)
+        return false;
+    for (size_t start = root.size() + 1; start < path.size();) {
+        const size_t end = std::min(path.find(L'\\', start), path.size());
+        parts.push_back(path.substr(start, end - start));
+        start = end + 1;
+    }
+    return !parts.empty() && !internal_dir(parts.front().c_str());
+}
+
+bool sets_delete(FILE_INFO_BY_HANDLE_CLASS info_class, const void* info, DWORD size) {
+    if (!info) return false;
+    if (info_class == FileDispositionInfo && size >= sizeof(FILE_DISPOSITION_INFO))
+        return static_cast<const FILE_DISPOSITION_INFO*>(info)->DeleteFile != FALSE;
+    if (info_class == FileDispositionInfoEx && size >= sizeof(FILE_DISPOSITION_INFO_EX))
+        return (static_cast<const FILE_DISPOSITION_INFO_EX*>(info)->Flags & FILE_DISPOSITION_FLAG_DELETE) != 0;
+    return false;
+}
+
+BOOL WINAPI set_file_information_by_handle(HANDLE file, FILE_INFO_BY_HANDLE_CLASS info_class, LPVOID info,
+                                           DWORD size) {
+    const Roots r = roots();
+    std::vector<std::wstring> parts;
+    if (!sets_delete(info_class, info, size) || r.overlay.empty() || !overlay_parts(file, r.overlay, parts))
+        return ::SetFileInformationByHandle(file, info_class, info, size);
+    // A package folder goes only once nothing is left in it, as RemoveDirectory requires.
+    const View v = view(r, parts);
+    if (v.in_package && v.kind == Kind::Directory && !empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
+    if (!::SetFileInformationByHandle(file, info_class, info, size)) return FALSE;
+    if (!v.in_package) return TRUE;
+    std::filesystem::path mark = marker(r.overlay, parts);
+    if (v.kind == Kind::Directory) mark /= kRemovedDirMarker;
+    DWORD error = 0;
+    return write_marker(mark, error) ? TRUE : fail_bool(error);
+}
+
 // ---- Folders: created in the overlay, removed by a marker when the package has them
 
 namespace {
@@ -1307,6 +1488,11 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
         const Target t = read_target(template_name);
         if (t.error) return fail_bool(t.error);
         template_path = t.path.wstring();
+    }
+    if (auto target = persistent_target(name)) {
+        if (target->error) return fail_bool(target->error);
+        return template_name ? ::CreateDirectoryExW(template_path.c_str(), target->path.c_str(), security)
+                             : ::CreateDirectoryW(target->path.c_str(), security);
     }
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
@@ -1365,6 +1551,8 @@ BOOL WINAPI create_directory_ex_a(LPCSTR template_name, LPCSTR name, LPSECURITY_
 
 BOOL WINAPI remove_directory_w(LPCWSTR name) {
     if (!name) return fail_bool(ERROR_INVALID_PARAMETER);
+    if (auto target = persistent_target(name, false))
+        return target->error ? fail_bool(target->error) : ::RemoveDirectoryW(target->path.c_str());
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
     if (parsed == Parsed::Host) return ::RemoveDirectoryW(name);
@@ -1399,6 +1587,15 @@ BOOL WINAPI remove_directory_a(LPCSTR name) {
 
 BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (!from) return fail_bool(ERROR_INVALID_PARAMETER);
+    const auto persistent_from = persistent_target(from, false);
+    const auto persistent_to = to ? persistent_target(to, false) : std::nullopt;
+    if (persistent_from && persistent_from->error) return fail_bool(persistent_from->error);
+    if (persistent_to && persistent_to->error) return fail_bool(persistent_to->error);
+    if (persistent_from || persistent_to) {
+        if (!to || (flags & MOVEFILE_DELAY_UNTIL_REBOOT) != 0) return fail_bool(ERROR_INVALID_PARAMETER);
+        if (persistent_from) from = persistent_from->path.c_str();
+        if (persistent_to) to = persistent_to->path.c_str();
+    }
     std::vector<std::wstring> src, dst;
     const Parsed from_kind = parse_console(from, src);
     const Parsed to_kind = to ? parse_console(to, dst) : Parsed::Host;
@@ -1491,6 +1688,12 @@ namespace {
 // Where a copy writes: a host path as given; a GAME: path is checked against the title's view (an existing name
 // counts even when only the package has it) and then means its overlay copy.
 bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& out, DWORD& error) {
+    if (auto target = persistent_target(to, false)) {
+        error = target->error;
+        if (error) return false;
+        out = std::move(target->path);
+        return true;
+    }
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(to, parts);
     if (parsed == Parsed::Host) {
@@ -1576,16 +1779,23 @@ namespace {
 // reason. GetProcAddress returns null there instead, and the fallback below runs.
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
 std::atomic<bool> g_force_copy_file2_fallback{false};
+INIT_ONCE g_host_copy_file2_once = INIT_ONCE_STATIC_INIT;
+CopyFile2Fn g_host_copy_file2_fn = nullptr;
+
+BOOL CALLBACK resolve_copy_file2_once(PINIT_ONCE, PVOID, PVOID*) noexcept {
+    for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"}) {
+        if (const HMODULE module = GetModuleHandleW(dll))
+            if (const FARPROC p = GetProcAddress(module, "CopyFile2")) {
+                g_host_copy_file2_fn = reinterpret_cast<CopyFile2Fn>(p);
+                return TRUE;
+            }
+    }
+    return TRUE;
+}
 
 CopyFile2Fn host_copy_file2() {
-    static const CopyFile2Fn fn = [] {
-        for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"}) {
-            if (const HMODULE module = GetModuleHandleW(dll))
-                if (const FARPROC p = GetProcAddress(module, "CopyFile2")) return reinterpret_cast<CopyFile2Fn>(p);
-        }
-        return CopyFile2Fn{};
-    }();
-    return g_force_copy_file2_fallback.load(std::memory_order_relaxed) ? CopyFile2Fn{} : fn;
+    InitOnceExecuteOnce(&g_host_copy_file2_once, &resolve_copy_file2_once, nullptr, nullptr);
+    return g_force_copy_file2_fallback.load(std::memory_order_relaxed) ? CopyFile2Fn{} : g_host_copy_file2_fn;
 }
 
 // The fallback's flags, by what CopyFileExW can do with them (values from the SDK's WinBase.h, spelled out because
@@ -1655,6 +1865,8 @@ HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS*
 
 BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
     if (!name) return fail_bool(ERROR_INVALID_PARAMETER);
+    if (auto target = persistent_target(name, false))
+        return target->error ? fail_bool(target->error) : ::SetFileAttributesW(target->path.c_str(), attributes);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
     if (parsed == Parsed::Host) return ::SetFileAttributesW(name, attributes);
@@ -2124,6 +2336,222 @@ UINT WINAPI get_drive_type_a(LPCSTR root_path) {
     return get_drive_type_w(wide.c_str());
 }
 
+// The volume shims answer for a console spelling (GAME:, G:\, T:\) only. A host path inside --game-dir is the package
+// to the file shims (game_dir_rest), but the title named the host volume, so the host answers for it.
+bool console_spelling(const std::wstring& name) {
+    size_t prefix = 0;
+    return console_drive(name, prefix) != Drive::None;
+}
+
+// Resolve the backing volume without exposing its host root to the title.
+bool volume_host_root(const std::wstring& name, std::wstring& result) {
+    const Roots r = roots();
+    size_t prefix = 0;
+    const Drive drive = console_drive(name, prefix);
+    const bool package_volume = drive == Drive::Game && prefix == 2;
+    auto dir = package_volume ? r.game : r.overlay;
+    const DWORD attributes = dir.empty() ? INVALID_FILE_ATTRIBUTES : ::GetFileAttributesW(dir.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (package_volume || r.game.empty() || ::GetFileAttributesW(r.game.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        if (dir.empty()) dir = r.game;
+        while (!dir.empty() && ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            const auto parent = dir.parent_path();
+            if (parent == dir) break;
+            dir = parent;
+        }
+    }
+    if (dir.empty() || ::GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return fail_bool(ERROR_PATH_NOT_FOUND);
+    wchar_t root[MAX_PATH]{};
+    if (!::GetVolumePathNameW(dir.c_str(), root, MAX_PATH)) return false;
+    result = root;
+    return true;
+}
+
+BOOL WINAPI get_volume_information_w(LPCWSTR name, LPWSTR label, DWORD label_size, LPDWORD serial,
+                                     LPDWORD max_component, LPDWORD flags, LPWSTR filesystem, DWORD filesystem_size) {
+    if (!name) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts, false);
+    if (parsed == Parsed::Host || !console_spelling(name)) return ::GetVolumeInformationW(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Refused || !drive_root(name, parts)) return fail_bool(ERROR_INVALID_NAME);
+    std::wstring root;
+    if (!volume_host_root(name, root)) return FALSE;
+    return ::GetVolumeInformationW(root.c_str(), label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+}
+
+BOOL WINAPI get_volume_information_a(LPCSTR name, LPSTR label, DWORD label_size, LPDWORD serial,
+                                     LPDWORD max_component, LPDWORD flags, LPSTR filesystem, DWORD filesystem_size) {
+    if (!name) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts, false);
+    if (parsed == Parsed::Host || !console_spelling(wide)) return ::GetVolumeInformationA(name, label, label_size, serial, max_component, flags, filesystem, filesystem_size);
+    if (parsed == Parsed::Refused || !drive_root(wide, parts)) return fail_bool(ERROR_INVALID_NAME);
+    std::wstring root;
+    if (!volume_host_root(wide, root)) return FALSE;
+    // Keep the mount path Unicode; only the two returned strings use the caller's ANSI code page.
+    wchar_t wide_label[MAX_PATH]{}, wide_filesystem[MAX_PATH]{};
+    if (!::GetVolumeInformationW(root.c_str(), label && label_size ? wide_label : nullptr,
+                                 label && label_size ? MAX_PATH : 0, serial, max_component, flags,
+                                 filesystem && filesystem_size ? wide_filesystem : nullptr,
+                                 filesystem && filesystem_size ? MAX_PATH : 0)) return FALSE;
+    if (label && label_size && !::WideCharToMultiByte(CP_ACP, 0, wide_label, -1, label,
+                                                       static_cast<int>(label_size > 0x7fffffffU ? 0x7fffffffU : label_size), nullptr, nullptr)) return FALSE;
+    if (filesystem && filesystem_size && !::WideCharToMultiByte(CP_ACP, 0, wide_filesystem, -1, filesystem,
+                                                                static_cast<int>(filesystem_size > 0x7fffffffU ? 0x7fffffffU : filesystem_size), nullptr, nullptr)) return FALSE;
+    return TRUE;
+}
+
+BOOL WINAPI get_volume_path_name_w(LPCWSTR name, LPWSTR output, DWORD size) {
+    if (!name) return ::GetVolumePathNameW(name, output, size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts, false);
+    if (parsed == Parsed::Host || !console_spelling(name)) return ::GetVolumePathNameW(name, output, size);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    size_t prefix = 0;
+    console_drive(name, prefix);
+    const std::wstring root = std::wstring(name, prefix) + L"\\";
+    if (!output || size <= root.size()) return fail_bool(ERROR_FILENAME_EXCED_RANGE);
+    std::wmemcpy(output, root.c_str(), root.size() + 1);
+    return TRUE;
+}
+
+BOOL WINAPI get_volume_path_name_a(LPCSTR name, LPSTR output, DWORD size) {
+    if (!name) return ::GetVolumePathNameA(name, output, size);
+    const std::wstring wide = widen_ansi(name);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts, false);
+    if (parsed == Parsed::Host || !console_spelling(wide)) return ::GetVolumePathNameA(name, output, size);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    size_t prefix = 0;
+    console_drive(wide, prefix);
+    if (!output || size <= prefix + 1) return fail_bool(ERROR_FILENAME_EXCED_RANGE);
+    std::memcpy(output, name, prefix);
+    output[prefix] = '\\';
+    output[prefix + 1] = '\0';
+    return TRUE;
+}
+
+// Console temporary directories always live in the writable overlay, independent of the package tree.
+static Target temp_directory(const std::wstring& path, bool& console) {
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(path, prefix_length);
+    console = drive != Drive::None;
+    if (!console) return {};
+    std::vector<std::wstring> parts;
+    if (parse_console(path, parts) == Parsed::Refused) return fail(ERROR_INVALID_NAME);
+    const auto overlay = roots().overlay;
+    if (overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
+    std::error_code ec;
+    const auto scratch = overlay / kScratchDir;
+    std::filesystem::create_directories(scratch, ec);
+    if (ec) return fail(static_cast<DWORD>(ec.value()));
+    Target target;
+    if (drive == Drive::Scratch) parts.erase(parts.begin());
+    target.path = join(scratch, parts);
+    return target;
+}
+
+static std::wstring temp_environment() {
+    for (const wchar_t* key : {L"TMP", L"TEMP"}) {
+        const DWORD size = ::GetEnvironmentVariableW(key, nullptr, 0);
+        if (!size) continue;
+        std::vector<wchar_t> value(size);
+        const DWORD length = ::GetEnvironmentVariableW(key, value.data(), size);
+        if (length && length < size) return std::wstring(value.data(), length);
+    }
+    return {};
+}
+
+static void temp_name_error(const std::filesystem::path& directory) {
+    const DWORD error = ::GetLastError();
+    if (::GetFileAttributesW(directory.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const DWORD attributes_error = ::GetLastError();
+        if (attributes_error == ERROR_FILE_NOT_FOUND || attributes_error == ERROR_PATH_NOT_FOUND) {
+            ::SetLastError(ERROR_PATH_NOT_FOUND);
+            return;
+        }
+    }
+    ::SetLastError(error);
+}
+
+DWORD WINAPI get_temp_path_w(DWORD size, LPWSTR buffer) {
+    bool console = false;
+    const Target target = temp_directory(temp_environment(), console);
+    if (!console) return ::GetTempPathW(size, buffer);
+    if (target.error) return fail_bool(target.error);
+    std::wstring path = target.path.wstring();
+    if (path.empty() || !is_separator(path.back())) path += static_cast<wchar_t>(92);
+    const DWORD required = static_cast<DWORD>(path.size() + 1);
+    if (size < required) return required;
+    std::wmemcpy(buffer, path.c_str(), required);
+    return required - 1;
+}
+
+DWORD WINAPI get_temp_path_a(DWORD size, LPSTR buffer) {
+    bool console = false;
+    const Target target = temp_directory(temp_environment(), console);
+    if (!console) return ::GetTempPathA(size, buffer);
+    if (target.error) return fail_bool(target.error);
+    std::wstring path = target.path.wstring();
+    if (path.empty() || !is_separator(path.back())) path += static_cast<wchar_t>(92);
+    const bool utf8 = ::GetACP() == CP_UTF8;
+    const DWORD flags = utf8 ? 0 : WC_NO_BEST_FIT_CHARS;
+    BOOL used_default = FALSE;
+    BOOL* const used_default_ptr = utf8 ? nullptr : &used_default;
+    const int required = ::WideCharToMultiByte(CP_ACP, flags, path.c_str(), -1, nullptr, 0, nullptr, used_default_ptr);
+    if (!required) return 0;
+    if (used_default) {
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
+    if (size < static_cast<DWORD>(required))
+        return size && size == static_cast<DWORD>(required - 1) ? size : static_cast<DWORD>(required);
+    if (!::WideCharToMultiByte(CP_ACP, flags, path.c_str(), -1, buffer, required, nullptr, used_default_ptr)) return 0;
+    if (used_default) {
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
+    return static_cast<DWORD>(required - 1);
+}
+
+UINT WINAPI get_temp_file_name_w(LPCWSTR path, LPCWSTR prefix, UINT unique, LPWSTR name) {
+    if (!path) return ::GetTempFileNameW(path, prefix, unique, name);
+    bool console = false;
+    const Target target = temp_directory(path, console);
+    if (!console) return ::GetTempFileNameW(path, prefix, unique, name);
+    if (target.error) return fail_bool(target.error);
+    const UINT result = ::GetTempFileNameW(target.path.c_str(), prefix, unique, name);
+    if (!result) temp_name_error(target.path);
+    return result;
+}
+
+UINT WINAPI get_temp_file_name_a(LPCSTR path, LPCSTR prefix, UINT unique, LPSTR name) {
+    if (!path) return ::GetTempFileNameA(path, prefix, unique, name);
+    bool console = false;
+    const Target target = temp_directory(widen_ansi(path), console);
+    if (!console) return ::GetTempFileNameA(path, prefix, unique, name);
+    if (target.error) return fail_bool(target.error);
+    const std::wstring wide_prefix = widen_ansi(prefix);
+    wchar_t wide_name[MAX_PATH]{};
+    const UINT result = ::GetTempFileNameW(target.path.c_str(), prefix ? wide_prefix.c_str() : nullptr, unique, wide_name);
+    if (!result) {
+        temp_name_error(target.path);
+        return 0;
+    }
+    char converted[MAX_PATH]{};
+    const int length = ::WideCharToMultiByte(CP_ACP, 0, wide_name, -1, converted, MAX_PATH, nullptr, nullptr);
+    if (!length || widen_ansi(converted) != wide_name) {
+        if (!unique) ::DeleteFileW(wide_name);
+        ::SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return 0;
+    }
+    std::memcpy(name, converted, static_cast<size_t>(length));
+    return result;
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -2159,6 +2587,14 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
 // file-l1-2-0 and file-l2-1-0 for CreateFile; ReadFile and its variants are in file-l1-1-0).
 #define FILE_API(dll)                                                                                    \
+    {dll, "GetVolumeInformationA", reinterpret_cast<void*>(&get_volume_information_a)},                   \
+        {dll, "GetVolumeInformationW", reinterpret_cast<void*>(&get_volume_information_w)},             \
+        {dll, "GetVolumePathNameA", reinterpret_cast<void*>(&get_volume_path_name_a)},                   \
+        {dll, "GetVolumePathNameW", reinterpret_cast<void*>(&get_volume_path_name_w)},                   \
+    {dll, "GetTempPathA", reinterpret_cast<void*>(&get_temp_path_a)},                                  \
+    {dll, "GetTempPathW", reinterpret_cast<void*>(&get_temp_path_w)},                                  \
+    {dll, "GetTempFileNameA", reinterpret_cast<void*>(&get_temp_file_name_a)},                          \
+    {dll, "GetTempFileNameW", reinterpret_cast<void*>(&get_temp_file_name_w)},                          \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
@@ -2202,7 +2638,8 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
         {dll, "GetDiskFreeSpaceA", reinterpret_cast<void*>(&get_disk_free_space_a)},                     \
         {dll, "GetDiskFreeSpaceW", reinterpret_cast<void*>(&get_disk_free_space_w)},                     \
         {dll, "GetDriveTypeA", reinterpret_cast<void*>(&get_drive_type_a)},                              \
-        {dll, "GetDriveTypeW", reinterpret_cast<void*>(&get_drive_type_w)}
+        {dll, "GetDriveTypeW", reinterpret_cast<void*>(&get_drive_type_w)},                              \
+        {dll, "SetFileInformationByHandle", reinterpret_cast<void*>(&set_file_information_by_handle)}
 
 // The Universal CRT's opens, under the api set a package DLL links (api-ms-win-crt-stdio-l1-1-0) and under ucrtbase
 // itself, which that set forwards to.

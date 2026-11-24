@@ -16,6 +16,7 @@
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -393,6 +394,31 @@ void check_run_time_load() {
                   reinterpret_cast<SetSensitive>(slot(t, 27))(t, false) == S_OK &&
                   !reinterpret_cast<IsSensitive>(slot(t, 30))(t),
               "slots 27 and 30 set and read this thread's time-sensitive flag");
+        // Verify per-thread isolation and LastError preservation across the Win32 TlsAlloc slot.
+        {
+            auto set_ts = reinterpret_cast<SetSensitive>(slot(t, 27));
+            auto is_ts = reinterpret_cast<IsSensitive>(slot(t, 30));
+            SetLastError(ERROR_INVALID_DATA);
+            const HRESULT set_hr = set_ts(t, true);
+            const DWORD err_after_set = GetLastError();
+            const bool main_ts = is_ts(t);
+            const DWORD err_after_get = GetLastError();
+            bool worker_initial = true;
+            bool worker_after_set = false;
+            std::thread worker([&] {
+                worker_initial = is_ts(t);
+                set_ts(t, true);
+                worker_after_set = is_ts(t);
+                set_ts(t, false);
+            });
+            worker.join();
+            const bool main_still_true = is_ts(t);
+            set_ts(t, false);
+            check(set_hr == S_OK && main_ts && main_still_true && !worker_initial && worker_after_set,
+                  "slots 27 and 30 keep the time-sensitive flag isolated per thread");
+            check(err_after_set == ERROR_INVALID_DATA && err_after_get == ERROR_INVALID_DATA,
+                  "slots 27 and 30 preserve Win32 LastError across TlsGetValue/TlsSetValue");
+        }
         // Slot 8 (XAsyncBeginAlloc, private, signature not measured) must not report a begun call whose provider
         // never received XAsyncOp::Begin: either it refuses, or the provider saw Begin exactly once.
         static std::atomic<int> s_begins{0};
@@ -649,6 +675,132 @@ void check_run_time_load() {
                   "deleting the GAME: name leaves the storage file alone");
         }
 
+
+        {
+            // A path can exceed the startup caller's byte buffer even when it fits in MAX_PATH as UTF-16.
+            const auto unicode_overlay = scratch / (L"Unicode " + std::wstring(120, L'\u4f8b'));
+            const auto long_overlay = scratch / std::wstring(90, L'a') / std::wstring(90, L'b') / std::wstring(90, L'c');
+            const auto game_path = scratch / L"game";
+            const auto package_storage = game_path / rt::fs::kPersistentStorageDir;
+            std::filesystem::create_directories(package_storage);
+            std::ofstream(package_storage / L"cache.bin", std::ios::binary) << "package";
+
+            const auto create_a = reinterpret_cast<decltype(&::CreateFileA)>(rt::shims::find("kernel32.dll", "CreateFileA"));
+            const auto create_w = reinterpret_cast<decltype(&::CreateFileW)>(rt::shims::find("kernel32.dll", "CreateFileW"));
+            const auto find_ex_a = reinterpret_cast<decltype(&::FindFirstFileExA)>(
+                rt::shims::find("kernel32.dll", "FindFirstFileExA"));
+            const auto find_close = reinterpret_cast<decltype(&::FindClose)>(rt::shims::find("kernel32.dll", "FindClose"));
+            const auto remove_w = reinterpret_cast<decltype(&::DeleteFileW)>(rt::shims::find("kernel32.dll", "DeleteFileW"));
+            const auto mkdir_w = reinterpret_cast<decltype(&::CreateDirectoryW)>(rt::shims::find("kernel32.dll", "CreateDirectoryW"));
+            const auto rmdir_w = reinterpret_cast<decltype(&::RemoveDirectoryW)>(rt::shims::find("kernel32.dll", "RemoveDirectoryW"));
+            const auto copy_w = reinterpret_cast<decltype(&::CopyFileW)>(rt::shims::find("kernel32.dll", "CopyFileW"));
+            const auto move_w = reinterpret_cast<decltype(&::MoveFileW)>(rt::shims::find("kernel32.dll", "MoveFileW"));
+            const auto attr_w = reinterpret_cast<decltype(&::GetFileAttributesW)>(
+                rt::shims::find("kernel32.dll", "GetFileAttributesW"));
+
+            for (const auto& overlay : {unicode_overlay, long_overlay}) {
+                const auto host_dir = overlay / rt::fs::kPersistentStorageDir;
+                const auto extended_overlay = std::filesystem::path(L"\\\\?\\" + overlay.native());
+                check(host_dir.u8string().size() >= 256, "the configured storage path exceeds the startup byte buffer");
+                rt::fs::configure(game_path, overlay);
+                char startup_path[256]{};
+                size_t reported = 0, used_bytes = 0;
+                const bool has_alias = reinterpret_cast<GetPathSize>(slot(pls, 3))(pls, &reported) == S_OK &&
+                    reinterpret_cast<GetPath>(slot(pls, 4))(pls, sizeof(startup_path), startup_path, &used_bytes) == S_OK &&
+                    std::string(startup_path) == "PLS:\\" && used_bytes == sizeof("PLS:\\") && used_bytes == reported;
+                check(has_alias, "a 256-byte startup caller gets the short PLS path and its NUL-inclusive size");
+                if (!has_alias) continue;
+
+                const auto cache = std::string(startup_path) + "cache.bin";
+                HANDLE file = create_a(cache.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                constexpr char contents[] = "persistent";
+                DWORD transferred = 0;
+                check(file != INVALID_HANDLE_VALUE && ::WriteFile(file, contents, sizeof(contents), &transferred, nullptr) &&
+                          transferred == sizeof(contents), "CreateFileA writes cache bytes through the PLS alias");
+                if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+
+                file = create_w(L"pls:/cAcHe.bin", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                char readback[sizeof(contents)]{};
+                transferred = 0;
+                check(file != INVALID_HANDLE_VALUE && ::ReadFile(file, readback, sizeof(readback), &transferred, nullptr) &&
+                          transferred == sizeof(contents) && std::memcmp(readback, contents, sizeof(contents)) == 0,
+                      "CreateFileW reopens the same cache with a different case and slash");
+                if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+
+                WIN32_FIND_DATAA found{};
+                const HANDLE enumeration = find_ex_a("PLS:\\*.bin", FindExInfoBasic, &found, FindExSearchNameMatch, nullptr, 0);
+                check(enumeration != INVALID_HANDLE_VALUE && std::string(found.cFileName) == "cache.bin",
+                      "FindFirstFileExA lists files in the same persistent storage");
+                if (enumeration != INVALID_HANDLE_VALUE) find_close(enumeration);
+
+                std::error_code size_error;
+                check(std::filesystem::file_size(extended_overlay / rt::fs::kPersistentStorageDir / L"cache.bin", size_error) ==
+                          sizeof(contents) && !size_error, "the physical cache file is under the configured overlay");
+                uint64_t space[4]{};
+                check(reinterpret_cast<GetSpaceInfo>(slot(pls, 5))(pls, space) == S_OK && space[2] == sizeof(contents),
+                      "GetSpaceInfo accounts for the file written through the alias");
+
+                for (const wchar_t* invalid : {L"PLS:\\..\\outside.bin", L"PLS:\\sub\\..\\..\\outside.bin",
+                                               L"PLS:\\cache.bin:stream", L"PLS:C:\\outside.bin"}) {
+                    file = create_w(invalid, GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+                    const DWORD error = ::GetLastError();
+                    check(file == INVALID_HANDLE_VALUE && error == ERROR_INVALID_NAME,
+                          "the persistent alias refuses paths outside its root or with a drive or stream separator");
+                    if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+                }
+
+                const auto link = extended_overlay / rt::fs::kPersistentStorageDir / L"outside";
+                if (::CreateSymbolicLinkW(link.c_str(), package_storage.c_str(),
+                                          SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+                    file = create_w(L"PLS:\\outside\\cache.bin", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                    OPEN_EXISTING, 0, nullptr);
+                    const DWORD error = ::GetLastError();
+                    check(file == INVALID_HANDLE_VALUE && error == ERROR_ACCESS_DENIED,
+                          "a link within the persistent alias cannot lead into the package");
+                    if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+                    ::RemoveDirectoryW(link.c_str());
+                }
+
+                check(mkdir_w(L"PLS:\\objects", nullptr) &&
+                          copy_w(L"PLS:\\cache.bin", L"PLS:\\objects\\copy.bin", TRUE) &&
+                          move_w(L"PLS:\\objects\\copy.bin", L"PLS:\\objects\\moved.bin") &&
+                          attr_w(L"PLS:\\objects\\moved.bin") != INVALID_FILE_ATTRIBUTES,
+                      "directories, copies, renames and attributes use the same backing paths");
+                check(remove_w(L"PLS:\\objects\\moved.bin") && rmdir_w(L"PLS:\\objects"),
+                      "the PLS alias removes files and empty directories");
+                check(!rmdir_w(L"PLS:\\") && ::GetLastError() == ERROR_ACCESS_DENIED,
+                      "the title cannot remove the mounted storage root through the alias");
+
+                check(remove_w(L"PLS:\\cache.bin"), "a cache file can be removed through the alias");
+                file = create_a(cache.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                const DWORD error = ::GetLastError();
+                check(file == INVALID_HANDLE_VALUE && error == ERROR_FILE_NOT_FOUND,
+                      "an absent PLS file never falls back to the installed package");
+                if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+                check(std::filesystem::file_size(package_storage / L"cache.bin", size_error) == sizeof("package") - 1 &&
+                          !size_error, "the package cache remains intact");
+
+                std::error_code remove_error;
+                std::filesystem::remove_all(extended_overlay, remove_error);
+                check(!remove_error, "the isolated overlay fixture can be removed");
+            }
+
+            const auto linked_overlay = scratch / L"linked_overlay";
+            std::filesystem::create_directories(linked_overlay);
+            const auto linked_storage = linked_overlay / rt::fs::kPersistentStorageDir;
+            if (::CreateSymbolicLinkW(linked_storage.c_str(), folder.c_str(),
+                                      SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+                rt::fs::configure(game_path, linked_overlay);
+                char host_path[256]{};
+                size_t used_bytes = 0;
+                check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, sizeof(host_path), host_path, &used_bytes) == S_OK &&
+                          std::filesystem::path(host_path) == linked_storage,
+                      "a short host path can still name a relocated storage directory");
+                ::RemoveDirectoryW(linked_storage.c_str());
+            }
+            rt::fs::configure(game_path, scratch / L"overlay");
+        }
+
         void* handle = reinterpret_cast<void*>(1);
         check(reinterpret_cast<Mount>(slot(pls, 8))(pls, "pkg", &handle) == E_NOTIMPL && handle == nullptr,
               "slot 8 (MountForPackage) is E_NOTIMPL and leaves no handle");
@@ -821,10 +973,89 @@ void check_run_time_load() {
         reinterpret_cast<CloseMount>(slot(pk, 26))(pk, handle);
         check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
               "slot 26 (XPackageCloseMountHandle) closes the handle");
+        // Slots 37/38, XPackageMountWithUiAsync/Result: slot 23's mount, completed on the async block; a package
+        // that is not installed is refused by the Async call.
+        using MountUiAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, XAsyncBlock*);
+        using MountUiResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint64_t*);
+        XAsyncBlock mount_block{};
+        handle = 0;
+        check(reinterpret_cast<MountUiAsync>(slot(pk, 37))(pk, "SLOTDLC_12345678901234567890123", &mount_block) == S_OK &&
+                  XAsyncGetStatus(&mount_block, true) == S_OK &&
+                  reinterpret_cast<MountUiResult>(slot(pk, 38))(pk, &mount_block, &handle) == S_OK && handle != 0 &&
+                  reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == S_OK &&
+                  need == std::strlen("C:\\LeonidaSlotDLC") + 1,
+              "slots 37/38 mount a content package through the async block, a handle slot 24 knows");
+        reinterpret_cast<CloseMount>(slot(pk, 26))(pk, handle);
+        XAsyncBlock missing_block{};
+        check(reinterpret_cast<MountUiAsync>(slot(pk, 37))(pk, "NOTINSTALLED", &missing_block) ==
+                  HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+              "slot 37 refuses a package that is not installed");
         SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
         using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
-        check(reinterpret_cast<Stub>(slot(pk, 5))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
-              "the slots without an offline answer (5, 40) are E_NOTIMPL");
+        check(reinterpret_cast<Stub>(slot(pk, 13))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
+              "the slots without an offline answer (13, 40) are E_NOTIMPL");
+        // Slots 5, 6, 9, 12, 14 and 16-19 answer as a fully installed package.
+        using CreateMonitor = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*, uint32_t, XTaskQueueHandle,
+                                                          void**);
+        using CloseMonitor = void(STDMETHODCALLTYPE*)(void*, void*);
+        using RegProgress = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*, void (CALLBACK*)(void*, void*),
+                                                        XTaskQueueRegistrationToken*);
+        using FindChunk = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*, uint32_t*);
+        using Chunks = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*);
+        using InstallAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*, uint32_t, bool, XAsyncBlock*);
+        using InstallResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void**);
+        using Estimate = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t, void*, uint64_t*, bool*);
+        uint8_t selector[24] = {};  // one XPackageChunkSelector; never read
+        const char* const kOwnPackage = "LeonidaPackageIdentifier00000000";  // the process's default identifier
+        void* monitor = nullptr;
+        check(reinterpret_cast<CreateMonitor>(slot(pk, 5))(pk, kOwnPackage, 1, selector, 1000, nullptr, &monitor) == S_OK &&
+                  monitor != nullptr &&
+                  reinterpret_cast<CreateMonitor>(slot(pk, 5))(pk, kOwnPackage, 1, selector, 1000, nullptr, nullptr) == E_POINTER,
+              "slot 5 (XPackageCreateInstallationMonitor) hands out a monitor");
+        static std::atomic<int> s_progress_calls{0};
+        XTaskQueueRegistrationToken progress_token{};
+        check(reinterpret_cast<RegProgress>(slot(pk, 9))(pk, monitor, nullptr,
+                                                         [](void*, void*) { s_progress_calls.fetch_add(1); },
+                                                         &progress_token) == S_OK &&
+                  progress_token.token != 0 &&
+                  reinterpret_cast<RegProgress>(slot(pk, 9))(pk, monitor, nullptr, nullptr, &progress_token) == E_INVALIDARG,
+              "slot 9 (XPackageRegisterInstallationProgressChanged) hands out a token");
+        reinterpret_cast<CloseMonitor>(slot(pk, 6))(pk, monitor);
+        uint32_t availability = 7;
+        check(reinterpret_cast<FindChunk>(slot(pk, 12))(pk, kOwnPackage, 1, selector, &availability) == S_OK && availability == 0,
+              "slot 12 (XPackageFindChunkAvailability): every chunk is Ready");
+        check(reinterpret_cast<Chunks>(slot(pk, 14))(pk, kOwnPackage, 1, selector) == S_OK,
+              "slot 14 (XPackageChangeChunkInstallOrder) succeeds with nothing queued");
+        uint64_t download = 9;
+        bool confirm = true;
+        check(reinterpret_cast<Estimate>(slot(pk, 18))(pk, kOwnPackage, 1, selector, &download, &confirm) == S_OK &&
+                  download == 0 && !confirm,
+              "slot 18 (XPackageEstimateDownloadSize): nothing to download, no confirmation");
+        check(reinterpret_cast<Chunks>(slot(pk, 19))(pk, kOwnPackage, 1, selector) == E_ACCESSDENIED,
+              "slot 19 (XPackageUninstallChunks) is refused: the game files are never removed");
+        XAsyncBlock install_block{};
+        void* install_monitor = nullptr;
+        check(reinterpret_cast<InstallAsync>(slot(pk, 16))(pk, kOwnPackage, 1, selector, 1000, true, &install_block) == S_OK &&
+                  XAsyncGetStatus(&install_block, true) == S_OK &&
+                  reinterpret_cast<InstallResult>(slot(pk, 17))(pk, &install_block, &install_monitor) == S_OK &&
+                  install_monitor == monitor,
+              "slots 16/17 (XPackageInstallChunksAsync/Result) complete at once with the installed package's monitor");
+        check(s_progress_calls.load() == 0, "no progress callback is ever called");
+        // A package that is not installed is ERROR_NOT_FOUND on the chunk slots, as on slot 23's mount.
+        const HRESULT not_found = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        availability = 7;
+        void* none = &availability;
+        XAsyncBlock none_block{};
+        check(reinterpret_cast<FindChunk>(slot(pk, 12))(pk, "NOTINSTALLED", 1, selector, &availability) == not_found &&
+                  availability == 7 &&
+                  reinterpret_cast<CreateMonitor>(slot(pk, 5))(pk, "NOTINSTALLED", 1, selector, 1000, nullptr, &none) ==
+                      not_found &&
+                  none == nullptr && reinterpret_cast<Chunks>(slot(pk, 14))(pk, "NOTINSTALLED", 1, selector) == not_found &&
+                  reinterpret_cast<Estimate>(slot(pk, 18))(pk, "NOTINSTALLED", 1, selector, &download, &confirm) ==
+                      not_found &&
+                  reinterpret_cast<InstallAsync>(slot(pk, 16))(pk, "NOTINSTALLED", 1, selector, 1000, true, &none_block) ==
+                      not_found,
+              "slots 5, 12, 14, 16 and 18 refuse a package that is not installed");
         struct Progress {
             uint64_t total, installed, launch;
             bool launchable, completed;
@@ -840,7 +1071,7 @@ void check_run_time_load() {
         check(!reinterpret_cast<Update>(slot(pk, 8))(pk, nullptr) &&
                   reinterpret_cast<UnregProgress>(slot(pk, 10))(pk, nullptr, XTaskQueueRegistrationToken{1}, true) &&
                   reinterpret_cast<UnregInstalled>(slot(pk, 22))(pk, XTaskQueueRegistrationToken{1}, false) &&
-                  !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, "pkg"),
+                  !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, kOwnPackage),
               "the bool slots 8, 10, 22 and 34 return their documented offline answers");
         const GUID chain[] = {
             package_cls,

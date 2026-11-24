@@ -139,13 +139,10 @@ def parse_startup(path: str, limit: int = 10) -> dict:
             elif kind == "file_open_failed":
                 trace["file_open_failed_count"] += 1
                 if len(trace["file_open_failed"]) < limit:
-                    trace["file_open_failed"].append(
-                        {
-                            "path": event.get("path"),
-                            "error": event.get("error"),
-                            "caller": event.get("caller"),
-                        }
-                    )
+                    detail = {key: event.get(key) for key in ("path", "error", "caller")}
+                    if "api" in event:
+                        detail["api"] = event["api"]
+                    trace["file_open_failed"].append(detail)
             elif kind == "int3_skipped":
                 trace["int3_skipped"].append(event.get("at"))
             elif kind == "exception":
@@ -313,7 +310,8 @@ def format_text(summary: dict, limit: int) -> str:
         if startup["file_open_failed_count"]:
             out.append(f"  failed file opens: {startup['file_open_failed_count']}")
             for item in startup["file_open_failed"][:limit]:
-                out.append(f"    {item['path']} error {item['error']} from {item['caller']}")
+                api = f"{item['api']} " if item.get("api") else ""
+                out.append(f"    {api}{item['path']} error {item['error']} from {item['caller']}")
             if startup["file_open_failed_count"] > limit:
                 out.append(f"    ... {startup['file_open_failed_count'] - limit} more")
         if startup["int3_skipped"]:

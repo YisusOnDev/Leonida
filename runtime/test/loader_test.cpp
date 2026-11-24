@@ -1484,6 +1484,71 @@ void test_host_crt_paths() {
     }
 }
 
+// The host msvcp140.dll's std::experimental::filesystem exports call kernel32 themselves (RT-369). C++17
+// std::filesystem has no export there (msvcprt.lib links it into the title); file_system_test covers its remove.
+void test_host_msvcp_filesystem() {
+    const char* what = "the host msvcp140.dll's filesystem exports see GAME: paths once a mapped image imports it";
+    HMODULE msvcp = LoadLibraryExA("msvcp140.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    constexpr size_t kNameMax = 260;  // _MAX_FILESYS_NAME
+    constexpr int kNotFound = -1, kRegular = 1, kDirectory = 2;  // std::experimental::filesystem::file_type
+    using StatFn = int(__cdecl*)(const wchar_t*, int*);
+    using OpenDirFn = void*(__cdecl*)(wchar_t (&)[kNameMax], const wchar_t*, int&, int&);
+    using ReadDirFn = wchar_t*(__cdecl*)(wchar_t (&)[kNameMax], void*, int&);
+    using CloseDirFn = void(__cdecl*)(void*);
+    using MakeDirFn = int(__cdecl*)(const wchar_t*, const wchar_t*);
+    using CopyFileFn = int(__cdecl*)(const wchar_t*, const wchar_t*);
+    const auto get = [&](const char* name) { return msvcp ? GetProcAddress(msvcp, name) : nullptr; };
+    const auto stat = reinterpret_cast<StatFn>(get("_Stat"));
+    const auto open_dir = reinterpret_cast<OpenDirFn>(get("_Open_dir"));
+    const auto read_dir = reinterpret_cast<ReadDirFn>(get("_Read_dir"));
+    const auto close_dir = reinterpret_cast<CloseDirFn>(get("_Close_dir"));
+    const auto make_dir = reinterpret_cast<MakeDirFn>(get("_Make_dir"));
+    const auto copy_file = reinterpret_cast<CopyFileFn>(get("_Copy_file"));
+    if (!stat || !open_dir || !read_dir || !close_dir || !make_dir || !copy_file) {
+        std::printf("SKIP %s: no msvcp140.dll with the filesystem exports in System32\n", what);
+        return;
+    }
+
+    const auto package = g_dir / "rt369_package";
+    const auto overlay = g_dir / "rt369_overlay";
+    std::filesystem::create_directories(package / "data");
+    std::ofstream(package / "data" / "package.txt", std::ios::binary) << "package";
+    std::filesystem::create_directories(overlay / "data");
+    std::ofstream(overlay / "data" / "overlay.txt", std::ios::binary) << "overlay";
+    rt::fs::configure(package, overlay);
+    try {
+        rt::Loader loader(g_dir);
+        loader.load(write_image_as(make_import_image("msvcp140.dll", "_Stat"), "importer_msvcp_fs.exe"));
+        int perms = 0;
+        if (stat(L"GAME:\\data\\package.txt", &perms) != kRegular)
+            return failed(what, "_Stat did not find the package file GAME:\\data\\package.txt");
+        if (stat(L"GAME:\\data", &perms) != kDirectory) return failed(what, "_Stat did not see GAME:\\data as a folder");
+        if (stat(L"GAME:\\data\\missing.txt", &perms) != kNotFound)
+            return failed(what, "_Stat found a GAME: file that does not exist");
+
+        std::vector<std::wstring> names;
+        wchar_t name[kNameMax] = {};
+        int error = 0, type = 0;
+        if (void* dir = open_dir(name, L"GAME:\\data", error, type)) {
+            for (; name[0]; read_dir(name, dir, type)) names.emplace_back(name);
+            close_dir(dir);
+        }
+        std::sort(names.begin(), names.end());
+        if (names != std::vector<std::wstring>{L"overlay.txt", L"package.txt"})
+            return failed(what, "_Open_dir/_Read_dir did not list the overlay and the package merged");
+
+        if (make_dir(L"GAME:\\saves", nullptr) != 1 || !std::filesystem::is_directory(overlay / "saves") ||
+            std::filesystem::exists(package / "saves"))
+            return failed(what, "_Make_dir did not create GAME:\\saves in the overlay");
+        if (copy_file(L"GAME:\\data\\package.txt", L"GAME:\\saves\\copy.txt") != 0 ||
+            !std::filesystem::exists(overlay / "saves" / "copy.txt"))
+            return failed(what, "_Copy_file did not copy a package file into the overlay");
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 int main() {
     g_dir = work_dir();
     std::error_code ec;
@@ -1530,6 +1595,7 @@ int main() {
         test_lookup_during_loads();
         test_host_crt_paths();
         test_compat_modules();
+        test_host_msvcp_filesystem();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());

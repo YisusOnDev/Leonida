@@ -110,6 +110,9 @@ private:
 
 // Provisional definitions of ours: the real constants and layouts of the console API are unmeasured.
 inline constexpr std::uint32_t frame_event_origin = 0;
+// WaitFrameEventX flag 0x2 (non-blocking current-token poll): returns a fresh token for the newest passed origin
+// immediately without waiting for the next origin or for in-flight latency slots to drain.
+inline constexpr std::uint32_t wait_flag_current_token = 0x2;
 // Statistics types (bit mask). Interval and render entries are never produced here.
 inline constexpr std::uint32_t stat_frame_interval = 0x01;
 inline constexpr std::uint32_t stat_frame_event = 0x02;
@@ -218,11 +221,13 @@ public:
     // WaitFrameEventX(event, timeout, ..., flags, &token). Blocks until the next origin, and while `latency` frames
     // are in flight. pacer_hr::timeout when `timeout_ms` passes first (infinite_timeout_ms: never); the token is left
     // alone then. invalid_state when nothing is registered, the pacer is suspended, or one of those happens while waiting.
+    // With wait_flag_current_token (0x2), returns immediately with a fresh token for the newest passed origin (or an
+    // unregistered token if no interval/event is armed yet), failing only if suspended or shutting down.
     std::int32_t wait_frame_event(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
                                   std::uint64_t* token) {
-        (void)flags;
         if (event != frame_event_origin || !token) return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
+        if (flags & wait_flag_current_token) return current_token_locked(token);
         ++waiters_;
         const std::int32_t result = wait_locked(lock, timeout_ms, token);
         if (--waiters_ == 0) cv_.notify_all();
@@ -433,6 +438,26 @@ private:
             if (shown_us_.size() > latency_) shown_us_.pop_front();
             pending_.pop_front();
         }
+    }
+
+    // Non-blocking poll (wait_flag_current_token): issues a fresh token for the newest passed origin without waiting
+    // for the next origin or an open latency slot.
+    std::int32_t current_token_locked(std::uint64_t* token) {
+        if (shutdown_ || suspended_) return pacer_hr::invalid_state;
+        *token = tokens_->issue();  // the device's shared token source (#7685)
+        if (!interval_set_ || !armed_) return pacer_hr::ok;
+        const std::uint64_t now = clock_.now_us();
+        retire_locked(now);
+        const std::uint64_t first = epoch_us_ + offset_us_;
+        const std::int64_t newest = now >= first ? std::int64_t((now - first) / period_us_) : 0;
+        last_origin_ = std::max(last_origin_, newest);
+        Record record;
+        record.token = *token;
+        record.origin_us = first + std::uint64_t(last_origin_) * period_us_;
+        record.due_us = record.origin_us - offset_us_ + period_us_;
+        records_.push_back(record);
+        if (records_.size() > 64) records_.pop_front();
+        return pacer_hr::ok;
     }
 
     std::int32_t wait_locked(std::unique_lock<std::mutex>& lock, std::uint32_t timeout_ms, std::uint64_t* token) {

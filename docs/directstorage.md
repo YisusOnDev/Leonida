@@ -93,7 +93,7 @@ The first boot with the executable settles most of this: the dry-run report show
   3. reserved option bits (`E_DSTORAGE_RESERVED_FIELDS`), then the source type against the queue's
      (`E_DSTORAGE_INVALID_SOURCE_TYPE`);
   4. BCPack mode above 7, swizzle mode above 4 (`_INVALID_BCPACK_MODE`, `_INVALID_SWIZZLE_MODE`), then BCPack or
-     swizzle, with or without zlib, then physical pages (`E_NOTIMPL`, logged once: later PRs);
+     swizzle, with or without zlib, then a physical-page source (`E_NOTIMPL`, logged once: later PRs);
   5. an `IntermediateSize` (`_INVALID_INTERMEDIATE_SIZE`: it is the size between the inflate and the BCPack decode,
      so only a zlib + BCPack request has one), a `DestinationSize` other than `SourceSize` without zlib, or not
      larger than `SourceSize` with it (`_INVALID_DESTINATION_SIZE`: the rule `dstorageerr.h` gives for that code,
@@ -159,14 +159,48 @@ The first boot with the executable settles most of this: the dry-run report show
   (the inflate's output, the BCPack decoder's input), and `FileOffset` must be 16-byte aligned. Each becomes a stage
   after `inflate_request`'s inflate and before its destination write, so the request checks above stay where they
   are.
-- **Physical pages** (`SourceIsPhysicalPages`, `DestinationIsPhysicalPages`): arrays of 64 KiB page numbers from
-  `XMemAllocatePhysicalPages`; needs the `xmem` shim to translate a page number to the address it mapped.
+- **A physical-page source** (`SourceIsPhysicalPages`: `SourcePageArray` and `SourcePageOffset` of a memory
+  request). The destination side is done, see "Physical-page destinations" below; a source needs the read
+  counterpart of `rt::xmem::write_physical_pages`.
 - **GPU memory**: the console API has no GPU destinations of its own (memory is unified, so a destination is an
   address). An address inside memory the Vulkan layer backs will need its write routed to that memory. The destination
   is written in two places, both in `execute_request` (`read_file_range` for a file source, `guarded_move` for a
   memory source), so that change stays inside the request path.
 - **Parallel reads**: the worker reads one request at a time. Overlapped reads with in-order retirement of
   notifications would keep the order guarantee.
+
+## Physical-page destinations
+
+A request with `DestinationIsPhysicalPages` has no destination address. The union that holds `Destination` holds
+`DestinationPageArray`, a pointer to page numbers, and `DestinationPageOffset`, a `UINT16`; the data starts that many
+bytes into the first page and runs on through the following entries. The page numbers are the ones
+`XMemAllocatePhysicalPages` hands out, 64 KiB each in the `xmem` shim ([runtime_imports.md](runtime_imports.md)), which
+is also why the offset fits 16 bits.
+
+The retail executable builds such requests. Read from its code, with nothing run: its chunked read path asks whether
+the destination address lies inside the range it backs with physical pages, and if it does it passes the address of
+that page's entry in its own page table as the array and the low 16 bits of the address as the offset, with the option
+bit set; otherwise it passes the address itself. The same path takes `ZlibDecompress`, `BcpackMode` 1 to 7 and
+`SwizzleMode` 1 to 4 from the chunk's entry in the file's chunk table, and never `SourceIsPhysicalPages`. How often
+each combination occurs in a boot has not been counted (a trace of the first requests would give it).
+
+What the shim does (`write_destination` in `shims/dstorage.cpp`, `rt::xmem::write_physical_pages` in `shims/xmem.cpp`):
+
+- the source (a file range or memory) is read into a staging buffer and, for a zlib request, inflated there, as for
+  an address;
+- the page numbers the range covers, `(DestinationPageOffset + size)` rounded up to whole pages, are copied out of
+  the title's array under the same guard as every other read of title memory;
+- every page number is looked up before a byte is written, so an unreadable array, page number 0 (which the map calls
+  read as "unmap"), a number that was never handed out and a freed page all fail the request with
+  `E_DSTORAGE_ACCESS_VIOLATION`, the code of a destination that cannot be written, and leave the pages as they were;
+- the bytes are written through views of the pages' backing sections, one view per run of pages that follow one
+  another in one allocation. A page needs no mapping to be written, and a page that is mapped (at one address or
+  several) shows the bytes at once, since every view of a section is the same memory.
+
+`DSTORAGE_MAX_4K_PAGE_DESTINATION_SIZE` (32 MiB) does not apply to these requests: the reference allows a larger
+buffer with 64 KiB or 2 MiB pages, and physical pages are 64 KiB. An address keeps the limit, because the shim cannot
+tell the page size behind it. **Unverified:** the console's failure code for a bad page number (the header has none
+that names one), and whether the console requires the pages to be mapped.
 
 ## Tests
 
@@ -183,7 +217,13 @@ block followed by the dynamic one. They are read from a file and from memory (al
 preset dictionary, a reserved block type, a truncated stream, an Adler-32 mismatch, a stream shorter and one longer
 than `DestinationSize`, a stored stream larger than its result, an unaligned offset, an `IntermediateSize`, zlib with
 BCPack or swizzle (`E_NOTIMPL`), an unreadable source and an unwritable destination each get their code, a failed
-stream leaves its destination untouched, and the decompression statistics count them.
+stream leaves its destination untouched, and the decompression statistics count them. Physical-page destinations use
+pages from the `xmem` shim's own exports (two allocations, so a request's pages come from two backings out of order)
+and read every result back through a window the pages are mapped into: a file read that starts inside one page and
+ends in the fourth, zlib from memory across a page boundary, a copy that ends exactly at the end of a page, pages that
+were mapped during the request and pages mapped only afterwards, a request over 32 MiB, and the failures (a number that
+is not a live page, page number 0, a freed page, an unreadable array), which must leave every page untouched. A
+physical-page source is `E_NOTIMPL`.
 
 ## Sources and licences
 

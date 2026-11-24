@@ -188,14 +188,37 @@ HRESULT STDMETHODCALLTYPE begin_alloc_not_provided(void*) {
 }
 
 // XThreadSetTimeSensitive / XThreadIsTimeSensitive / XThreadAssertNotTimeSensitive. The flag is per thread, as in
-// the GDK; nothing is enforced offline (a time-sensitive thread may still block).
-thread_local bool t_time_sensitive = false;
+// the GDK; nothing is enforced offline (a time-sensitive thread may still block). Stored in a Win32 TlsAlloc slot
+// rather than thread_local so this shim emits no static module TLS (_tls_index) reads on guest threads.
+INIT_ONCE g_time_sensitive_tls_once = INIT_ONCE_STATIC_INIT;
+DWORD g_time_sensitive_tls_slot = TLS_OUT_OF_INDEXES;
+
+BOOL CALLBACK init_time_sensitive_tls(PINIT_ONCE, PVOID, PVOID*) noexcept {
+    g_time_sensitive_tls_slot = TlsAlloc();
+    return TRUE;
+}
+
+DWORD time_sensitive_tls_slot() noexcept {
+    InitOnceExecuteOnce(&g_time_sensitive_tls_once, &init_time_sensitive_tls, nullptr, nullptr);
+    return g_time_sensitive_tls_slot;
+}
+
 HRESULT STDMETHODCALLTYPE thread_set_time_sensitive(void*, bool value) {
-    t_time_sensitive = value;
+    const DWORD saved_error = GetLastError();
+    const DWORD slot = time_sensitive_tls_slot();
+    if (slot != TLS_OUT_OF_INDEXES)
+        TlsSetValue(slot, value ? reinterpret_cast<void*>(static_cast<uintptr_t>(1)) : nullptr);
+    SetLastError(saved_error);
     return S_OK;
 }
 void STDMETHODCALLTYPE thread_assert_not_time_sensitive(void*) {}
-bool STDMETHODCALLTYPE thread_is_time_sensitive(void*) { return t_time_sensitive; }
+bool STDMETHODCALLTYPE thread_is_time_sensitive(void*) {
+    const DWORD saved_error = GetLastError();
+    const DWORD slot = time_sensitive_tls_slot();
+    const bool value = slot != TLS_OUT_OF_INDEXES && TlsGetValue(slot) != nullptr;
+    SetLastError(saved_error);
+    return value;
+}
 
 #define XM(fn) reinterpret_cast<const void*>(&Method<&fn>::call)
 const void* const kThreadingVtable[] = {
@@ -479,23 +502,26 @@ struct PersistentSpaceInfo {
 };
 static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceInfo is four UINT64");
 
-// The storage folder, created on first use. Empty when there is no overlay (no place to keep files) or the folder
-// cannot be created.
-std::filesystem::path persistent_storage_dir() {
-    const std::filesystem::path overlay = rt::fs::overlay_dir();
-    if (overlay.empty()) return {};
-    std::filesystem::path dir = overlay / rt::fs::kPersistentStorageDir;
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return ec ? std::filesystem::path{} : dir;
-}
-
-std::string utf8_of(const std::wstring& wide) {
+std::string utf8_of(const std::filesystem::path& path) {
+    const std::wstring& wide = path.native();
     const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
     if (n <= 0) return {};
     std::string utf8(static_cast<size_t>(n), '\0');
     WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), utf8.data(), n, nullptr, nullptr);
     return utf8;
+}
+
+std::string persistent_storage_guest_path() {
+    std::filesystem::path host_path;
+    const auto physical_path = rt::fs::ensure_persistent_storage(&host_path);
+    if (physical_path.empty()) return {};
+    auto path = utf8_of(host_path);
+    // The title can supply a fixed 256-byte buffer, including the NUL. Keep short host paths compatible.
+    constexpr size_t kBootPathCapacity = 256;
+    if (path.size() < kBootPathCapacity) return path;
+    const DWORD attributes = ::GetFileAttributesW(physical_path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return {};
+    return rt::fs::kPersistentStorageGuestPath;
 }
 
 uint64_t folder_bytes(const std::filesystem::path& dir) {
@@ -514,7 +540,7 @@ uint64_t folder_bytes(const std::filesystem::path& dir) {
 HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
     if (!path_size) return E_POINTER;
     *path_size = 0;
-    const std::string path = utf8_of(persistent_storage_dir().native());
+    const std::string path = persistent_storage_guest_path();
     if (path.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     *path_size = path.size() + 1;  // with the terminating NUL
     return S_OK;
@@ -523,7 +549,7 @@ HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
 HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size_t* path_used) {
     if (path_used) *path_used = 0;
     if (!path) return E_POINTER;
-    const std::string folder = utf8_of(persistent_storage_dir().native());
+    const std::string folder = persistent_storage_guest_path();
     if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     if (path_size < folder.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     std::memcpy(path, folder.c_str(), folder.size() + 1);
@@ -534,7 +560,7 @@ HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size
 HRESULT STDMETHODCALLTYPE pls_get_space_info(void*, PersistentSpaceInfo* info) {
     if (!info) return E_POINTER;
     *info = {};
-    const std::filesystem::path dir = persistent_storage_dir();
+    const std::filesystem::path dir = rt::fs::ensure_persistent_storage();
     if (dir.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     const uint64_t used = folder_bytes(dir);
     const uint64_t left = used < kPersistentQuotaBytes ? kPersistentQuotaBytes - used : 0;
@@ -549,7 +575,7 @@ HRESULT STDMETHODCALLTYPE pls_get_space_info(void*, PersistentSpaceInfo* info) {
 
 HRESULT STDMETHODCALLTYPE pls_prompt_async(void*, uint64_t requested_bytes, XAsyncBlock* async) {
     if (!async) return E_POINTER;
-    const std::filesystem::path dir = persistent_storage_dir();
+    const std::filesystem::path dir = rt::fs::ensure_persistent_storage();
     const bool fits = !dir.empty() && requested_bytes <= kPersistentQuotaBytes - (std::min)(folder_bytes(dir), kPersistentQuotaBytes);
     if (fits) return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return S_OK; });
     return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return HRESULT_FROM_WIN32(ERROR_DISK_FULL); });
@@ -1002,8 +1028,9 @@ bool __stdcall XPackageIsPackagedProcess() {
 // 22, 24-27, 30, 32-34, 37-40), each in the argument shape of the method at that position of xgameruntime-docs'
 // IXPackageImpl (slots 3-34), IXPackageImpl2 (35-38) and IXPackageImpl3 (39-40) lists (docs/runtime_imports.md).
 // The slots with an offline answer forward to the XPackage functions above (the package identifier, whether the
-// process is packaged, the mount path and its size, the user's locale); every other slot logs its number once and
-// returns E_NOTIMPL, so the first boot shows which ones the title needs.
+// process is packaged, the mount path and its size, the user's locale) or answer as a fully installed package
+// (installation monitors, chunks); every other slot logs its number once and returns E_NOTIMPL, so the first boot
+// shows which ones the title needs.
 
 constexpr GUID kPackageClass = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
 // IXPackageImpl3 : IXPackageImpl2 : IXPackageImpl (xgameruntime include/xpackage.idl); the class id is its own.
@@ -1140,20 +1167,144 @@ bool STDMETHODCALLTYPE pkg_unregister_progress(void*, void*, XTaskQueueRegistrat
 bool STDMETHODCALLTYPE pkg_unregister_installed(void*, XTaskQueueRegistrationToken, bool) { return true; }
 bool STDMETHODCALLTYPE pkg_uninstall_package(void*, const char*) { return false; }
 
+// Chunks and installation monitors, offline: the whole package is on disk, so every chunk is Ready, nothing is
+// downloaded, and an install finishes at once. Signatures as Microsoft's XPackage reference gives them; the
+// selector arrays are never read. One monitor serves every caller: slot 7 reads it as complete whatever it is.
+// XPackageChunkAvailability: Ready 0, Pending 1, Installable 2, Unavailable 3.
+char g_package_monitor;
+constexpr uint32_t kChunkReady = 0;
+const char kInstallChunksIdentity = 0, kMountWithUiIdentity = 1;  // different values, so a linker cannot fold them
+// "Installed" means what slot 23's XPackageMount means by it: the process's own package, or a content package in
+// LEONIDA_CONTENT_PACKAGES. Anything else is ERROR_NOT_FOUND here as it is there.
+HRESULT package_installed(const char* id) {
+    if (!id) return E_INVALIDARG;
+    HRESULT hr = S_OK;
+    (void)resolve_package_path(id, hr);
+    return hr == E_ACCESSDENIED ? S_OK : hr;  // E_ACCESSDENIED is the game's own id: installed, just not mountable
+}
+
+// HRESULT XPackageCreateInstallationMonitor(const char* packageIdentifier, uint32_t selectorCount,
+//     XPackageChunkSelector* selectors, uint32_t minimumUpdateIntervalMs, XTaskQueueHandle queue,
+//     XPackageInstallationMonitorHandle* installationMonitor)
+HRESULT STDMETHODCALLTYPE pkg_create_monitor(void*, const char* id, uint32_t, void*, uint32_t, XTaskQueueHandle,
+                                             void** monitor) {
+    if (!monitor) return E_POINTER;
+    *monitor = nullptr;
+    if (const HRESULT hr = package_installed(id); FAILED(hr)) return hr;
+    *monitor = &g_package_monitor;
+    return S_OK;
+}
+void STDMETHODCALLTYPE pkg_close_monitor(void*, void*) {}
+// HRESULT XPackageRegisterInstallationProgressChanged(monitor, void* context,
+//     XPackageInstallationProgressChangedCallback* callback, XTaskQueueRegistrationToken* token): the install is
+// already complete, so the callback is never called; slot 10 unregisters any token.
+HRESULT STDMETHODCALLTYPE pkg_register_progress(void*, void*, void*, void* callback, XTaskQueueRegistrationToken* token) {
+    if (!callback) return E_INVALIDARG;
+    if (!token) return E_POINTER;
+    token->token = 1;
+    return S_OK;
+}
+// HRESULT XPackageFindChunkAvailability(const char* packageIdentifier, uint32_t selectorCount,
+//     XPackageChunkSelector* selectors, XPackageChunkAvailability* availability)
+HRESULT STDMETHODCALLTYPE pkg_find_chunk_availability(void*, const char* id, uint32_t, void*, uint32_t* availability) {
+    if (!availability) return E_POINTER;
+    if (const HRESULT hr = package_installed(id); FAILED(hr)) return hr;
+    *availability = kChunkReady;
+    return S_OK;
+}
+// HRESULT XPackageChangeChunkInstallOrder(const char* packageIdentifier, uint32_t selectorCount,
+//     XPackageChunkSelector* selectors): nothing is queued, so there is no order to change.
+HRESULT STDMETHODCALLTYPE pkg_change_chunk_order(void*, const char* id, uint32_t, void*) {
+    return package_installed(id);
+}
+// HRESULT XPackageEstimateDownloadSize(const char* packageIdentifier, uint32_t selectorCount,
+//     XPackageChunkSelector* selectors, uint64_t* downloadSize, bool* shouldPresentUserConfirmation)
+HRESULT STDMETHODCALLTYPE pkg_estimate_download(void*, const char* id, uint32_t, void*, uint64_t* size, bool* confirm) {
+    if (!size || !confirm) return E_POINTER;
+    if (const HRESULT hr = package_installed(id); FAILED(hr)) return hr;
+    *size = 0;
+    *confirm = false;
+    return S_OK;
+}
+// HRESULT XPackageUninstallChunks(const char* packageIdentifier, uint32_t selectorCount,
+//     XPackageChunkSelector* selectors): refused. The game folder is read only and nothing is removed, so the
+// chunks stay Ready; the one call site (counted with tools/gdk_runtime_calls.py) does not test the result. The same
+// answer as slot 34 (not uninstalled).
+HRESULT STDMETHODCALLTYPE pkg_uninstall_chunks(void*, const char*, uint32_t, void*) { return E_ACCESSDENIED; }
+
+// The answer of slots 16 and 37 rides in the async context as one u64 (the monitor or the mount handle).
+HRESULT CALLBACK package_value_provider(XAsyncOp op, const XAsyncProviderData* data) {
+    switch (op) {
+    case XAsyncOp::Begin:
+        return XAsyncSchedule(data->async, 0);
+    case XAsyncOp::DoWork:
+        XAsyncComplete(data->async, S_OK, sizeof(uint64_t));
+        return S_OK;
+    case XAsyncOp::GetResult:
+        if (!data->buffer || data->bufferSize < sizeof(uint64_t)) return E_INVALIDARG;
+        *static_cast<uint64_t*>(data->buffer) = reinterpret_cast<uintptr_t>(data->context);
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+// HRESULT XPackageInstallChunksAsync(const char* packageIdentifier, uint32_t selectorCount,
+//     XPackageChunkSelector* selectors, uint32_t minimumUpdateIntervalMs, bool suppressUserConfirmation,
+//     XAsyncBlock* asyncBlock) / XPackageInstallChunksResult(XAsyncBlock*, XPackageInstallationMonitorHandle*):
+// completes at once with the installed package's monitor.
+HRESULT STDMETHODCALLTYPE pkg_install_chunks_async(void*, const char* id, uint32_t, void*, uint32_t, bool,
+                                                   XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    if (const HRESULT hr = package_installed(id); FAILED(hr)) return hr;
+    return XAsyncBegin(async, &g_package_monitor, &kInstallChunksIdentity, "XPackageInstallChunksAsync",
+                       package_value_provider);
+}
+HRESULT STDMETHODCALLTYPE pkg_install_chunks_result(void*, XAsyncBlock* async, void** monitor) {
+    if (!monitor) return E_POINTER;
+    return XAsyncGetResult(async, &kInstallChunksIdentity, sizeof(*monitor), monitor, nullptr);
+}
+// HRESULT XPackageMountWithUiAsync(const char* packageIdentifier, XAsyncBlock* asyncBlock) /
+// XPackageMountWithUiResult(XAsyncBlock*, XPackageMountHandle*): no UI to show offline, so this is slot 23's
+// XPackageMount, done before the call returns. A refused mount (ERROR_NOT_FOUND, E_ACCESSDENIED for the game itself)
+// is returned by the Async call itself, which its one call site (tools/gdk_runtime_calls.py) tests; whether the GDK
+// fails there or in the result is not known. A mount whose result is never collected (a cancel before the work runs,
+// or no slot 38 call) stays in the mount table: one small entry, not closed by the async cleanup.
+HRESULT STDMETHODCALLTYPE pkg_mount_with_ui_async(void*, const char* id, XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    XPackageMountHandle mount{};
+    const HRESULT hr = XPackageMount(id, &mount);
+    if (FAILED(hr)) return hr;
+    const HRESULT begun = XAsyncBegin(async, reinterpret_cast<void*>(static_cast<uintptr_t>(mount.handle)),
+                                      &kMountWithUiIdentity, "XPackageMountWithUiAsync", package_value_provider);
+    if (FAILED(begun)) XPackageCloseMountHandle(mount);
+    return begun;
+}
+HRESULT STDMETHODCALLTYPE pkg_mount_with_ui_result(void*, XAsyncBlock* async, XPackageMountHandle* mount) {
+    if (!mount) return E_POINTER;
+    return XAsyncGetResult(async, &kMountWithUiIdentity, sizeof(*mount), mount, nullptr);
+}
+
 #define PN(n) reinterpret_cast<const void*>(&package_not_implemented<n>)
 const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
     reinterpret_cast<const void*>(&object_release),
     reinterpret_cast<const void*>(&pkg_identifier),   // 3  XPackageGetCurrentProcessPackageIdentifier
     reinterpret_cast<const void*>(&pkg_is_packaged),  // 4  XPackageIsPackagedProcess
-    PN(5), PN(6),                                     // 5-6 installation monitor: create, close
+    reinterpret_cast<const void*>(&pkg_create_monitor),         // 5  XPackageCreateInstallationMonitor
+    reinterpret_cast<const void*>(&pkg_close_monitor),          // 6  XPackageCloseInstallationMonitorHandle (void)
     reinterpret_cast<const void*>(&pkg_installation_progress),  // 7  XPackageGetInstallationProgress (void, writes)
     reinterpret_cast<const void*>(&pkg_update_monitor),         // 8  XPackageUpdateInstallationMonitor (bool)
-    PN(9),                                                      // 9  XPackageRegisterInstallationProgressChanged
+    reinterpret_cast<const void*>(&pkg_register_progress),      // 9  XPackageRegisterInstallationProgressChanged
     reinterpret_cast<const void*>(&pkg_unregister_progress),    // 10 ...UnregisterInstallationProgressChanged (bool)
     reinterpret_cast<const void*>(&pkg_user_locale),  // 11 XPackageGetUserLocale
-    PN(12), PN(13), PN(14), PN(15), PN(16), PN(17),   // 12-19 chunks: find / enumerate availability, change order,
-    PN(18), PN(19),                                   //       install (+ async, result), estimate size, uninstall
+    reinterpret_cast<const void*>(&pkg_find_chunk_availability),  // 12 XPackageFindChunkAvailability
+    PN(13),                                                       // 13 XPackageEnumerateChunkAvailability
+    reinterpret_cast<const void*>(&pkg_change_chunk_order),       // 14 XPackageChangeChunkInstallOrder
+    PN(15),                                                       // 15 XPackageInstallChunks
+    reinterpret_cast<const void*>(&pkg_install_chunks_async),     // 16 XPackageInstallChunksAsync
+    reinterpret_cast<const void*>(&pkg_install_chunks_result),    // 17 XPackageInstallChunksResult
+    reinterpret_cast<const void*>(&pkg_estimate_download),        // 18 XPackageEstimateDownloadSize
+    reinterpret_cast<const void*>(&pkg_uninstall_chunks),         // 19 XPackageUninstallChunks
     PN(20), PN(21),                                   // 20-21 _unknown_ (older enumerate / register installed)
     reinterpret_cast<const void*>(&pkg_unregister_installed),  // 22 XPackageUnregisterPackageInstalled (bool)
     reinterpret_cast<const void*>(&pkg_mount),            // 23 XPackageMount
@@ -1164,8 +1315,9 @@ const void* const kPackageVtable[] = {
                                                       // 30 GetWriteStats, 31 _unknown_
     PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
     reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
-    PN(35), PN(36), PN(37), PN(38),                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
-                                                      //   MountWithUiAsync, MountWithUiResult
+    PN(35), PN(36),                                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
+    reinterpret_cast<const void*>(&pkg_mount_with_ui_async),   // 37 XPackageMountWithUiAsync
+    reinterpret_cast<const void*>(&pkg_mount_with_ui_result),  // 38 XPackageMountWithUiResult
     PN(39), PN(40),                                   // IXPackageImpl3: EnumeratePackages, RegisterPackageInstalled
 };
 #undef PN

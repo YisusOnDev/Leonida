@@ -22,7 +22,9 @@
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <source_location>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -77,23 +79,73 @@ static bool append_tile_regions(const D3D12_TILED_RESOURCE_COORDINATE* start, co
     return true;
 }
 
+namespace {
+
+struct SrwGuard {
+    SRWLOCK& lock;
+    explicit SrwGuard(SRWLOCK& l) noexcept : lock(l) { AcquireSRWLockExclusive(&lock); }
+    ~SrwGuard() noexcept { ReleaseSRWLockExclusive(&lock); }
+    SrwGuard(const SrwGuard&) = delete;
+    SrwGuard& operator=(const SrwGuard&) = delete;
+};
+
+// Constant-initialized and intentionally immortal so threads where a mapped executable owns static TLS slot 0 never
+// hit an _Init_thread_header guard or touch a destroyed mutex during process teardown.
+SRWLOCK g_log_lock = SRWLOCK_INIT;
+std::set<std::string>* g_stub_seen = nullptr;
+std::set<std::string>* g_note_seen = nullptr;
+
+}  // namespace
+
 void stub(const char* method) {
     // Generated API stubs pass a bare method name; explanatory diagnostics are not separate calls.
     if (!std::strchr(method, '(')) d3d12_trace::record(method, "unsupported");
-    static std::mutex mutex;
-    static std::set<std::string> seen;
-    std::lock_guard lock(mutex);
-    if (seen.insert(method).second) std::fprintf(stderr, "[rt] d3d12: unimplemented %s\n", method);
+    SrwGuard lock(g_log_lock);
+    if (!g_stub_seen) g_stub_seen = new std::set<std::string>;
+    if (g_stub_seen->insert(method).second) std::fprintf(stderr, "[rt] d3d12: unimplemented %s\n", method);
 }
 
 namespace {
 
+// The method a std::source_location names: the identifier just before the parameter list of function_name(). MSVC and
+// clang-cl give the whole signature ("void __cdecl rt::d3d12::`anonymous-namespace'::GraphicsCommandList::
+// RSSetViewports(unsigned int,const struct D3D12_VIEWPORT *)"), where the first '(' after an identifier character
+// opens the parameters (the one in clang's "(anonymous namespace)" follows a space); a bare name is kept whole.
+std::string_view method_of(const char* function) {
+    const std::string_view name = function ? function : "";
+    const auto identifier = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+    };
+    std::size_t open = name.find('(');
+    while (open != std::string_view::npos && (open == 0 || !identifier(name[open - 1]))) open = name.find('(', open + 1);
+    const std::size_t end = open == std::string_view::npos ? name.size() : open;
+    std::size_t begin = end;
+    while (begin > 0 && identifier(name[begin - 1])) --begin;
+    return begin < end ? name.substr(begin, end - begin) : name;
+}
+
+// A recorded call the layer refuses marks its list invalid: Close then returns E_INVALIDARG, and ExecuteCommandLists
+// refuses the list. Nothing else said so, so a failing Close gave no cause: on a retail boot every Close failed, and
+// only a rebuild with per-line logging showed that ClearRenderTargetView's check was the one refusing (a console CPU
+// handle, translated since by #7880). The first refusal at each call site is logged with its method and line; one bit
+// per source line, so the refusals a title repeats every frame cost an atomic OR after the first.
+void log_refused_call(const std::source_location& where) {
+    static std::array<std::atomic<std::uint64_t>, 64> logged{};  // 4,096 lines; the file is shorter
+    const std::uint32_t line = where.line() % (64 * 64);
+    const std::uint64_t bit = std::uint64_t{1} << (line % 64);
+    if (logged[line / 64].fetch_or(bit, std::memory_order_relaxed) & bit) return;
+    const std::string_view method = method_of(where.function_name());
+    std::fprintf(stderr,
+                 "[rt] d3d12: ID3D12GraphicsCommandList::%.*s refused a recorded call (d3d12_com.cpp:%u); the list is "
+                 "invalid, so its Close returns E_INVALIDARG (logged once per call site)\n",
+                 static_cast<int>(method.size()), method.data(), static_cast<unsigned>(where.line()));
+}
+
 // Reports a deliberate simplification once (unlike stub, which reports a method not implemented).
 void note_once(const char* what) {
-    static std::mutex mutex;
-    static std::set<std::string> seen;
-    std::lock_guard lock(mutex);
-    if (seen.insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
+    SrwGuard lock(g_log_lock);
+    if (!g_note_seen) g_note_seen = new std::set<std::string>;
+    if (g_note_seen->insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
 }
 
 // Every ReplayResult needs a case: a missing one is a compile error (MSVC C4062, clang -Wswitch), not a "?" in the log.
@@ -1093,8 +1145,11 @@ private:
         return out;
     }
 
-    void check(bool ok) {
-        if (!ok) invalid_ = true;
+    // `where` is the call site, which the compiler fills in: each refusing site is logged once (log_refused_call).
+    void check(bool ok, std::source_location where = std::source_location::current()) {
+        if (ok) return;
+        invalid_ = true;
+        log_refused_call(where);
     }
 
     void stop_recording() {

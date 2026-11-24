@@ -35,6 +35,7 @@
 #ifdef LEONIDA_VULKAN_DEVICE
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
 // WindowPresenter. Other builds of this file (mock and COM tests) keep the refused-slot behaviour.
+#include "title_window.h"
 #include "xbox_present.h"
 #endif
 
@@ -599,6 +600,7 @@ HRESULT WINAPI dxgi_get_private_data(void* self, const GUID* name, UINT* size, v
 }
 HRESULT WINAPI dxgi_get_parent(void* self, const IID* riid, void** out) {
     note_dxgi("XboxIDXGIDevice::GetParent");
+    if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure
     if (!riid) return E_POINTER;
     return dxgi_adapter(dxgi_owner(self), *riid, out);
 }
@@ -1354,9 +1356,11 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 
 struct PresentState {
     ~PresentState() {
-        if (window) DestroyWindow(window);  // the presentation and its window die with the device proxy
+        xbox.reset();                                     // the presenter's surface goes before its window
+        if (window && own_window) DestroyWindow(window);  // the title's own window is never ours to destroy
     }
     HWND window = nullptr;
+    bool own_window = false;  // true only for the fallback window made here when the title has none
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
 };
@@ -1377,20 +1381,36 @@ PresentState* present_state_for(DeviceProxy* device) {
     if (!state) return nullptr;
     device->present_state = state;
     state->tried = true;
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = present_window_proc;
-    window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
-        return state;
-    }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
-                                  window_class.hInstance, nullptr);
-    if (!state->window) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
-        return state;
+    // The title's own top-level window (shims/title_window.h, #8591) is where the frames belong; the fallback window
+    // below is only for a title that has none by its first PresentX.
+    state->window = rt::d3d12::find_title_window(GetCurrentProcessId());
+    if (state->window) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX presents into the title's window %p\n",
+                     static_cast<void*>(state->window));
+    } else {
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc = present_window_proc;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.lpszClassName = L"LeonidaPresentX";
+        if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW,
+                                        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+                                        window_class.hInstance, nullptr);
+        if (!state->window) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->own_window = true;
+        // Shown, or the frames go to a window nobody sees. LEONIDA_WINDOW_NO_ACTIVATE (window_placement.h) keeps the
+        // focus where it is; this file does not link window_placement.cpp, so the flag is read here.
+        wchar_t flag[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_WINDOW_NO_ACTIVATE", flag, 8);
+        const bool no_activate = n > 0 && n < 8 && flag[0] != L'0';
+        ShowWindow(state->window, no_activate ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL);
+        std::fprintf(stderr, "[rt] d3d12_xs: no visible title window at the first PresentX; showing a fallback window\n");
     }
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
@@ -2325,7 +2345,6 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
 // (S_FALSE for a valid description on the PC), as #558 does for slot 14.
 HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
                                    void** out) {
-    note_slot(8);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
     // The caller's null output goes to the real device on purpose: its answer (S_FALSE, E_UNEXPECTED, ...) is the
@@ -2988,7 +3007,11 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
                                            {1, xbox_desc->kind1, xbox_desc->kind1_size},
                                            {6, xbox_desc->kind6, xbox_desc->kind6_size},
                                            {7, xbox_desc->kind7, xbox_desc->kind7_size}};
-        payload = leonida::fspx_payload_from_parts(parts);
+        try {
+            payload = leonida::fspx_payload_from_parts(parts);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
         if (payload.empty()) {
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true, std::memory_order_relaxed))
@@ -3003,6 +3026,9 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
         }
         pc_desc.CS.pShaderBytecode = payload.data();
         pc_desc.CS.BytecodeLength = payload.size();
+    } else if ((!xbox_desc->kind6 && xbox_desc->kind6_size) || (!xbox_desc->kind1 && xbox_desc->kind1_size) ||
+               (!xbox_desc->kind7 && xbox_desc->kind7_size)) {
+        return E_INVALIDARG;
     }
 
     pc_desc.NodeMask = 0;
@@ -4046,6 +4072,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 2) {
         return proxy_release(self);
     } else if constexpr (Slot == 8) {
+        note_slot(8);
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                     reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 9) {

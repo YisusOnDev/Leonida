@@ -243,6 +243,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   that sits on a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
   `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything
   is written there, and removing or moving it fails with `ERROR_ACCESS_DENIED`.
+- `XPersistentLocalStorageGetPath` returns the backing path if it fits the 256-byte startup buffer including
+  the NUL. For longer paths it returns the guest root `PLS:\`, backed by the same `<overlay>\.gta6rt-persistent`
+  directory. The runtime's intercepted file APIs resolve this root directly in the overlay. The package and
+  its deletion markers are outside this namespace.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
   write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes. The copy is
   written under `<overlay>\.gta6rt-copy` and renamed into place, one copy-up at a time, so a process killed mid-copy
@@ -325,9 +329,7 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   `_wfsopen`, `_wremove`, `_wrename` and `_wrmdir` (the only CRT path calls those modules import, all from
   `msvcp140.dll`) at the shim registered under the same name, as it already points its `RtlPcToFileHeader` at the
   loader's; a name with no shim keeps the host's. `gta6rt` links the static CRT and does not use those modules
-  itself. `runtime/test/loader_test.cpp` checks it through `std::_Fiopen`. Not covered: `std::filesystem`, which
-  `msvcp140.dll` runs on kernel32 (`CreateFile2`, `FindFirstFileExW`, `GetFileAttributesExW` and others) and which
-  deletes through a handle (`SetFileInformationByHandle`), so routing it needs more than this list.
+  itself. `runtime/test/loader_test.cpp` checks it through `std::_Fiopen`.
 - The CRT's other path calls follow the same rules (RT-359): `remove`/`_wremove`, `_unlink`/`_wunlink`,
   `rename`/`_wrename`, `_mkdir`/`_wmkdir`, `_rmdir`/`_wrmdir`, `_access`/`_waccess`, `_access_s`/`_waccess_s` and
   `_stat32`, `_stat32i64`, `_stat64`, `_stat64i32` with their `_wstat` forms, under
@@ -337,6 +339,24 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   move from `GAME:` to a host path fails with `EXDEV`. `_stat*` and `_access*` look at the copy a read would open,
   through ucrtbase's wide function. Errors land in the caller's CRT `errno` as that CRT maps them. Host paths go to
   ucrtbase unchanged.
+- `std::filesystem` on `GAME:` paths (RT-369). C++17 `std::filesystem` is not in `msvcp140.dll`: `msvcprt.lib`
+  links its implementation (`filesystem.obj`, the `__std_fs_*` functions) into the title, so it calls kernel32
+  through the title's own imports, which the loader binds to these shims. Its `remove` deletes through a handle:
+  `CreateFileW` with `DELETE`, then `SetFileInformationByHandle` with `FileDispositionInfoEx` (or
+  `FileDispositionInfo`). `DELETE` makes the open a write, so the handle names the overlay copy of a package file
+  (a package folder is mirrored there, as `SetFileAttributes` does); the `SetFileInformationByHandle` shim, on a
+  delete request for a handle under the overlay, also leaves the marker `DeleteFile` or `RemoveDirectory` leaves, so
+  the package name is hidden too. A package folder that still holds files fails with `ERROR_DIR_NOT_EMPTY`. Other
+  classes and host handles go to the host unchanged. `msvcp140.dll` itself still exports the older
+  `std::experimental::filesystem` (`_Stat`, `_Open_dir`/`_Read_dir`, `_Make_dir`, `_Copy_file`, ...), which calls
+  kernel32 directly; the host CRT copy's imports of every wide kernel32 file call with a shim (`CopyFile2`,
+  `CopyFileW`, `CreateFile2`, `CreateFileW`, `CreateDirectoryW`, `FindFirstFileExW`, `GetFileAttributesExW`,
+  `SetFileInformationByHandle`, ...) are pointed at the shims with the CRT names above. The whole set is listed
+  because versions differ: `msvcp140.dll` 14.51 imports `CopyFile2`/`CreateFile2`, 14.44 `CopyFileW`/`CreateFileW`
+  (dumpbin). `CreateHardLinkW` and `CreateSymbolicLinkW` have no shim and stay with the host. `loader_test`
+  checks `_Stat`, the merged listing, `_Make_dir` and `_Copy_file`; `file_system_test` checks the remove. Not covered:
+  `std::filesystem::canonical` (`GetFinalPathNameByHandleW`), hard and symbolic links, and `absolute`
+  (`GetFullPathNameW`, a separate pull request).
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
@@ -429,7 +449,7 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 | `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`), 3-20 (`libHttpClient.GDK.dll`, each in its documented argument shape, e.g. 18-20 (enum, u64 pointer / u64 / pointer)) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Served offline, asked for with `IXNetworkingImpl2`'s id |
 | `XSystemImpl` (`IXSystemImpl5`, slots 3-8 known) | 3-8 (`libHttpClient.GDK.dll`) | 3-5 `XSystemGetConsoleId` / `GetXboxLiveSandboxId` / `GetAppSpecificDeviceId` (size, pointer, pointer each), 6 `XSystemHandleTrack` (two pointers, IXSystemImpl3), 7 `XSystemIsHandleValid` (pointer), 8 `XSystemAllowFullDownloadBandwidth` (bool, IXSystemImpl4); IXSystemImpl2 and 5 add no known method. Served offline |
 | `XPersistentLocalStorageImpl` (`IXPersistentLocalStorageImpl3`, slots 3-8) | none called (the table of ids only) | slots 3-7 are `XPersistentLocalStorageGetPathSize` / `GetPath` / `GetSpaceInfo` / `PromptUserForSpaceAsync` / `PromptUserForSpaceResult`, slot 8 `XPersistentLocalStorageMountForPackage` (IXPersistentLocalStorageImpl3). Slots from the public xgameruntime-docs and Wine IDL, not measured in a caller. Served offline: the folder is `<overlay>\.gta6rt-persistent`, which `GAME:` does not see, the quota is the 2048 MB of `MicrosoftGame.Config`, a prompt for space the quota holds succeeds, and `MountForPackage` is `E_NOTIMPL` |
-| `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Served offline: 3 identifier, 4 packaged process, 11 user locale, 24-26 mount path size / path / close; the rest log once and return `E_NOTIMPL` |
+| `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Served offline: 3 identifier, 4 packaged process, 11 user locale, 24-26 mount path size / path / close; as a fully installed package: 5-6 installation monitor (one handle, closing it does nothing), 9 progress registration (a token, no callback is ever called), 12 every chunk `Ready`, 14 change install order (nothing queued), 16-17 install chunks (complete at once with the monitor), 18 download size 0 with no confirmation, 19 uninstall chunks refused (`E_ACCESSDENIED`, nothing removed); 37-38 mount with UI (slot 23's mount on an async block, a refused mount returned by the Async call); the rest log once and return `E_NOTIMPL` |
 | `XGameImpl` (`IXGameImpl3`, slots 3-5) | none in the package's DLLs (`libHttpClient.GDK.dll` holds its id only in the linked id table); the executable's requests are unmeasured | from the xgameruntime IDL: 3 `XGameGetXboxTitleId` (pointer), 4 `XLaunchNewGame` (two strings and a user handle, `void`), 5 `XLaunchRestartOnCrash` (string, u32). Served offline: the title id is `MicrosoftGame.Config`'s `<TitleId>` (`E_FAIL` without one), a new game launch is logged and ignored, a crash restart succeeds with nothing registered |
 
 **Two layout sources, and where they differ.** Besides xgameruntime-docs (GPL; facts only), the LGPL

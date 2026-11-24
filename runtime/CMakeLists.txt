@@ -343,11 +343,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/dstorage.cpp
     shims/file_system.cpp
     shims/registry.cpp
+    shims/xmem.cpp
   )
   target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(dstorage_test PRIVATE /OPT:NOREF)
+  target_link_libraries(dstorage_test PRIVATE psapi)  # xmem.cpp: the physical pages a request can name
 
   # LEONIDA_WINDOW_MONITOR / LEONIDA_WINDOW_NO_ACTIVATE: the title's CreateWindowEx/ShowWindow imports through the
   # registry. Creates and destroys a few windows on this desktop; none is activated.
@@ -361,6 +363,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(window_placement_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(window_placement_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(window_placement_test PRIVATE /OPT:NOREF)
+
+  # Shim registry constant-initialized lazy state and XCRDAPI.dll!DStorageGetFactory return-class checks.
+  add_executable(registry_init_and_classify_test
+    test/registry_init_and_classify_test.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(registry_init_and_classify_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(registry_init_and_classify_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(registry_init_and_classify_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(registry_init_and_classify_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
@@ -1410,6 +1422,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)
   endif()
+  if(WIN32 AND TARGET registry_init_and_classify_test)
+    add_test(NAME registry_init_and_classify COMMAND registry_init_and_classify_test)
+  endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
   endif()
@@ -2038,6 +2053,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_shader_path_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_shader_path COMMAND d3d12_shader_path_test)
 
+    add_executable(d3d12_tls_safe_test test/d3d12_tls_safe_test.cpp)
+    target_link_libraries(d3d12_tls_safe_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_tls_safe_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_tls_safe_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(d3d12_tls_safe_test PRIVATE /OPT:NOREF)
+    add_test(NAME d3d12_tls_safe COMMAND d3d12_tls_safe_test)
+    set_tests_properties(d3d12_tls_safe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
     # Multi-threaded concurrent submissions across two D3D12 queues + resource creation/destruction churn.
     add_executable(d3d12_multithread_test test/d3d12_multithread_test.cpp)
     target_link_libraries(d3d12_multithread_test PRIVATE gta6rt_d3d12_com)
@@ -2599,6 +2622,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_close_parity_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_close_parity COMMAND d3d12_close_parity_test)
     set_tests_properties(d3d12_close_parity PROPERTIES SKIP_RETURN_CODE 77)
+
+    # A refused recorded call is logged once per call site, with its method, so a failing Close names its cause.
+    add_executable(d3d12_refused_call_log_test test/d3d12_refused_call_log_test.cpp)
+    target_link_libraries(d3d12_refused_call_log_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_refused_call_log_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(d3d12_refused_call_log_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_refused_call_log COMMAND d3d12_refused_call_log_test)
+    set_tests_properties(d3d12_refused_call_log PROPERTIES SKIP_RETURN_CODE 77)
 
     # ExecuteIndirect recording-time Close() parity against live WARP and hardware D3D12, plus GPU dispatch sanity.
     add_executable(d3d12_execute_indirect_validation_test test/d3d12_execute_indirect_validation_test.cpp)

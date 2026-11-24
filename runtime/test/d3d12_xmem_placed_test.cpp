@@ -113,15 +113,16 @@ int run(ID3D12Device* real, void* device) {
     desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);  // the Xbox row-major word
     const auto window_va = reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(window);
 
-    // Without the hook the reserved pages are refused and the fallback answers.
+    // Without the hook the reserved pages are not imported: the buffer is a shadow at the title's VA (#8225), copied
+    // from the pages before each submission; reading them for that copy commits nothing.
     rt::d3d12_xs::set_placed_at_va_pages_hook(nullptr);
     {
         Ref<ID3D12Resource> fallback;
         EXPECT(place(device, window, desc, &fallback.p) == S_OK && fallback.p);
-        EXPECT(fallback->GetGPUVirtualAddress() != window_va);
+        EXPECT(fallback->GetGPUVirtualAddress() == window_va);
         EXPECT(state_is(window, MEM_RESERVE));
     }
-    std::printf("%s: untouched physical pages without the hook: still reserved, fallback buffer\n", who);
+    std::printf("%s: untouched physical pages without the hook: still reserved, shadow at the title's VA\n", who);
 
     // With it the range is committed first and imported.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
