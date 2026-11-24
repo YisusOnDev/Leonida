@@ -4498,9 +4498,21 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     if (call.console_abi && title_descs) {
         UINT64 size = 0, alignment = 0;
         if (leonida::console_layout::console_texture_placement(title_descs, desc_count, size, alignment)) {
-            static std::atomic<int> logged{0};
-            if ((size != info.SizeInBytes || alignment != info.Alignment) &&
-                logged.fetch_add(1, std::memory_order_relaxed) < 16)
+            // Logged once per distinct first description (up to 256 of them) where the answer changed.
+            static std::mutex log_mutex;
+            static std::vector<D3D12_RESOURCE_DESC> seen;
+            bool first_time = false;
+            if (size != info.SizeInBytes || alignment != info.Alignment) {
+                std::lock_guard lock(log_mutex);
+                const bool known = std::any_of(seen.begin(), seen.end(), [&](const D3D12_RESOURCE_DESC& s) {
+                    return std::memcmp(&s, &title_descs[0], sizeof(s)) == 0;
+                });
+                if (!known && seen.size() < 256) {
+                    seen.push_back(title_descs[0]);
+                    first_time = true;
+                }
+            }
+            if (first_time)
                 std::fprintf(stderr,
                              "[rt] d3d12_xs: slot 25: console size 0x%llx align 0x%llx for PC 0x%llx align 0x%llx: "
                              "%llux%ux%u mips %u format %d layout 0x%x align asked 0x%llx (%u description(s))\n",

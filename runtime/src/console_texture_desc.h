@@ -78,13 +78,19 @@ inline bool console_allocation(const D3D12_RESOURCE_DESC& d, uint64_t& size, uin
 
 // GetResourceAllocationInfo for a list of sampled textures (no render-target or depth flag: those keep the device
 // proxy's own rule, d3d12_xs_alloc_size.h): each placed after the previous at its own alignment, the total at the
-// largest alignment (VIctory's place). False when any description is something else or has no console layout.
+// largest alignment (VIctory's place). That alignment is at least 64 KiB (VIctory's place starts there) unless every
+// description asked for a smaller one itself (the title's +0x343E80 asks for 4 KiB and keeps only a 4 KiB answer): the
+// class builder rounds the size up to the alignment and looks for a 64 KiB slab count it divides (+0x51FB926), which a
+// 256-byte alignment (the 256-byte modes) would turn into a multiple of the size. The size is not rounded to the
+// floor: the title's page count comes from it. False when any description is something else or has no console layout.
 inline bool console_texture_placement(const D3D12_RESOURCE_DESC* descs, uint32_t count, uint64_t& size,
                                       uint64_t& alignment) {
     if (!descs || !count) return false;
     uint64_t total = 0, largest = 0;
+    bool floor = false;
     for (uint32_t i = 0; i < count; ++i) {
         if (static_cast<uint32_t>(descs[i].Flags) & (kDescRenderTarget | kDescDepthStencil)) return false;
+        if (!descs[i].Alignment) floor = true;
         uint64_t one = 0, a = 0;
         if (!console_allocation(descs[i], one, a)) return false;
         const uint64_t offset = (total + a - 1) / a * a;
@@ -93,7 +99,7 @@ inline bool console_texture_placement(const D3D12_RESOURCE_DESC* descs, uint32_t
         largest = std::max(largest, a);
     }
     size = total;
-    alignment = largest;
+    alignment = floor ? std::max<uint64_t>(largest, 64 * 1024) : largest;
     return true;
 }
 
