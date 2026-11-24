@@ -31,6 +31,7 @@
 #include "../src/frame_pacer.h"
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+#include "../src/title_va_alias.h"  // set_descriptor_source: title-written slots reach the layer heap
 
 #ifdef LEONIDA_VULKAN_DEVICE
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
@@ -179,6 +180,8 @@ bool readable_memory(SIZE_T start, SIZE_T size) {
     return true;
 }
 
+std::uint64_t pull_title_descriptors(void*, std::uint8_t* real, std::size_t bytes);
+
 bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap, SIZE_T custom_start,
                                SIZE_T byte_size, SIZE_T real_start, UINT stride) {
     if (custom_start == 0 || byte_size == 0 || custom_start > (std::numeric_limits<SIZE_T>::max)() - byte_size)
@@ -195,10 +198,44 @@ bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap,
         descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap, stride,
                                        mirror});
         g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
+        leonida::title_va_aliases().set_descriptor_source(nullptr, &pull_title_descriptors);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: descriptor heap backed by the title's memory %p (%zu bytes, layer heap %p, mirror %d)\n",
+                         reinterpret_cast<void*>(custom_start), static_cast<std::size_t>(byte_size),
+                         reinterpret_cast<void*>(real_start), int(mirror));
         return true;
     } catch (const std::bad_alloc&) {
         return false;
     }
+}
+
+// The title's own writes into a title-backed heap (a descriptor memcpy'd from a staging heap into a shader-visible
+// table, which no device call sees) reach the layer's heap here: TitleVaAliases::pull_descriptors calls it before a
+// bound table is scanned at submission, with [real, real + bytes) the layer heap's CPU memory of that table. The
+// backing holds every slot the layer wrote too (mirror_title_descriptors copies each device write back over it), so
+// it is the whole truth for its range and is copied over the layer's bytes. Returns the descriptors copied.
+// Same idea as OpenScarlett's guest descriptor materializer (californiaAlmonds/OpenScarlett f8e24d49d, MIT); no code
+// is taken from it.
+std::uint64_t pull_title_descriptors(void*, std::uint8_t* real, std::size_t bytes) {
+    if (!real || !bytes || g_custom_range_count.load(std::memory_order_acquire) == 0) return 0;
+    const SIZE_T at = reinterpret_cast<SIZE_T>(real);
+    std::lock_guard lock(descriptor_range_mutex());
+    for (const DescriptorRange& r : descriptor_ranges()) {
+        if (!r.mirror || !r.stride) continue;
+        const SIZE_T size = r.custom_end - r.custom_start;
+        if (at < r.real_start || at >= r.real_start + size) continue;
+        const SIZE_T offset = at - r.real_start;
+        const SIZE_T n = (std::min<SIZE_T>)(bytes, size - offset);
+        const auto* from = reinterpret_cast<const std::uint8_t*>(r.custom_start + offset);
+        if (std::memcmp(real, from, n) != 0) std::memcpy(real, from, n);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: pulled %zu bytes of a bound table from the title's heap backing %p into the layer heap %p" "\n",
+                         static_cast<std::size_t>(n), static_cast<const void*>(from), static_cast<void*>(real));
+        return n / r.stride;
+    }
+    return 0;
 }
 
 void unregister_descriptor_range(const HeapProxy* heap) {
