@@ -2117,11 +2117,14 @@ int check_render_target_sizes() {
     const D3D12_RESOURCE_DESC two = target_desc(1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM, 2);
     EXPECT(ask(&two, 1).SizeInBytes == 2 * 8847360);
 
-    // What is left alone: a texture that is not a render target, a buffer, a render target of a format the rule does
-    // not list, one the PC device refuses, and a surface that is already whole tiles (1024 x 1024 RGBA8).
+    // A texture that is not a render target takes its console layout's size instead (src/console_texture_desc.h):
+    // in this description's 256-byte standard mode (0x101), 1920 x 1080 x 4 = 8,294,400 B unpadded, 64 KiB aligned.
     D3D12_RESOURCE_DESC sampled = hd;
     sampled.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    EXPECT(ask(&sampled, 1).SizeInBytes == 8323072);
+    info = ask(&sampled, 1);
+    EXPECT(info.SizeInBytes == 8294400 && info.Alignment == 65536);
+    // What is left alone: a buffer, a render target of a format the rule does not list, one the PC device refuses,
+    // and a surface that is already whole tiles (1024 x 1024 RGBA8).
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer.Width = 100000;

@@ -170,15 +170,15 @@ int main() {
     // The streaming classes the title builds from slot 10 (+0x3441F0 into exe 0x149C3E1D0, boot frontier5-3): per
     // standard mip a start tile and width x height tiles, the tail = tiles per slice - the standard mips' tiles, at
     // tile 0, all in 64 KiB tiles the title stores as 16 pages of 4 KiB. The archive's chunks follow the console layout:
-    // the captured 512x512, 32-slice, 9-mip BC7 64KB_D array's mip 0 is one 0x40000-byte chunk.
+    // the captured 512x512, 32-slice, 10-mip BC7 64KB_D array's mip 0 is one 0x40000-byte chunk.
     struct ClassCase {
         uint32_t w, h, array, mips, format;
         UINT total, standard, packed, per_slice, tail;
         UINT start[2], wide[2], high[2];
         const char* what;
     } classes[] = {
-        {512, 512, 32, 9, 98, 192, 2, 7, 6, 1, {2, 1}, {2, 1}, {2, 1},
-         "512x512x32 BC7 9 mips 0x10a (frontier5-3 class 0x149c3fbd8): 6 tiles a slice, mip 0 4 tiles at tile 2 "
+        {512, 512, 32, 10, 98, 192, 2, 8, 6, 1, {2, 1}, {2, 1}, {2, 1},
+         "512x512x32 BC7 10 mips 0x10a (frontier5-3 class 0x149c3fbd8): 6 tiles a slice, mip 0 4 tiles at tile 2 "
          "(one 0x40000 chunk), mip 1 at tile 1, the tail at 0"},
         {256, 256, 32, 9, 83, 64, 1, 8, 2, 1, {1, 0}, {1, 0}, {1, 0},
          "256x256x32 BC5 9 mips 0x10a: 2 tiles a slice, mip 0 at tile 1, mips 1-8 in the tail at 0"},
@@ -221,6 +221,15 @@ int main() {
     D3D12_RESOURCE_DESC pair[2] = {desc(128, 4, 1, 11, 0x105), desc(512, 512, 9, 98, 0x10a, 32)};
     check(cl::console_texture_placement(pair, 2, bytes, align) && bytes == 0x10000 + 0xc00000 && align == 0x10000,
           "two descriptions: the 64 KiB-aligned array placed after the 4 KiB one, 64 KiB aligned in all");
+    narrow.Alignment = 0x1000;
+    check(cl::console_texture_placement(&narrow, 1, bytes, align) && bytes == 0x4000 && align == 0x1000,
+          "slot 25 with 4 KiB asked (the title's first try): 0x4000 bytes at 4 KiB");
+    narrow.Alignment = 0;
+    check(cl::console_texture_placement(&narrow, 1, bytes, align) && bytes == 0x4000 && align == 0x10000,
+          "slot 25 with nothing asked: 0x4000 bytes (4 pages), 64 KiB aligned, as VIctory's place");
+    D3D12_RESOURCE_DESC r32 = desc(1280, 720, 1, 41, 0x102);  // R32_FLOAT, 256B_D (boot frontier7-1)
+    check(cl::console_texture_placement(&r32, 1, bytes, align) && bytes == 0x384000 && align == 0x10000,
+          "1280x720 R32 0x102: 0x384000 bytes, 64 KiB aligned (not 256 bytes), the size not rounded to it");
     pair[0].Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     check(!cl::console_texture_placement(pair, 2, bytes, align), "a render target keeps the proxy's own rule");
     D3D12_RESOURCE_DESC buffer{};
