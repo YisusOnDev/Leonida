@@ -206,6 +206,28 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
   for 4 KiB alignment) for the others; the PC answer for a 128x4 `R16G16B16A16` `SW_4KB_S` texture was 0x1000 bytes
   where its archive chunk is 0x4000, the console size, and the archive read builder asserted (`+0x4ffd879`, boot
   frontier5-3, class `0x149c46708`). Confirmed by `xg_xs_test` with the captured descriptions.
+- Slot 108 (`GetResourceAllocationInfo2`) gives the same answer, with each description's place in the per-resource
+  array, and slot 56 (`GetResourceAllocationInfo1`) follows. Slot 108 is the size of a texture's own memory:
+  the title's texture creation (`+0x193E1DA`, through the wrapper `+0xABFAE0`) rounds a block-compressed width and
+  height up to 4, asks for 4 KiB alignment and keeps the 4 KiB answer only when the reply's alignment is 0x1000
+  (`+0xABFDB7`; otherwise it asks again with alignment 0), allocates that many bytes at that alignment, places the
+  texture there (slot 133 or 127), and stores the size in KiB. A PC size smaller than the console layout lets the
+  console-sized data DirectStorage writes there run into the next allocation. The two calls through the title's
+  device pointer are the only ones measured; slot 56 has no call site through it and no boot reached it (frontier7-1
+  to 7-3), so its answer is there for consistency only. Slots 133 and 127 create committed textures with alignment 0,
+  since a PC device refuses 4 KiB for a texture that is not small by its own rule. Confirmed by `xs_proxy_mock_test`
+  (`check_texture_answers_108_56`) and `xg_xs_test` (per-description places).
+- The title's fatal int3 at `+0x2474606` is its own GPU-hang handler (`+0x2474500`), not an assert. It writes a
+  dump (`T:\*.dmp`) and always breaks. Three paths reach it: (1) a wait helper (`+0x10A0C0`, polled from the fence
+  wait `+0x4FB0A50` and the frame-pacing ring `+0x2474740`). It runs only when the byte at exe `0x14A943998` is 1. It
+  watches five queue timelines (table exe `0x1468929D0`) and fails when, for at least 10 polls and 10.0 s
+  (`0x41200000` stored at `+0x10A31A`), none of them completes the work submitted on it. (2) A fence's
+  `GetCompletedValue` (or the slot 12 completed-value word) reads `UINT64_MAX`, which is device removed (`+0x4DAD0AA`,
+  `+0x4FB0C31`...). (3) An HRESULT checker (`+0x4E9B660`, called after device calls such as slots 133 and 127)
+  that sees `0x887A0005`/`06`/`07`/`20` (removed, hung, reset, driver internal error). frontier7-2 logged no
+  device loss, so it was path (1): a queue that made no progress for 10 s. The runtime now logs a fence stall (a
+  queue signal pending with no progress for 4 s) and graphics pipeline compiles over 1 s (with `LEONIDA_LAZY_PSO` a
+  graphics pipeline is built at its first draw, on the replay path, which holds that queue's submission).
 - PSO metadata is a new variant (`PSIN`, `LSCH` schema, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`, little-endian).
   CodeWalker's parser reads the container but not the new schema; dump it once the exe gives the field names.
 

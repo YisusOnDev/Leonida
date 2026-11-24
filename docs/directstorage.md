@@ -256,6 +256,20 @@ any other request's bytes (to an address or to physical pages). The retail title
   (`tools/bcpack_history_calib.py`), never a table taken from another project or file. A chunk that references it
   fails with `E_NOTIMPL` (counted as `bcpackN=`), the destination left as it was. Loading a locally calibrated history
   file at run time is the next step (not done: the C++ decoder has no `--history` loader yet).
+  The data a BC7 chunk needs is the decoder's initial history (`Bc7History` in `runtime/src/bcpack.cpp`, the `bc7`
+  section of a `--history` JSON in `tools/bcpack_tables_bptc.load_bc7`): 256 entries, each 24 endpoint bytes
+  (`historyEndpoints`) and 32 index bytes (`historyIndices`), and for every byte how many leading bits are known
+  (`historyEndpointBits`/`historyIndexBits`, 0 = unknown) and how many are confirmed exactly
+  (`historyEndpointConfirmedBits`/`historyIndexConfirmedBits`), plus the last-resort (entry, slot) list. A block
+  decodes only when each history byte it reads has at least as many known bits as its mode reads from it (BC7
+  minimum depth 4, `b7_min_depth`); without the history every entry has depth 0, so any block that references one
+  refuses. In the boots the 20 failures (frontier7-1 to 7-3) are all BC7 chunks of that kind (`E_NOTIMPL`), and the
+  same 17 of 5,167 BC7 chunks refuse offline even with a provisional history (docs/design.md, world textures).
+  The only allowed sources are the player's own copy: exact inversion against reference blocks the player has (a
+  raw/zlib sibling mip of the same texture: `--ref-dds`, `--ref-pairs`) or pool self-calibration over the player's
+  TTPF pools (`tools/bcpack_history_calib.py`). Either way the result is a local JSON in the work folder that the
+  runtime would read through a `LEONIDA_BCPACK_HISTORY` path; it is never committed. A table taken from another
+  project's files (for example a `bcpack-tables.bin`) is not allowed.
 - A malformed chunk (bad rANS state, wrong size) fails with `E_DSTORAGE_DECOMPRESSION_ERROR` (`bcpackN-malformed=`).
   Requests that start inside a chunk rather than at its start (the title's asserts at +0x4ffd868/879, frontier5-2)
   land here: their source does not begin with a chunk header.
