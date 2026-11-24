@@ -989,8 +989,7 @@ struct DeviceState {
         if (!aliases.title_memory(va, title_lo, title_hi)) {
             if (bail_log.fetch_add(1, std::memory_order_relaxed) < 12)
                 std::fprintf(stderr, "[rt] d3d12: title VA 0x%llx (+0x%llx) left untranslated: not in the title's "
-                                     "xmem ranges
-",
+                                     "xmem ranges\n",
                              (unsigned long long)va, (unsigned long long)bytes);
             return true;
         }
@@ -999,8 +998,7 @@ struct DeviceState {
             mbi.State != MEM_COMMIT || !mbi.Protect || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
             if (bail_log.fetch_add(1, std::memory_order_relaxed) < 12)
                 std::fprintf(stderr, "[rt] d3d12: title VA 0x%llx (+0x%llx) left untranslated: state 0x%lx protect "
-                                     "0x%lx
-",
+                                     "0x%lx\n",
                              (unsigned long long)va, (unsigned long long)bytes, (unsigned long)mbi.State,
                              (unsigned long)mbi.Protect);
             return true;
@@ -1507,6 +1505,15 @@ struct DeviceState {
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
             return {};
+        // B4G4R4A4 render targets where the device has no A4R4G4B4 colour attachment (Vulkan 1.3 requires sampling it
+        // only; the RTX 3070 Laptop's driver refuses the target, and the title asserts on the refusal): stand-in,
+        // stored as B8G8R8A8_UNORM, the same channel order with more bits. A copy between it and a buffer would see
+        // the wider texels.
+        if (format.format == VK_FORMAT_A4R4G4B4_UNORM_PACK16 && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            !color_attachment_usable(format.format)) {
+            log_once("B4G4R4A4_UNORM render target unavailable, stored as B8G8R8A8_UNORM; format", desc.Format);
+            format.format = VK_FORMAT_B8G8R8A8_UNORM;
+        }
         format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
             log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
