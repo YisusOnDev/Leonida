@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "../src/console_linear_layout.h"
 #include "../src/resource_tiling.h"
 #include "shims.h"
 
@@ -156,12 +157,14 @@ HRESULT __stdcall computer_get_resource_tiling(Computer* self, UINT* total, D3D1
 }
 
 // The linear layout a computer answers for its description: subresources in D3D12 order (array slice by array slice,
-// mip by mip), each tightly packed (rows of whole blocks, slices of whole rows). Not the console's layout: on the PC the
-// texture is a PC resource, and the memory the title hands slot 9 is only read back through this same layout.
+// mip by mip), rows of whole blocks at a pitch rounded up to 256 bytes, slices of whole rows (src/console_linear_layout.h:
+// the title assumes that pitch). Not the console's tiled layouts: on the PC the texture is a PC resource, and the memory
+// the title hands slot 9 is only read back through this same layout.
 struct MipLayout {
     uint64_t size;   // one subresource of this mip (all its depth slices)
     uint64_t slice;  // one depth slice
-    uint32_t row;    // one row of blocks
+    uint32_t row;    // the bytes of one row of blocks
+    uint32_t pitch;  // from one row to the next: row rounded up to 256 bytes
     uint32_t rows;   // rows of blocks in a slice
     uint32_t depth;  // depth slices (1 for 2D)
 };
@@ -187,9 +190,10 @@ bool linear_layout(const Computer& c, MipLayout (&mips)[kMaxLayoutMips], uint32_
         const uint64_t w = std::max<uint64_t>(1, d.Width >> m), h = std::max<uint64_t>(1, d.Height >> m);
         MipLayout& l = mips[m];
         l.row = static_cast<uint32_t>((w + block - 1) / block * bytes);
+        l.pitch = static_cast<uint32_t>(leonida::console_linear_pitch(l.row));
         l.rows = static_cast<uint32_t>((h + block - 1) / block);
         l.depth = volume ? std::max<uint32_t>(1, d.DepthOrArraySize >> m) : 1;
-        l.slice = uint64_t{l.row} * l.rows;
+        l.slice = uint64_t{l.pitch} * l.rows;
         l.size = l.slice * l.depth;
     }
     return true;
@@ -247,15 +251,15 @@ HRESULT __stdcall computer_get_resource_layout(Computer* self, uint8_t* layout) 
         const MipLayout& l = mips[m];
         const uint32_t width = static_cast<uint32_t>(std::max<uint64_t>(1, d.Width >> m));
         const uint32_t height = std::max<uint32_t>(1, d.Height >> m);
-        const uint32_t elements_wide = l.row / bytes;
+        const uint32_t elements_wide = l.row / bytes, pitch_elements = l.pitch / bytes;
         uint8_t* entry = plane + kMipAt + kMipBytes * m;
         put<uint64_t>(entry + 0x00, l.size);
         put<uint64_t>(entry + 0x08, per_array);
         put<uint64_t>(entry + 0x10, l.slice);
-        put<uint32_t>(entry + 0x18, elements_wide * block);
-        put<uint32_t>(entry + 0x1C, l.row);
+        put<uint32_t>(entry + 0x18, pitch_elements * block);
+        put<uint32_t>(entry + 0x1C, l.pitch);
         put<uint32_t>(entry + 0x20, static_cast<uint32_t>(kLinearAlignment));
-        put<uint32_t>(entry + 0x24, elements_wide);
+        put<uint32_t>(entry + 0x24, pitch_elements);
         put<uint32_t>(entry + 0x28, l.rows);
         put<uint32_t>(entry + 0x2C, volume ? l.depth : arrays);
         put<uint32_t>(entry + 0x30, elements_wide);
@@ -290,7 +294,7 @@ bool guarded_rows(uint8_t* caller, uint64_t caller_row, uint64_t caller_slice, u
         for (uint32_t z = 0; z < l.depth; ++z)
             for (uint32_t y = 0; y < l.rows; ++y) {
                 uint8_t* const c = caller + z * caller_slice + y * caller_row;
-                uint8_t* const t = texels + z * l.slice + uint64_t{y} * l.row;
+                uint8_t* const t = texels + z * l.slice + uint64_t{y} * l.pitch;
                 if (into) std::memcpy(t, c, l.row);
                 else std::memcpy(c, t, l.row);
             }
