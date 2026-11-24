@@ -5104,7 +5104,14 @@ public:
         registered_ = true;
         compute_job_ = job;
         DeviceState* device = &device_;
-        compute_compile_pool().submit([device, job] {
+        static const bool hooked = [] {
+            leonida::detail::g_compute_wanted.store(+[](std::uint64_t wanted) {
+                compute_compile_pool().prioritise(static_cast<std::uintptr_t>(wanted));
+            });
+            return true;
+        }();
+        (void)hooked;
+        compute_compile_pool().submit(job->id, [device, job] {
             {
                 std::lock_guard lock(job->mutex);
                 if (job->state == ComputeCompileJob::cancelled) return;
@@ -5141,12 +5148,28 @@ public:
             const unsigned n = std::max(2u, std::thread::hardware_concurrency() / 2);
             for (unsigned i = 0; i < n; ++i) std::thread([this] { run(); }).detach();
         }
-        void submit(std::function<void()> task) {
+        void submit(std::uintptr_t id, std::function<void()> task) {
             {
                 std::lock_guard lock(mutex_);
-                tasks_.push_back(std::move(task));
+                tasks_.push_back({id, std::move(task)});
             }
             cv_.notify_one();
+        }
+        // A queued compile that a dispatch is waiting for goes to the front (logged the first few times).
+        void prioritise(std::uintptr_t id) {
+            std::lock_guard lock(mutex_);
+            for (auto it = tasks_.begin(); it != tasks_.end(); ++it) {
+                if (it->first != id) continue;
+                if (it == tasks_.begin()) return;
+                auto task = std::move(*it);
+                tasks_.erase(it);
+                tasks_.push_front(std::move(task));
+                static int logged = 0;
+                if (logged++ < 16)
+                    std::fprintf(stderr, "[rt] d3d12: a dispatched compute pipeline's compile moved to the front of "
+                                         "%zu queued\n", tasks_.size());
+                return;
+            }
         }
 
     private:
@@ -5156,7 +5179,7 @@ public:
                 {
                     std::unique_lock lock(mutex_);
                     cv_.wait(lock, [this] { return !tasks_.empty(); });
-                    task = std::move(tasks_.front());
+                    task = std::move(tasks_.front().second);
                     tasks_.pop_front();
                 }
                 task();
@@ -5164,7 +5187,7 @@ public:
         }
         std::mutex mutex_;
         std::condition_variable cv_;
-        std::deque<std::function<void()>> tasks_;
+        std::deque<std::pair<std::uintptr_t, std::function<void()>>> tasks_;
     };
     static ComputeCompilePool& compute_compile_pool() {
         static auto* pool = new ComputeCompilePool();  // process lifetime: its threads are detached
@@ -5186,6 +5209,13 @@ public:
                                  "sha256 %s, VkResult %d\n", deferred ? " (deferred)" : "", ms, job.words,
                          job.program_hash.c_str(), int(created));
         if (created != VK_SUCCESS) {
+            // A deferred compile that fails leaves its PSO pending for good: every dispatch with it is skipped.
+            static std::atomic<int> failed_log{0};
+            if (failed_log.fetch_add(1, std::memory_order_relaxed) < 32)
+                std::fprintf(stderr, "[rt] d3d12: compute pipeline compile failed%s: VkResult %d, %zu SPIR-V words, "
+                                     "program sha256 %s\n",
+                             deferred ? " (deferred; its dispatches stay skipped)" : "", int(created), job.words,
+                             job.program_hash.c_str());
             if (created == VK_ERROR_DEVICE_LOST)
                 device.context->mark_device_lost("PipelineState::create_compute (vkCreateComputePipelines)", created);
             return false;
