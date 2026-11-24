@@ -2843,8 +2843,7 @@ void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
             std::size_t length = 0;
             return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
         }();
-        if (on && ((dest.ptr & 0xFFFF) == 0xDEA0 || (dest.ptr & 0xFFFF) == 0xDEC0) &&
-            logged.fetch_add(1, std::memory_order_relaxed) < 20)
+        if (const int n = on ? logged.fetch_add(1, std::memory_order_relaxed) : 0; on && n >= 300 && n < 316)
             std::fprintf(stderr, "[rt] table-log: slot 17 view at title %p -> layer %p\n", reinterpret_cast<void*>(dest.ptr),
                          reinterpret_cast<void*>(translate_cpu_handle(self, dest).ptr));
     }
@@ -2862,8 +2861,7 @@ void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_S
             std::size_t length = 0;
             return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
         }();
-        if (on && ((dest.ptr & 0xFFFF) == 0xDEA0 || (dest.ptr & 0xFFFF) == 0xDEC0) &&
-            logged.fetch_add(1, std::memory_order_relaxed) < 20)
+        if (const int n = on ? logged.fetch_add(1, std::memory_order_relaxed) : 0; on && n >= 300 && n < 316)
             std::fprintf(stderr, "[rt] table-log: slot 18 view at title %p -> layer %p\n", reinterpret_cast<void*>(dest.ptr),
                          reinterpret_cast<void*>(translate_cpu_handle(self, dest).ptr));
     }
