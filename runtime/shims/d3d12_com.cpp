@@ -1570,7 +1570,11 @@ private:
 
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
         for (UINT i = 0; i < count; ++i) {
-            if (views) leonida::title_va_aliases().note(views[i].BufferLocation, leonida::TitleVaAliases::vertex_view);
+            // A view in the title's own memory gets a window copy in the arena now (refreshed before every
+            // submission); replay binds it when no buffer covers the address (vulkan_replay.h title_window_buffer).
+            if (views && views[i].BufferLocation)
+                leonida::title_va_aliases().resolve(views[i].BufferLocation, views[i].SizeInBytes,
+                                                    leonida::TitleVaAliases::vertex_view);
             const leonida::VertexBufferView next =
                 views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes, views[i].StrideInBytes}
                       : leonida::VertexBufferView{};
@@ -1580,7 +1584,9 @@ private:
     }
 
     void set_index_buffer(const D3D12_INDEX_BUFFER_VIEW* view) {
-        if (view) leonida::title_va_aliases().note(view->BufferLocation, leonida::TitleVaAliases::index_view);
+        if (view && view->BufferLocation)
+            leonida::title_va_aliases().resolve(view->BufferLocation, view->SizeInBytes,
+                                                leonida::TitleVaAliases::index_view);
         index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
                       : leonida::IndexBufferView{};
     }

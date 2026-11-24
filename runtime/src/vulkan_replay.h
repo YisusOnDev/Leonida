@@ -37,6 +37,7 @@
 #include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
+#include "title_va_alias.h"
 #include "vulkan_predicate.h"
 #include "vulkan_predicated_copy.h"
 #include "vulkan_indirect_dispatch_count.h"
@@ -817,6 +818,26 @@ enum class ReplayResult {
     // VulkanQueue::execute submitted the lists without at least one command it could not prepare (unsupported).
     skipped_unsupported
 };
+
+// Diagnostic: the source line of the last unresolved_resource this thread returned (named in the refusal log).
+inline int& replay_unresolved_line() {
+    thread_local int line = 0;
+    return line;
+}
+#define LEONIDA_REPLAY_UNRESOLVED (::leonida::replay_unresolved_line() = __LINE__, ::leonida::ReplayResult::unresolved_resource)
+
+// A vertex or index view in the title's own memory that no buffer covers: the window copy of that memory in the GPU
+// address arena (src/title_va_alias.h; made when the view was set and refreshed before every submission). The arena
+// buffer is the one the zero page is in, at offset 0, and a console VA in the arena is its offset there.
+template <class Vk>
+bool title_window_buffer(const Vk& vk, std::uint64_t va, VkBuffer& buffer, VkDeviceSize& offset) {
+    const std::uint64_t to = title_va_aliases().shader_va(va);
+    if (to == va || !vk.zero_buffer) return false;
+    buffer = vk.zero_buffer;
+    offset = vk.zero_offset + to;
+    return true;
+}
+
 
 struct ReplayFunctions {
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
@@ -2249,7 +2270,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
-    if (!pipeline || (!pipeline->pipeline && !pipeline->variant)) return ReplayResult::unresolved_resource;
+    if (!pipeline || (!pipeline->pipeline && !pipeline->variant)) return LEONIDA_REPLAY_UNRESOLVED;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
@@ -2276,7 +2297,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const TargetView& target = draw.views->render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding) return LEONIDA_REPLAY_UNRESOLVED;
         auto& a = p.colors[slot];
         a.binding = *binding;
         a.id = target.resource;
@@ -2293,7 +2314,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding) return LEONIDA_REPLAY_UNRESOLVED;
         auto& a = p.depth;
         a.binding = *binding;
         a.id = draw.depth.resource;
@@ -2334,7 +2355,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const bool bound = draw.views && slot < draw.views->vertex_buffers.size() &&
                            draw.views->vertex_buffers[slot].va;
         if (!bound) {
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            if (!vk.zero_buffer) return LEONIDA_REPLAY_UNRESOLVED;
             p.vertex_buffers[slot] = vk.zero_buffer;
             p.vertex_offsets[slot] = vk.zero_offset;
             p.vertex_sizes[slot] = vk.zero_size;
@@ -2343,26 +2364,28 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
         const VertexBufferView& view = draw.views->vertex_buffers[slot];
         std::uint64_t size = view.size;
-        if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
-            return ReplayResult::unresolved_resource;
+        if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]) &&
+            !title_window_buffer(vk, view.va, p.vertex_buffers[slot], p.vertex_offsets[slot]))
+            return LEONIDA_REPLAY_UNRESOLVED;
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
     // A non-indexed quad list is drawn from the shared triangle index buffer (emit).
     if (!draw.indexed && !draw.mesh && draw.topology == topology_quad_list && !vk.quad_indices)
-        return ReplayResult::unresolved_resource;
+        return LEONIDA_REPLAY_UNRESOLVED;
     if (draw.indexed) {
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
         else if (draw.index.va) return ReplayResult::unsupported;
         if (!draw.index.va) {  // no index buffer: every index reads 0
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            if (!vk.zero_buffer) return LEONIDA_REPLAY_UNRESOLVED;
             p.index_buffer = vk.zero_buffer;
             p.index_offset = vk.zero_offset;
         } else {
             std::uint64_t size = draw.index.size;
-            if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
-                return ReplayResult::unresolved_resource;
+            if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset) &&
+                !title_window_buffer(vk, draw.index.va, p.index_buffer, p.index_offset))
+                return LEONIDA_REPLAY_UNRESOLVED;
         }
     }
     return ReplayResult::success;
@@ -2824,7 +2847,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         };
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
-            if (!bind(transition->resource)) return ReplayResult::unresolved_resource;
+            if (!bind(transition->resource)) return LEONIDA_REPLAY_UNRESOLVED;
             if (p.binding.image == VK_NULL_HANDLE) {
                 if (transition->subresource != 0 && transition->subresource != all_subresources)
                     return ReplayResult::invalid_subresource;
@@ -2834,14 +2857,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
             if (const auto* buffer_barrier = std::get_if<BufferBarrier>(&command))
-                if (!bind(buffer_barrier->resource)) return ReplayResult::unresolved_resource;
+                if (!bind(buffer_barrier->resource)) return LEONIDA_REPLAY_UNRESOLVED;
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
-            if (!bind(texture->resource)) return ReplayResult::unresolved_resource;
+            if (!bind(texture->resource)) return LEONIDA_REPLAY_UNRESOLVED;
             if (!p.binding.image || !barrier_range(p.binding, texture->range, p.range))
                 return ReplayResult::invalid_subresource;
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
-            if (!bind(color_clear->target.resource)) return ReplayResult::unresolved_resource;
+            if (!bind(color_clear->target.resource)) return LEONIDA_REPLAY_UNRESOLVED;
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
                 return ReplayResult::invalid_subresource;
@@ -2864,7 +2887,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.load_op_clear = !predicated && p.clear_format != VK_FORMAT_UNDEFINED && p.clear_format != p.binding.format;
             if (!p.skip && p.rects.empty() && !vk.clear_color_image) return refuse("the device lacks vkCmdClearColorImage");
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
-            if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
+            if (!bind(depth_clear->target.resource)) return LEONIDA_REPLAY_UNRESOLVED;
             VkImageAspectFlags aspects = 0;
             if (depth_clear->flags & clear_depth) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (depth_clear->flags & clear_stencil) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -2885,7 +2908,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return refuse("the device lacks vkCmdClearDepthStencilImage");
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
-            if (!bind(view.resource)) return ReplayResult::unresolved_resource;
+            if (!bind(view.resource)) return LEONIDA_REPLAY_UNRESOLVED;
             if (view.buffer) {
                 if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer)
                     return refuse("the device lacks vkCmdFillBuffer, vkCmdUpdateBuffer or vkCmdCopyBuffer");
@@ -2951,7 +2974,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (predicated && !std::holds_alternative<CopyBuffer>(command)) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
-            if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
+            if (!bind(dst_id) || !source) return LEONIDA_REPLAY_UNRESOLVED;
             p.source = *source;
             ReplayResult result = ReplayResult::success;
             if (const auto* buffer_copy = std::get_if<CopyBuffer>(&command)) {
@@ -3091,7 +3114,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.resolve_image) return refuse("the device lacks vkCmdResolveImage");
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
-            if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
+            if (!bind(resolve_command->dst) || !source) return LEONIDA_REPLAY_UNRESOLVED;
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result == ReplayResult::unsupported
@@ -3131,7 +3154,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
-            if (!bind(discard->resource)) return ReplayResult::unresolved_resource;
+            if (!bind(discard->resource)) return LEONIDA_REPLAY_UNRESOLVED;
             const std::uint64_t end = std::uint64_t(discard->first_subresource) + discard->count;
             if (!p.binding.image) {
                 if (!discard->whole && end > 1) return ReplayResult::invalid_subresource;
@@ -3151,7 +3174,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.update_buffer || !vk.buffer_at) return refuse("the device lacks vkCmdUpdateBuffer or buffer addresses");
             std::uint64_t bytes = 4;
             if (!vk.buffer_at(write->address, bytes, p.write_buffer, p.write_offset) || bytes < 4)
-                return ReplayResult::unresolved_resource;
+                return LEONIDA_REPLAY_UNRESOLVED;
             if (p.write_offset % 4) return ReplayResult::invalid_copy;
             // WriteBufferImmediate resolves by VA and may target a readback buffer in COPY_DEST.
             out.wrote_readback = true;
@@ -3160,14 +3183,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.copy_buffer) return refuse("the device lacks vkCmdCopyBuffer");
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(atomic->src);
-            if (!bind(atomic->dst) || !source) return ReplayResult::unresolved_resource;
+            if (!bind(atomic->dst) || !source) return LEONIDA_REPLAY_UNRESOLVED;
             p.source = *source;
             if (!p.binding.buffer || !p.source.buffer || !detail::within(atomic->dst_offset, atomic->bytes, p.binding.size) ||
                 !detail::within(atomic->src_offset, atomic->bytes, p.source.size))
                 return ReplayResult::invalid_copy;
             for (const auto& d : atomic->dependencies) {
                 const ResourceBinding* dependent = resolve(d.resource);
-                if (!dependent) return ReplayResult::unresolved_resource;
+                if (!dependent) return LEONIDA_REPLAY_UNRESOLVED;
                 if (!dependent->image) {
                     const std::uint64_t end = d.end == UINT64_MAX ? dependent->size : d.end;
                     if (d.subresource != 0 || d.begin >= end || end > dependent->size)
@@ -3186,7 +3209,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!conditional) return ReplayResult::unsupported;
             // Without physical segments the capture dispatch would pollute CSInvocations.
             if (statistics_active && !statistics_helpers) return ReplayResult::unsupported;
-            if (!bind(predication->buffer)) return ReplayResult::unresolved_resource;
+            if (!bind(predication->buffer)) return LEONIDA_REPLAY_UNRESOLVED;
             if (!p.binding.buffer || !detail::within(predication->offset, 8, p.binding.size) ||
                 predication->offset > UINT64_MAX - p.binding.buffer_offset)
                 return ReplayResult::invalid_predication;
@@ -3198,7 +3221,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // not suppress them (emit_query suspends conditional rendering around ResolveQueryData).
             if (!queries) return ReplayResult::unsupported;
             QueryPool* heap = vk.query_pool(range.heap);
-            if (!heap) return ReplayResult::unresolved_resource;
+            if (!heap) return LEONIDA_REPLAY_UNRESOLVED;
             if (!query_fits_heap(heap->heap_type, range.type)) return ReplayResult::invalid_query;
             if (range.first >= heap->count || range.count > heap->count - range.first)
                 return ReplayResult::invalid_query;
@@ -3221,7 +3244,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
                 // The destination is a buffer, as D3D12 requires, large enough for every result.
-                if (!bind(resolve_queries->dst)) return ReplayResult::unresolved_resource;
+                if (!bind(resolve_queries->dst)) return LEONIDA_REPLAY_UNRESOLVED;
                 const std::uint64_t bytes = std::uint64_t(range.count) * query_result_size(range.type);
                 if (!p.binding.buffer || p.binding.buffer_offset % 8 ||
                     !detail::within(resolve_queries->offset, bytes, p.binding.size) ||
@@ -3239,7 +3262,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             out.queries.push_back({i, heap, statistics_active});
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
-            if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
+            if (!bind(ind->argument_buffer) || !p.binding.buffer) return LEONIDA_REPLAY_UNRESOLVED;
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
                 return ReplayResult::invalid_indirect_arguments;
@@ -3253,7 +3276,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_indirect_arguments;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
-                if (!cnt || !cnt->buffer) return ReplayResult::unresolved_resource;
+                if (!cnt || !cnt->buffer) return LEONIDA_REPLAY_UNRESOLVED;
                 if (!detail::indirect_range(*cnt, ind->count_offset, sizeof(std::uint32_t)))
                     return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
@@ -3280,7 +3303,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline)
                     return refuse("the device lacks pipeline binding or push constants");
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
-                if (!pipeline) return ReplayResult::unresolved_resource;
+                if (!pipeline) return LEONIDA_REPLAY_UNRESOLVED;
                 if (!pipeline->pipeline) {  // still compiling (see Dispatch below): left out alone
                     p.skip = true;
                     return ReplayResult::success;
@@ -3297,10 +3320,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
                     return refuse("the device lacks acceleration structure builds");
                 p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
-                if (!p.accel_dst) return ReplayResult::unresolved_resource;
+                if (!p.accel_dst) return LEONIDA_REPLAY_UNRESOLVED;
                 if (build->update && build->src_va) {
                     p.accel_src = vk.resolve_acceleration_structure(build->src_va);
-                    if (!p.accel_src) return ReplayResult::unresolved_resource;
+                    if (!p.accel_src) return LEONIDA_REPLAY_UNRESOLVED;
                 }
                 if (build->is_tlas && build->instance_pointers && build->instance_count) {
                     if (!vk.prepare_khr_instances || !vk.host_at || !vk.buffer_at) return ReplayResult::unsupported;
@@ -3314,9 +3337,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 std::uint64_t room = ~std::uint64_t(0);
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
-                if (!vk.buffer_at(copy->dst_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
+                if (!vk.buffer_at(copy->dst_va, room, buffer, offset)) return LEONIDA_REPLAY_UNRESOLVED;
                 std::uint64_t source = ~std::uint64_t(0);
-                if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return ReplayResult::unresolved_resource;
+                if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return LEONIDA_REPLAY_UNRESOLVED;
                 p.xdxr_bytes = std::min(room, source);
             } else {
                 if (vk.queue_stages == detail::queue_stages_copy || !vk.copy_acceleration_structure ||
@@ -3324,7 +3347,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::unsupported;
                 p.accel_dst = vk.resolve_acceleration_structure(copy->dst_va);
                 p.accel_src = vk.resolve_acceleration_structure(copy->src_va);
-                if (!p.accel_dst || !p.accel_src) return ReplayResult::unresolved_resource;
+                if (!p.accel_dst || !p.accel_src) return LEONIDA_REPLAY_UNRESOLVED;
                 // Vulkan forbids overlapping source and destination handles in CLONE/COMPACT copies.
                 if (p.accel_dst == p.accel_src) return ReplayResult::invalid_copy;
             }
@@ -3334,7 +3357,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 std::uint64_t room = 8 * info->sources.size();
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
-                if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
+                if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return LEONIDA_REPLAY_UNRESOLVED;
                 if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
             } else if (info->type == 0 && vk.write_acceleration_structures_properties &&
                        vk.resolve_acceleration_structure && vk.reset_query_pool && vk.copy_query_pool_results &&
@@ -3346,14 +3369,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 std::uint64_t room = need;
                 detail::PreparedKhrPostbuild pb;
                 if (!vk.buffer_at(info->dest_va, room, pb.dst_buffer, pb.dst_offset))
-                    return ReplayResult::unresolved_resource;
+                    return LEONIDA_REPLAY_UNRESOLVED;
                 // vkCmdCopyQueryPoolResults with VK_QUERY_RESULT_64_BIT requires an 8-byte aligned dstOffset.
                 if (!pb.dst_buffer || room < need || (pb.dst_offset % 8) != 0)
                     return ReplayResult::invalid_copy;
                 pb.sources.reserve(info->sources.size());
                 for (const std::uint64_t src_va : info->sources) {
                     const VkAccelerationStructureKHR as = vk.resolve_acceleration_structure(src_va);
-                    if (!as) return ReplayResult::unresolved_resource;
+                    if (!as) return LEONIDA_REPLAY_UNRESOLVED;
                     pb.sources.push_back(as);
                 }
                 if (!vk.prepare_khr_postbuild(static_cast<std::uint32_t>(pb.sources.size()), pb.query_pool,
@@ -3373,7 +3396,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
                 return refuse("the device lacks pipeline binding, push constants or dispatch");
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
-            if (!pipeline) return ReplayResult::unresolved_resource;
+            if (!pipeline) return LEONIDA_REPLAY_UNRESOLVED;
             if (!pipeline->pipeline) {
                 // Registered but not compiled yet (LEONIDA_LAZY_PSO compiles compute pipelines on a worker): this
                 // dispatch alone is left out, and counted, instead of the whole list.
@@ -3409,6 +3432,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         const std::size_t draw_count = out.draw_count;
         const ReplayResult result = prepare_command(i, command, p);
         if (result == ReplayResult::success) continue;
+        if (result == ReplayResult::unresolved_resource) {
+            // Diagnostic: which command of a refused list names an unknown resource (first 64).
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
+                std::fprintf(stderr, "[rt] replay: command %zu of %zu (%s) names an unknown resource (vulkan_replay.h:%d)%s%s\n", i,
+                             commands.size(), command_name(command), replay_unresolved_line(), why ? ": " : "", why ? why : "");
+        }
         if (result != ReplayResult::unsupported || !vk.skip_unsupported || !skippable(command)) return result;
         // Left out whole: nothing it prepared is emitted, planned into a query segment or counted.
         p = {};
