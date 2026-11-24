@@ -7431,6 +7431,18 @@ public:
     void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateConstantBufferView");
+        {  // bring-up (LEONIDA_DRAW_LOG): where frame-time views land
+            static std::atomic<int> logged{0};
+            static const bool on = [] {
+                char text[16] = {};
+                std::size_t length = 0;
+                return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
+            }();
+            if (const int n = on ? logged.fetch_add(1, std::memory_order_relaxed) : 0; on && n >= 300 && n < 312)
+                std::fprintf(stderr, "[rt] table-log: device CreateConstantBufferView #%d at %p arena+0x%llx\n", n,
+                             reinterpret_cast<void*>(destination.ptr),
+                             static_cast<unsigned long long>(destination.ptr - reinterpret_cast<SIZE_T>(state_.arena.mapped)));
+        }
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
@@ -7452,6 +7464,18 @@ public:
                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateShaderResourceView");
+        {  // bring-up (LEONIDA_DRAW_LOG): where frame-time views land
+            static std::atomic<int> logged{0};
+            static const bool on = [] {
+                char text[16] = {};
+                std::size_t length = 0;
+                return getenv_s(&length, text, sizeof(text), "LEONIDA_DRAW_LOG") == 0 && length > 1;
+            }();
+            if (const int n = on ? logged.fetch_add(1, std::memory_order_relaxed) : 0; on && n >= 300 && n < 312)
+                std::fprintf(stderr, "[rt] table-log: device CreateShaderResourceView #%d at %p arena+0x%llx\n", n,
+                             reinterpret_cast<void*>(destination.ptr),
+                             static_cast<unsigned long long>(destination.ptr - reinterpret_cast<SIZE_T>(state_.arena.mapped)));
+        }
         using leonida::gfx10::ImageType;
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
