@@ -689,16 +689,17 @@ def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
                        "s_cmp_eq_u32 s6, 0\ns_cmp_lg_u32 s7, 0\ns_endpgm\n", name="cs_halfcmp_ci")
     asm_hcmp = hcmp.translate()
     hcmp.validate(asm_hcmp)
-    # Low-half s_cmp_eq_u32: lane < 32 (%c20) guards OpSelect(..., %true) feeding OpGroupNonUniformAll.
+    # Low-half s_cmp_eq_u32: lane < 32 (%c20) guards OpSelect(..., %true) feeding OpGroupNonUniformAll. The lane is
+    # %h_wl, computed once in %entry (SPIRV-SIZE-1), or a per-use %t id.
     assert re.search(
-        r"(%t\d+) = OpULessThan %bool %t\d+ %c20\n\s*"
+        r"(%t\d+) = OpULessThan %bool %\w+ %c20\n\s*"
         r"(%t\d+) = OpSelect %bool \1 %t\d+ %true\n\s*"
         r"%t\d+ = OpGroupNonUniformAll %bool %c3 \2",
         asm_hcmp,
     ), "low-half s_cmp_eq_u32 did not guard OpGroupNonUniformAll with lane < 32"
     # High-half s_cmp_lg_u32: lane >= 32 (%c20) guards OpLogicalAnd feeding OpGroupNonUniformAny.
     assert re.search(
-        r"(%t\d+) = OpUGreaterThanEqual %bool %t\d+ %c20\n\s*"
+        r"(%t\d+) = OpUGreaterThanEqual %bool %\w+ %c20\n\s*"
         r"(%t\d+) = OpLogicalAnd %bool \1 %t\d+\n\s*"
         r"%t\d+ = OpGroupNonUniformAny %bool %c3 \2",
         asm_hcmp,

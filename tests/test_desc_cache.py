@@ -20,6 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import rdna2spirv  # noqa: E402
+import spirv_outline  # noqa: E402
 
 CALL = "OpFunctionCall %uint %desc_lookup_fn"
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -56,7 +57,8 @@ def translate(lines):
             warnings.simplefilter("ignore", ResourceWarning)
             result = rdna2spirv.translate(os.path.join(tmp, "disasm", "ps_desc_cache.s"))
             gc.collect()
-        return result
+        # Repeated sample bodies may be one shared function (SPIRV-SIZE-3); count lookups as they run, inlined.
+        return spirv_outline.inline_outlined(result)
 
 
 def calls(*lines):
