@@ -9636,25 +9636,8 @@ private:
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        const bool attachment_usable = state_.color_attachment_usable(format.format);
-        const TextureCreateInfo create(resolved, format, attachment_usable);
-        if (!state_.memory_requirements(create.info, need)) {
-            // A render target in a format this GPU cannot render to (the title's 2560x1440 B4G4R4A4_UNORM target on an
-            // RTX 3070 Laptop: A4R4G4B4_UNORM_PACK16 has no color-attachment support there) is sized as the texture
-            // without the attachment usage, which the size does not depend on in practice. Refused, the console title
-            // asserts at game_scarlett_master.exe+0x344196 (boots frontier8-1/2, renderB-3, laptop-smoke-1).
-            // Only for a format the PC runtime lets be a render target at all (block-compressed and the other
-            // non-renderable families stay refused, as the host refuses them).
-            if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || attachment_usable ||
-                !render_target_family(desc.Format))
-                return kInvalidAllocation;
-            D3D12_RESOURCE_DESC sampled = resolved;
-            sampled.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-            const TextureCreateInfo without(sampled, format, false);
-            if (!state_.memory_requirements(without.info, need)) return kInvalidAllocation;
-            log_once("GetResourceAllocationInfo: render target format the GPU cannot render to, sized without the "
-                     "attachment usage:", int(desc.Format));
-        }
+        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
+        if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
         if (tiled) {
             leonida::ResourceTiling tiling;
             if (!resource_tiling(resolved, tiling)) return kInvalidAllocation;
