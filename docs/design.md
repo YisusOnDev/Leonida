@@ -188,6 +188,15 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
   struct-returning device methods with the C ABI, return buffer first: `GetCustomHeapProperties` (slot 26) is
   measured as `rcx` = buffer, `rdx` = device. Slots 25 and 26 take that form, and still take the PC one. Queues, fences, command lists and
   `PresentX` extensions remain unimplemented.
+- `xg_xs.dll` answers the console's texture layouts (`runtime/src/console_texture_layout.h`, a port of VIctory's
+  `texture.rs`, GPL-3.0, itself following AMD addrlib, MIT): `XGSuggestSwizzleMode` writes `0x100 | mode` (1D linear,
+  depth `SW_64KB_Z_X`, render target `SW_64KB_R_X`, else `SW_4KB_S`); the texture computer lays out the Layout field's
+  swizzle mode and answers slot 2 (the 0x1B40-byte layout), 6 (element offset), 8/9 (copies into / out of tiled
+  memory, non-XOR modes only) and 10 (64 KiB tiling; `E_FAIL` for 4 KiB modes). Confirmed by `xg_xs_test` (VIctory's
+  cases, and the sizes VIctory answered for 1024², 2048², 4096² full BC7 chains in `0x10a`: 1 441 792, 5 636 096,
+  22 413 312 bytes). Why: the title sizes its archive reads from these answers (texture-class page counts built from
+  slot 10); PC-sized answers made reads shorter than the archive chunks. Open: the Vulkan layer still reads
+  title-filled textures as linear, so textures the title tiles through slot 8 sample scrambled until it detiles them.
 - PSO metadata is a new variant (`PSIN`, `LSCH` schema, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`, little-endian).
   CodeWalker's parser reads the container but not the new schema; dump it once the exe gives the field names.
 
