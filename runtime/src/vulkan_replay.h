@@ -46,6 +46,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <cmath>
 #include <cstdint>
@@ -1117,6 +1118,11 @@ struct PreparedDraw {
 // LEONIDA_DRAW_LOG_SKIP=M: the first M draws are not logged (to see the draws of a later frame).
 inline std::atomic<long> g_draw_log_left{-1};
 inline std::atomic<long long> g_draw_log_skip{-1};
+// Set by the device: a guarded copy of `bytes` from a title address (false when a page is not readable).
+inline std::atomic<bool (*)(void* to, std::uint64_t from, std::size_t bytes)> g_draw_log_peek{nullptr};
+// Set by the device: the host mapping of the GPU address arena, to show what a 32-bit user-data pointer names.
+inline std::atomic<const std::uint8_t*> g_draw_log_arena{nullptr};
+inline std::atomic<std::uint64_t> g_draw_log_arena_size{0};
 inline void log_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipeline& graphics) {
     long left = g_draw_log_left.load(std::memory_order_relaxed);
     if (left == -1) {
@@ -1153,6 +1159,55 @@ inline void log_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipe
         char one[16];
         std::snprintf(one, sizeof(one), " %x", draw.user_data[i]);
         user += one;
+    }
+    // The vertex-buffer views and the first three vertices at each view's address, read from the title's memory by
+    // the device's guarded copy (g_draw_log_peek; null: not read).
+    std::string vbs;
+    if (draw.views) {
+        for (std::size_t slot = 0; slot < draw.views->vertex_buffers.size() && slot < 4; ++slot) {
+            const VertexBufferView& v = draw.views->vertex_buffers[slot];
+            char one[160];
+            std::snprintf(one, sizeof(one), " vb%zu{va %llx size %u stride %u buf %p+%llx}", slot,
+                          static_cast<unsigned long long>(v.va), v.size, v.stride,
+                          slot < d.vertex_buffers.size() ? static_cast<void*>(d.vertex_buffers[slot]) : nullptr,
+                          slot < d.vertex_offsets.size() ? static_cast<unsigned long long>(d.vertex_offsets[slot]) : 0ull);
+            vbs += one;
+            const auto peek = g_draw_log_peek.load(std::memory_order_relaxed);
+            if (peek && v.va && v.stride && v.stride <= 64) {
+                float words[48] = {};
+                const std::size_t bytes = std::min<std::size_t>(sizeof(words), std::size_t(v.stride) * 3);
+                if (peek(words, v.va + std::uint64_t(v.stride) * draw.first, bytes)) {
+                    vbs += " [";
+                    for (std::size_t i = 0; i < bytes / 4; ++i) {
+                        char w[24];
+                        std::snprintf(w, sizeof(w), "%s%g", i ? "," : "", words[i]);
+                        vbs += w;
+                    }
+                    vbs += "]";
+                } else {
+                    vbs += " [unreadable]";
+                }
+            }
+        }
+    }
+    std::fprintf(stderr, "[rt] draw-log-vb:%s\n", vbs.c_str());
+    // User words that name an arena offset: the 16 dwords there (a table the shader loads its V#s from).
+    if (const std::uint8_t* arena = g_draw_log_arena.load(std::memory_order_relaxed)) {
+        const std::uint64_t arena_size = g_draw_log_arena_size.load(std::memory_order_relaxed);
+        for (int i = 0; i < 16; ++i) {
+            const std::uint64_t at = draw.user_data[i] & ~3ull;
+            if (at < 0x10000 || at + 64 > arena_size) continue;
+            std::uint32_t w[16];
+            std::memcpy(w, arena + at, sizeof(w));
+            std::string line;
+            for (int k = 0; k < 16; ++k) {
+                char one[12];
+                std::snprintf(one, sizeof(one), " %08x", w[k]);
+                line += one;
+            }
+            std::fprintf(stderr, "[rt] draw-log-table: s%d=%llx:%s\n", i, static_cast<unsigned long long>(at),
+                         line.c_str());
+        }
     }
     std::fprintf(stderr,
                  "[rt] draw-log: %s count %u inst %u first %u topo %u vp %.0f,%.0f %.0fx%.0f d%.2f-%.2f sc %d,%d-%d,%d "

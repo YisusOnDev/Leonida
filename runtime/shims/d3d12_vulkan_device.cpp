@@ -218,6 +218,11 @@ bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes,
     }
 }
 
+// LEONIDA_DRAW_LOG's vertex peek (src/vulkan_replay.h): a guarded read of the title's memory at a view's address.
+bool draw_log_peek(void* to, std::uint64_t from, std::size_t bytes) {
+    return copy_guarded(static_cast<std::uint8_t*>(to), reinterpret_cast<const std::uint8_t*>(from), bytes, false);
+}
+
 // Copies [from, from + bytes) of the title's address space to `to`, for a slot-133 shadow buffer. Only committed,
 // readable pages are read (xmem commits on first touch, and a read of a reserved page faults); the rest is zero.
 void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
@@ -6058,6 +6063,7 @@ public:
             if (getenv_s(&length, text, "LEONIDA_TITLE_WINDOWS_MB") == 0 && length > 1)
                 state_.title_window_cap = std::strtoull(text, nullptr, 10) << 20;
         }
+        leonida::detail::g_draw_log_peek.store(&draw_log_peek, std::memory_order_relaxed);
         leonida::title_va_aliases().set_hooks(
             &state_,
             [](void* device, std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
@@ -6076,6 +6082,8 @@ public:
         }
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
+        leonida::detail::g_draw_log_arena.store(state_.arena.mapped, std::memory_order_relaxed);
+        leonida::detail::g_draw_log_arena_size.store(state_.arena.size, std::memory_order_relaxed);
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
